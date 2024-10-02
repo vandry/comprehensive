@@ -1,0 +1,13 @@
+syntax = "proto2";
+
+package comprehensive;
+
+import "google/protobuf/empty.proto";
+
+message GreetResponse {
+  optional string message = 1;
+}
+
+service Test {
+  rpc Greet(google.protobuf.Empty) returns (GreetResponse) {}
+}

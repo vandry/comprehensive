@@ -408,6 +408,7 @@ dependencies = [
  "clap",
  "futures",
  "http",
+ "hyper",
  "log",
  "prometheus",
  "prost",

@@ -2,14 +2,17 @@ use axum::response::IntoResponse;
 use axum::Router;
 #[cfg(feature = "tls")]
 use axum_server::tls_rustls::RustlsConfig;
-#[cfg(feature = "tls")]
+use futures::future::Either;
 use futures::pin_mut;
 use prometheus::Encoder;
+use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 #[cfg(feature = "tls")]
 use std::sync::Arc;
 #[cfg(feature = "tls")]
 use tokio_rustls::rustls;
+
+use tokio::sync::Notify;
 
 use crate::tls;
 use crate::ComprehensiveError;
@@ -56,6 +59,50 @@ pub(crate) struct HttpServer {
     https_details: Option<(SocketAddr, Arc<tls::ReloadableKeyAndCertResolver>)>,
 }
 
+async fn serve_until_shutdown<'a, F>(
+    serve_fut: F,
+    shut: tokio::sync::futures::Notified<'a>,
+    h: axum_server::Handle,
+) -> std::io::Result<()>
+where
+    F: Future<Output = std::io::Result<()>>,
+{
+    pin_mut!(serve_fut);
+    pin_mut!(shut);
+    match futures::future::select(serve_fut, shut).await {
+        Either::Left((r, _)) => {
+            log::info!("Left {:?}", r);
+            r
+        }
+        Either::Right((_, server)) => {
+            h.graceful_shutdown(None);
+            server.await
+        }
+    }
+}
+
+fn server_with_shutdown<'a, M, A>(
+    b: axum_server::Server<A>,
+    shutdown_signal: &'a Notify,
+    make_service: M,
+) -> impl Future<Output = std::io::Result<()>> + 'a
+where
+    M: axum_server::service::MakeService<SocketAddr, http::Request<hyper::body::Incoming>> + 'a,
+    A: axum_server::accept::Accept<tokio::net::TcpStream, M::Service>
+        + Clone
+        + Send
+        + Sync
+        + 'static,
+    A::Stream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
+    A::Service: axum_server::service::SendService<http::Request<hyper::body::Incoming>> + Send,
+    A::Future: Send,
+{
+    let handle = axum_server::Handle::new();
+    let serve_fut = b.handle(handle.clone()).serve(make_service);
+    let shutdown_signal = shutdown_signal.notified();
+    serve_until_shutdown(serve_fut, shutdown_signal, handle)
+}
+
 impl HttpServer {
     pub(crate) fn new(args: Args, tlsc: &tls::TlsConfig) -> Result<Self, ComprehensiveError> {
         let http_addr = args.http_port.map(|p| (args.http_bind_addr, p).into());
@@ -86,7 +133,7 @@ impl HttpServer {
         })
     }
 
-    pub(crate) async fn run(self) -> Result<(), ComprehensiveError> {
+    pub(crate) async fn run(self, shutdown_signal: &Notify) -> Result<(), ComprehensiveError> {
         let http = self.http_addr.map(|a| {
             log::info!("Insecure HTTP listening on {}", a);
             axum_server::bind(a)
@@ -109,14 +156,14 @@ impl HttpServer {
         {
             match (http, https) {
                 (Some(s1), Some(s2)) => {
-                    let s1 = s1.serve(s.clone());
-                    let s2 = s2.serve(s);
+                    let s1 = server_with_shutdown(s1, shutdown_signal, s.clone());
+                    let s2 = server_with_shutdown(s2, shutdown_signal, s);
                     pin_mut!(s1);
                     pin_mut!(s2);
                     futures::future::select(s1, s2).await.factor_first().0
                 }
-                (Some(s1), None) => s1.serve(s).await,
-                (None, Some(s2)) => s2.serve(s).await,
+                (Some(s1), None) => server_with_shutdown(s1, shutdown_signal, s).await,
+                (None, Some(s2)) => server_with_shutdown(s2, shutdown_signal, s).await,
                 (None, None) => std::future::ready(Ok(())).await,
             }
             .map_err(|e| e.into())
@@ -125,7 +172,7 @@ impl HttpServer {
         #[cfg(not(feature = "tls"))]
         {
             match http {
-                Some(s1) => s1.serve(s).await,
+                Some(s1) => server_with_shutdown(s1, shutdown_signal, s).await,
                 None => std::future::ready(Ok(())).await,
             }
             .map_err(|e| e.into())
@@ -173,7 +220,7 @@ impl crate::Server {
 mod tests {
     use prometheus::register_int_counter;
     use std::net::Ipv6Addr;
-    use tokio::sync::oneshot;
+    use std::sync::Arc;
 
     use super::*;
     use crate::testutil;
@@ -203,6 +250,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn nothing_enabled() {
+        let (tlsc, tempdir) = tls::TlsConfig::for_tests(false).expect("creating test TLS");
+        let http = HttpServer::new(test_args(false, false), &tlsc).unwrap();
+
+        assert!(http.http_addr.is_none());
+        #[cfg(feature = "tls")]
+        assert!(http.https_details.is_none());
+
+        let never_quit = Notify::new();
+        assert!(http.run(&never_quit).await.is_ok());
+        std::mem::drop(tempdir);
+    }
+
+    #[tokio::test]
     async fn http_only() {
         let counter = register_int_counter!("comprehensive_test_total", "Number of happy").unwrap();
         counter.inc_by(111);
@@ -216,8 +277,9 @@ mod tests {
         #[cfg(feature = "tls")]
         assert!(http.https_details.is_none());
 
-        let (tx, rx) = oneshot::channel();
-        let j = testutil::run_until_signal(http.run(), rx).await;
+        let quit = Arc::new(Notify::new());
+        let quit_rx = Arc::clone(&quit);
+        let j = tokio::spawn(async move { http.run(&quit_rx).await });
         testutil::wait_until_serving(&addr).await;
 
         let url = format!("http://[::1]:{}/", addr.port());
@@ -243,7 +305,7 @@ mod tests {
             .expect(&url);
         assert!(text.contains("hello"));
 
-        let _ = tx.send(());
+        let _ = quit.notify_waiters();
         let _ = j.await;
         std::mem::drop(tempdir);
     }
@@ -262,8 +324,9 @@ mod tests {
             .expect("https_details should be populated")
             .0;
 
-        let (tx, rx) = oneshot::channel();
-        let j = testutil::run_until_signal(http.run(), rx).await;
+        let quit = Arc::new(Notify::new());
+        let quit_rx = Arc::clone(&quit);
+        let j = tokio::spawn(async move { http.run(&quit_rx).await });
         testutil::wait_until_serving(&addr).await;
 
         let cacert = reqwest::Certificate::from_pem(tls::testdata::CACERT).expect("cacert");
@@ -277,7 +340,7 @@ mod tests {
         let resp = client.get(&url).send().await.expect(&url);
         assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
 
-        let _ = tx.send(());
+        let _ = quit.notify_waiters();
         let _ = j.await;
         std::mem::drop(tempdir);
     }
@@ -296,8 +359,9 @@ mod tests {
             .expect("https_details should be populated")
             .0;
 
-        let (tx, rx) = oneshot::channel();
-        let j = testutil::run_until_signal(http.run(), rx).await;
+        let quit = Arc::new(Notify::new());
+        let quit_rx = Arc::clone(&quit);
+        let j = tokio::spawn(async move { http.run(&quit_rx).await });
         testutil::wait_until_serving(&addr_http).await;
         testutil::wait_until_serving(&addr_https).await;
 
@@ -316,7 +380,7 @@ mod tests {
         let resp = client.get(&url).send().await.expect(&url);
         assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
 
-        let _ = tx.send(());
+        let _ = quit.notify_waiters();
         let _ = j.await;
         std::mem::drop(tempdir);
     }

@@ -1,4 +1,5 @@
 use arc_swap::ArcSwap;
+use futures::{pin_mut, select, FutureExt};
 use rustls::crypto::CryptoProvider;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::{ClientHello, ResolvesServerCert};
@@ -8,6 +9,7 @@ use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
+use tokio::sync::Notify;
 use tokio_rustls::rustls;
 
 use super::ComprehensiveError;
@@ -222,13 +224,24 @@ impl TlsConfig {
         }
     }
 
-    pub(crate) async fn run(self) -> Result<(), ComprehensiveError> {
+    pub(crate) async fn run(self, shutdown_notify: &Notify) -> Result<(), ComprehensiveError> {
         Ok(match self.inner {
             None => (),
-            Some(mut inner) => loop {
-                tokio::time::sleep(RELOAD_INTERVAL).await;
-                inner.maybe_reload();
-            },
+            Some(mut inner) => {
+                let shutdown_notify = shutdown_notify.notified().fuse();
+                pin_mut!(shutdown_notify);
+                loop {
+                    let delay = tokio::time::sleep(RELOAD_INTERVAL).fuse();
+                    pin_mut!(delay);
+                    select! {
+                        _ = shutdown_notify => {
+                            break;
+                        }
+                        _ = delay => (),
+                    }
+                    inner.maybe_reload();
+                }
+            }
         })
     }
 

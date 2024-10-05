@@ -97,7 +97,9 @@
 #![warn(missing_docs)]
 
 use futures::FutureExt;
-use futures::{pin_mut, select};
+use futures::{future::FusedFuture, pin_mut, select};
+use std::future::Future;
+use tokio::sync::Notify;
 
 #[cfg(feature = "tls")]
 use tokio_rustls::rustls;
@@ -111,7 +113,7 @@ mod tls {
     pub(crate) struct TlsConfig {}
 
     impl TlsConfig {
-        pub(crate) async fn run(self) -> Result<(), super::ComprehensiveError> {
+        pub(crate) async fn run(self, _: &super::Notify) -> Result<(), super::ComprehensiveError> {
             Ok(())
         }
 
@@ -273,6 +275,32 @@ pub struct Server {
     tls: tls::TlsConfig,
 }
 
+async fn run_tasks<T, H, G>(tls: T, http: H, grpc: G) -> Result<(), ComprehensiveError>
+where
+    T: Future<Output = Result<(), ComprehensiveError>> + FusedFuture,
+    H: Future<Output = Result<(), ComprehensiveError>> + FusedFuture,
+    G: Future<Output = Result<(), ComprehensiveError>> + FusedFuture,
+{
+    pin_mut!(tls);
+    pin_mut!(http);
+    pin_mut!(grpc);
+    loop {
+        let (result, task_name) = select! {
+            r = tls => (r, "TLS"),
+            r = http => (r, "HTTP"),
+            r = grpc => (r, "gRPC"),
+            complete => {
+                return Ok(());
+            }
+        };
+        if let Err(e) = result {
+            log::error!("{} failed: {}", task_name, e);
+            return Err(e);
+        }
+        log::info!("{} exited successfully", task_name);
+    }
+}
+
 impl Server {
     /// Construct a Comprehensive server with all of the components that are
     /// both feature-enabled and either active by default or configured to be
@@ -306,30 +334,38 @@ impl Server {
     /// servers fails. If this happens, all servers are stopped but only the
     /// first error is reported.
     pub async fn run(self) -> Result<bool, ComprehensiveError> {
-        let tls = self.tls.run().fuse();
-        let http = self.http.run().fuse();
+        let mut sigterm =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        let mut quitting = false;
+        let shutdown_notify = Notify::new();
+
+        let tls = self.tls.run(&shutdown_notify).fuse();
+        let http = self.http.run(&shutdown_notify).fuse();
 
         #[cfg(feature = "grpc")]
-        let grpc = self.grpc.run().fuse();
+        let grpc = self.grpc.run(&shutdown_notify).fuse();
         #[cfg(not(feature = "grpc"))]
         let grpc = std::future::ready(Ok(())).fuse();
 
-        pin_mut!(tls);
-        pin_mut!(http);
-        pin_mut!(grpc);
+        let tasks = run_tasks(tls, http, grpc).fuse();
+        pin_mut!(tasks);
         loop {
-            if let (Err(e), task_name) = select! {
-                r = tls => (r, "TLS"),
-                r = http => (r, "HTTP"),
-                r = grpc => (r, "gRPC"),
-                complete => {
-                    break;
+            select! {
+                _ = sigterm.recv().fuse() => {
+                    if quitting {
+                        log::warn!("SIGTERM received again; quitting immediately.");
+                        break;
+                    }
+                    quitting = true;
+                    log::warn!("SIGTERM received; shutting down");
+                    shutdown_notify.notify_waiters();
+                    continue;
+                },
+                r = tasks => {
+                    return r.map(|_| quitting);
                 }
-            } {
-                log::info!("{} failed: {}", task_name, e);
-                return Err(e);
             }
         }
-        Ok(false)
+        Ok(quitting)
     }
 }

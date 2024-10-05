@@ -1,9 +1,5 @@
-use futures::{future::Either, pin_mut};
-use std::future::Future;
-use std::marker::Send;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr, TcpListener};
 use tokio::net::TcpStream;
-use tokio::sync::oneshot::Receiver;
 
 #[cfg(feature = "grpc")]
 pub(crate) mod pb {
@@ -37,24 +33,4 @@ pub(crate) async fn wait_until_serving(addr: &SocketAddr) {
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
-}
-
-pub(crate) async fn run_until_signal<F, O>(
-    f: F,
-    signal: Receiver<()>,
-) -> tokio::task::JoinHandle<()>
-where
-    F: Future<Output = O> + Send + 'static,
-    O: std::fmt::Debug,
-{
-    tokio::spawn(async move {
-        pin_mut!(f);
-        pin_mut!(signal);
-        match futures::future::select(f, signal).await {
-            Either::Left((ret, _)) => {
-                panic!("SUT unexpectedly exited: {:?}", ret);
-            }
-            Either::Right((_, _)) => (),
-        }
-    })
 }

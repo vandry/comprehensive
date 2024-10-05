@@ -6,6 +6,7 @@ use prost_types::FileDescriptorSet;
 use std::collections::HashSet;
 use std::convert::Infallible;
 use std::net::{IpAddr, SocketAddr};
+use tokio::sync::Notify;
 use tonic::body::BoxBody;
 use tonic::server::NamedService;
 use tonic::service::Routes;
@@ -108,7 +109,7 @@ impl GrpcServer {
         })
     }
 
-    pub(crate) async fn run(self) -> Result<(), ComprehensiveError> {
+    pub(crate) async fn run(self, shutdown_signal: &Notify) -> Result<(), ComprehensiveError> {
         let mut routes = self.routes;
 
         if let Some(r) = self.reflection {
@@ -139,14 +140,26 @@ impl GrpcServer {
         {
             match (self.grpc_server, self.grpcs_server) {
                 (Some((a1, mut s1)), Some((a2, mut s2))) => {
-                    let s1 = s1.add_routes(routes.clone()).serve(a1);
-                    let s2 = s2.add_routes(routes).serve(a2);
+                    let s1 = s1
+                        .add_routes(routes.clone())
+                        .serve_with_shutdown(a1, shutdown_signal.notified());
+                    let s2 = s2
+                        .add_routes(routes)
+                        .serve_with_shutdown(a2, shutdown_signal.notified());
                     pin_mut!(s1);
                     pin_mut!(s2);
                     futures::future::select(s1, s2).await.factor_first().0
                 }
-                (Some((a1, mut s1)), None) => s1.add_routes(routes).serve(a1).await,
-                (None, Some((a2, mut s2))) => s2.add_routes(routes).serve(a2).await,
+                (Some((a1, mut s1)), None) => {
+                    s1.add_routes(routes)
+                        .serve_with_shutdown(a1, shutdown_signal.notified())
+                        .await
+                }
+                (None, Some((a2, mut s2))) => {
+                    s2.add_routes(routes)
+                        .serve_with_shutdown(a2, shutdown_signal.notified())
+                        .await
+                }
                 (None, None) => std::future::ready(Ok(())).await,
             }
             .map_err(|e| e.into())
@@ -155,7 +168,11 @@ impl GrpcServer {
         #[cfg(not(feature = "tls"))]
         {
             match self.grpc_server {
-                Some((a1, mut s1)) => s1.add_routes(routes).serve(a1).await,
+                Some((a1, mut s1)) => {
+                    s1.add_routes(routes)
+                        .serve_with_shutdown(a1, shutdown_signal.notified())
+                        .await
+                }
                 None => std::future::ready(Ok(())).await,
             }
             .map_err(|e| e.into())
@@ -269,7 +286,7 @@ impl crate::Server {
 mod tests {
     use std::future::Future;
     use std::net::Ipv6Addr;
-    use tokio::sync::oneshot;
+    use std::sync::Arc;
     #[cfg(feature = "tls")]
     use tokio_rustls::rustls;
     #[cfg(feature = "tls")]
@@ -319,8 +336,9 @@ mod tests {
         #[cfg(feature = "tls")]
         assert!(grpc.grpcs_server.is_none());
 
-        let (tx, rx) = oneshot::channel();
-        let j = testutil::run_until_signal(grpc.run(), rx).await;
+        let quit = Arc::new(Notify::new());
+        let quit_rx = Arc::clone(&quit);
+        let j = tokio::spawn(async move { grpc.run(&quit_rx).await });
         testutil::wait_until_serving(&addr).await;
 
         let uri = format!("http://[::1]:{}/", addr.port()).parse().unwrap();
@@ -330,7 +348,7 @@ mod tests {
             .expect("localhost channel");
         t(channel).await;
 
-        let _ = tx.send(());
+        let _ = quit.notify_waiters();
         let _ = j.await;
         std::mem::drop(tempdir);
     }
@@ -346,6 +364,20 @@ mod tests {
             resp.status,
             health_check_response::ServingStatus::Serving as i32
         );
+    }
+
+    #[tokio::test]
+    async fn nothing_enabled() {
+        let (tlsc, tempdir) = tls::TlsConfig::for_tests(false).expect("creating test TLS");
+        let grpc = GrpcServer::new(test_args(false, false), &tlsc).unwrap();
+
+        assert!(grpc.grpc_server.is_none());
+        #[cfg(feature = "tls")]
+        assert!(grpc.grpcs_server.is_none());
+
+        let never_quit = Notify::new();
+        assert!(grpc.run(&never_quit).await.is_ok());
+        std::mem::drop(tempdir);
     }
 
     #[tokio::test]
@@ -467,6 +499,7 @@ mod tests {
         .await;
     }
 
+    #[cfg(feature = "tls")]
     async fn test_grpcs_channel(port: u16) -> tonic::transport::Channel {
         let identity = tonic::transport::Identity::from_pem(
             tls::testdata::USER2_CERT,
@@ -499,14 +532,15 @@ mod tests {
             .expect("grpcs_server should be populated")
             .0;
 
-        let (tx, rx) = oneshot::channel();
-        let j = testutil::run_until_signal(grpc.run(), rx).await;
+        let quit = Arc::new(Notify::new());
+        let quit_rx = Arc::clone(&quit);
+        let j = tokio::spawn(async move { grpc.run(&quit_rx).await });
         testutil::wait_until_serving(&addr).await;
 
         let channel = test_grpcs_channel(addr.port()).await;
         check_health(channel).await;
 
-        let _ = tx.send(());
+        let _ = quit.notify_waiters();
         let _ = j.await;
         std::mem::drop(tempdir);
     }
@@ -529,8 +563,9 @@ mod tests {
             .expect("grpcs_server should be populated")
             .0;
 
-        let (tx, rx) = oneshot::channel();
-        let j = testutil::run_until_signal(grpc.run(), rx).await;
+        let quit = Arc::new(Notify::new());
+        let quit_rx = Arc::clone(&quit);
+        let j = tokio::spawn(async move { grpc.run(&quit_rx).await });
         testutil::wait_until_serving(&addr_grpc).await;
         testutil::wait_until_serving(&addr_grpcs).await;
 
@@ -546,7 +581,7 @@ mod tests {
         let channel = test_grpcs_channel(addr_grpcs.port()).await;
         check_health(channel).await;
 
-        let _ = tx.send(());
+        let _ = quit.notify_waiters();
         let _ = j.await;
         std::mem::drop(tempdir);
     }

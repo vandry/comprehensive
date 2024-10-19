@@ -104,7 +104,14 @@ use tokio::sync::Notify;
 #[cfg(feature = "tls")]
 use tokio_rustls::rustls;
 
+pub mod assembly;
 mod server;
+
+pub use assembly::{Assembly, NoArgs, NoDependencies, Resource, ResourceDependencies};
+
+// This is necessary for using the macros defined in comprehensive_macros
+// within this crate.
+extern crate self as comprehensive;
 
 #[cfg(feature = "tls")]
 mod tls;

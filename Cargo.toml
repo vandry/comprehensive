@@ -1,6 +1,12 @@
+[workspace]
+resolver = "2"
+members = [
+  "comprehensive_macros",
+]
+
 [package]
 name = "comprehensive"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 repository = "https://github.com/vandry/comprehensive.git"
 homepage = "https://github.com/vandry/comprehensive"
@@ -9,9 +15,12 @@ license = "MIT"
 
 [dependencies]
 arc-swap = { version = "1.7", optional = true }
+async-trait = "0.1"
 axum = "0.7"
 axum-server = "0.7"
 clap = { version = "4.5", features = ["derive"] }
+comprehensive_macros = { path = "comprehensive_macros", version = "=0.2.0" }
+downcast-rs = "1.2"
 futures = "0.3"
 http = "1.1"
 hyper = "1.4"
@@ -36,6 +45,7 @@ tls = ["tonic?/tls", "axum-server/tls-rustls", "dep:arc-swap", "dep:tokio-rustls
 
 [dev-dependencies]
 rand = "0.8"
+regex = "1.11"
 reqwest = "0.12"
 tempfile = "3"
 tokio-stream = "0.1"

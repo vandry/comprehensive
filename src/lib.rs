@@ -127,17 +127,13 @@ pub use assembly::{Assembly, NoArgs, NoDependencies, Resource, ResourceDependenc
 extern crate self as comprehensive;
 
 #[cfg(feature = "tls")]
-mod tls;
+pub mod tls;
 #[cfg(not(feature = "tls"))]
 mod tls {
     pub(crate) struct TlsConfig {}
 
+    #[cfg(test)]
     impl TlsConfig {
-        pub(crate) async fn run<'a>(self, _: &'a super::ShutdownNotify<'a>) -> Result<(), super::ComprehensiveError> {
-            Ok(())
-        }
-
-        #[cfg(test)]
         pub(crate) fn for_tests(
             _: bool,
         ) -> Result<(Self, Option<tempfile::TempDir>), super::ComprehensiveError> {
@@ -178,10 +174,6 @@ pub struct Args {
 
     #[command(flatten)]
     http_server: server::http::Args,
-
-    #[cfg(feature = "tls")]
-    #[command(flatten)]
-    tls: tls::Args,
 }
 
 /// Error type returned by various Comprehensive functions
@@ -264,7 +256,6 @@ pub struct DeprecatedMonolithInner {
     #[cfg(feature = "grpc")]
     grpc: server::grpc::GrpcServer,
     http: server::http::HttpServer,
-    tls: tls::TlsConfig,
 }
 
 /// A [builder](https://rust-unofficial.github.io/patterns/patterns/creational/builder.html)
@@ -278,18 +269,15 @@ pub struct DeprecatedMonolithInner {
 /// from [`DeprecatedMonolith`] to their own [`Resource`] types.
 pub struct DeprecatedMonolith(std::sync::Mutex<Option<DeprecatedMonolithInner>>);
 
-async fn run_tasks<T, H, G>(tls: T, http: H, grpc: G) -> Result<(), ComprehensiveError>
+async fn run_tasks<H, G>(http: H, grpc: G) -> Result<(), ComprehensiveError>
 where
-    T: Future<Output = Result<(), ComprehensiveError>> + FusedFuture,
     H: Future<Output = Result<(), ComprehensiveError>> + FusedFuture,
     G: Future<Output = Result<(), ComprehensiveError>> + FusedFuture,
 {
-    pin_mut!(tls);
     pin_mut!(http);
     pin_mut!(grpc);
     loop {
         let (result, task_name) = select! {
-            r = tls => (r, "TLS"),
             r = http => (r, "HTTP"),
             r = grpc => (r, "gRPC"),
             complete => {
@@ -318,16 +306,26 @@ impl DeprecatedMonolith {
     }
 }
 
+#[doc(hidden)]
+#[derive(ResourceDependencies)]
+pub struct DeprecatedMonolithDependencies {
+    #[cfg(feature = "tls")]
+    tls: std::sync::Arc<tls::TlsConfig>,
+}
+
 impl Resource for DeprecatedMonolith {
     type Args = Args;
-    type Dependencies = NoDependencies;
+    type Dependencies = DeprecatedMonolithDependencies;
     const NAME: &str = "DeprecatedMonolith";
 
-    fn new(_: NoDependencies, args: Args) -> Result<Self, Box<dyn std::error::Error>> {
+    fn new(d: DeprecatedMonolithDependencies, args: Args) -> Result<Self, Box<dyn std::error::Error>> {
         #[cfg(feature = "tls")]
-        let tls = tls::TlsConfig::new(args.tls)?;
+        let tls = d.tls;
         #[cfg(not(feature = "tls"))]
-        let tls = tls::TlsConfig {};
+        let tls = {
+            let _ = d;
+            tls::TlsConfig {}
+        };
 
         #[cfg(feature = "grpc")]
         let grpc = server::grpc::GrpcServer::new(args.grpc_server, &tls)?;
@@ -337,13 +335,11 @@ impl Resource for DeprecatedMonolith {
             #[cfg(feature = "grpc")]
             grpc,
             http,
-            tls,
         }))))
     }
 
     async fn run_with_termination_signal<'a>(&'a self, term: &'a ShutdownNotify<'a>) -> Result<(), Box<dyn std::error::Error>> {
         let inner = self.0.lock().unwrap().take().unwrap();
-        let tls = inner.tls.run(term).fuse();
         let http = inner.http.run(term).fuse();
 
         #[cfg(feature = "grpc")]
@@ -351,7 +347,7 @@ impl Resource for DeprecatedMonolith {
         #[cfg(not(feature = "grpc"))]
         let grpc = std::future::ready(Ok(())).fuse();
 
-        run_tasks(tls, http, grpc).fuse().await?;
+        run_tasks(http, grpc).fuse().await?;
         Ok(())
     }
 }

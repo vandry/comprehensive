@@ -9,7 +9,6 @@ use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
-use tokio::sync::Notify;
 use tokio_rustls::rustls;
 
 use super::ComprehensiveError;
@@ -224,11 +223,14 @@ impl TlsConfig {
         }
     }
 
-    pub(crate) async fn run(self, shutdown_notify: &Notify) -> Result<(), ComprehensiveError> {
+    pub(crate) async fn run<'a>(
+        self,
+        shutdown_notify: &'a crate::ShutdownNotify<'a>,
+    ) -> Result<(), ComprehensiveError> {
         Ok(match self.inner {
             None => (),
             Some(mut inner) => {
-                let shutdown_notify = shutdown_notify.notified().fuse();
+                let shutdown_notify = shutdown_notify.subscribe().fuse();
                 pin_mut!(shutdown_notify);
                 loop {
                     let delay = tokio::time::sleep(RELOAD_INTERVAL).fuse();

@@ -51,6 +51,11 @@ impl<'a> ShutdownNotify<'a> {
     pub fn subscribe(&'a self) -> Notified<'a> {
         self.0.notified()
     }
+
+    /// Create a new notifier. Visible for testing.
+    pub fn new(n: &'a Notify) -> Self {
+        Self(n)
+    }
 }
 
 #[async_trait]

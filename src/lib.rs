@@ -34,8 +34,6 @@
 //! # Hello world server
 //!
 //! ```
-//! use clap::Parser;
-//!
 //! // Generated protobufs for gRPC
 //! # #[cfg(feature = "grpc")]
 //! mod pb {
@@ -46,15 +44,39 @@
 //! # #[cfg(feature = "grpc")]
 //! use pb::*;
 //!
-//! #[derive(Parser, Debug)]
+//! #[derive(clap::Args, Debug)]
 //! struct Args {
-//!     // Adds Comprehensive's own command line flags to those defined below.
-//!     #[command(flatten)]
-//!     comprehensive: comprehensive::Args,
-//!
 //!     #[arg(long)]
 //!     app_flag: Option<String>,
 //! }
+//!
+//! #[derive(comprehensive::ResourceDependencies)]
+//! struct ApplicationDependencies {
+//!     // Temporary resource type while migrating!
+//!     monolith: std::sync::Arc<comprehensive::DeprecatedMonolith>,
+//! }
+//!
+//! struct ApplicationWorkResource;
+//!
+//! impl comprehensive::Resource for ApplicationWorkResource {
+//!     type Args = Args;
+//!     type Dependencies = ApplicationDependencies;
+//!     const NAME: &str = "application";
+//!
+//!     fn new(d: ApplicationDependencies, args: Args) -> Result<Self, Box<dyn std::error::Error>> {
+//!         # #[cfg(feature = "grpc")]
+//!         let srv = TestServer{};
+//!         # #[cfg(feature = "grpc")]
+//!         d.monolith.configure(|b| Ok(b
+//!             .register_encoded_file_descriptor_set(pb::FILE_DESCRIPTOR_SET)
+//!             .add_grpc_service(pb::test_server::TestServer::new(srv))?
+//!         ))?;
+//!         Ok(Self)
+//!     }
+//! }
+//!
+//! #[derive(comprehensive::ResourceDependencies)]
+//! struct TopDependencies(std::sync::Arc<ApplicationWorkResource>);
 //! # struct TestServer {}
 //! # #[cfg(feature = "grpc")]
 //! # #[tonic::async_trait]
@@ -66,7 +88,6 @@
 //!
 //! #[tokio::main]
 //! pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
-//!     let args = Args::parse();
 //!     // Required if TLS is needed.
 //!     # #[cfg(feature = "tls")]
 //!     let _ = tokio_rustls::rustls::crypto::aws_lc_rs::default_provider().install_default();
@@ -74,14 +95,7 @@
 //!     // Will start a gRPC server with or without TLS depending on flags,
 //!     // with extra features such as server reflection, and also serve
 //!     // HTTP and/or HTTPS (again, depending on flags) at least for metrics.
-//!     # #[cfg(feature = "grpc")]
-//!     let srv = TestServer{};
-//!     # #[cfg(feature = "grpc")]
-//!     comprehensive::Server::builder(args.comprehensive)?
-//!         .register_encoded_file_descriptor_set(pb::FILE_DESCRIPTOR_SET)
-//!         .add_grpc_service(pb::test_server::TestServer::new(srv))?
-//!         .run()
-//!         .await?;
+//!     comprehensive::Assembly::<TopDependencies>::new()?.run().await?;
 //!     Ok(())
 //! }
 //! ```
@@ -99,7 +113,6 @@
 use futures::FutureExt;
 use futures::{future::FusedFuture, pin_mut, select};
 use std::future::Future;
-use tokio::sync::Notify;
 
 #[cfg(feature = "tls")]
 use tokio_rustls::rustls;
@@ -107,7 +120,7 @@ use tokio_rustls::rustls;
 pub mod assembly;
 mod server;
 
-pub use assembly::{Assembly, NoArgs, NoDependencies, Resource, ResourceDependencies};
+pub use assembly::{Assembly, NoArgs, NoDependencies, Resource, ResourceDependencies, ShutdownNotify};
 
 // This is necessary for using the macros defined in comprehensive_macros
 // within this crate.
@@ -120,7 +133,7 @@ mod tls {
     pub(crate) struct TlsConfig {}
 
     impl TlsConfig {
-        pub(crate) async fn run(self, _: &super::Notify) -> Result<(), super::ComprehensiveError> {
+        pub(crate) async fn run<'a>(self, _: &'a super::ShutdownNotify<'a>) -> Result<(), super::ComprehensiveError> {
             Ok(())
         }
 
@@ -136,7 +149,7 @@ mod tls {
 #[cfg(test)]
 mod testutil;
 
-/// Command line flags for Comprehensive
+/// Command line flags for the monolith
 ///
 /// This struct is meant to be used as part of a [clap](https://crates.io/crates/clap)
 /// Command Line Argument Parser. It makes flags available that will be used
@@ -156,30 +169,6 @@ mod testutil;
 /// | `--https_port`      | *none*     | TCP port number for secure HTTP server. If unset, HTTPS is not served. |
 /// | `--https_bind_addr` | `::`       | Binding IP address for HTTPS. Used only if `--https_port` is set. |
 /// | `--metrics_path`    | `/metrics` | HTTP and/or HTTPS path where metrics are served. Set to empty to disable. |
-///
-/// Use it like this:
-///
-/// ```
-/// use clap::Parser;
-///
-/// #[derive(Parser, Debug)]
-/// struct Args {
-///     // Adds Comprehensive's own command line flags to those defined below.
-///     #[command(flatten)]
-///     comprehensive: comprehensive::Args,
-///
-///     #[arg(long)]
-///     app_flag: Option<String>,
-/// }
-///
-/// #[tokio::main]
-/// pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
-///     let args = Args::parse();
-///     // [...]
-///     let _ = comprehensive::Server::builder(args.comprehensive)?;
-///     Ok(())
-/// }
-/// ```
 #[derive(clap::Args, Debug)]
 #[group(id = "comprehensive_args")]
 pub struct Args {
@@ -267,20 +256,27 @@ impl From<tonic::transport::Error> for ComprehensiveError {
     }
 }
 
-/// A [builder](https://rust-unofficial.github.io/patterns/patterns/creational/builder.html)
-/// for Comprehensive servers
+/// Provides access to the [`DeprecatedMonolith`] server.
 ///
-/// Call [`Server::builder`] to construct, and [`Server::run`] to execute.
-///
-/// This will construct a server with all of the components that are both
-/// feature-enabled and either active by default or configured to be active
-/// through command line flags.
-pub struct Server {
+/// This interface will be removed as components are factored out
+/// from [`DeprecatedMonolith`] to their own [`Resource`] types.
+pub struct DeprecatedMonolithInner {
     #[cfg(feature = "grpc")]
     grpc: server::grpc::GrpcServer,
     http: server::http::HttpServer,
     tls: tls::TlsConfig,
 }
+
+/// A [builder](https://rust-unofficial.github.io/patterns/patterns/creational/builder.html)
+/// for Comprehensive servers
+///
+/// This will construct a server with all of the components that are both
+/// feature-enabled and either active by default or configured to be active
+/// through command line flags.
+///
+/// This interface will be removed as components are factored out
+/// from [`DeprecatedMonolith`] to their own [`Resource`] types.
+pub struct DeprecatedMonolith(std::sync::Mutex<Option<DeprecatedMonolithInner>>);
 
 async fn run_tasks<T, H, G>(tls: T, http: H, grpc: G) -> Result<(), ComprehensiveError>
 where
@@ -308,11 +304,26 @@ where
     }
 }
 
-impl Server {
-    /// Construct a Comprehensive server with all of the components that are
-    /// both feature-enabled and either active by default or configured to be
-    /// active through the command line flags supplied.
-    pub fn builder(args: Args) -> Result<Self, ComprehensiveError> {
+impl DeprecatedMonolith {
+    /// Configure this monolith server. Accepts a closure that can receive
+    /// and return the server builder state.
+    ///
+    /// This interface will be removed as components are factored out
+    /// from [`DeprecatedMonolith`] to their own [`Resource`] types.
+    pub fn configure(&self, mutator: impl FnOnce(DeprecatedMonolithInner) -> Result<DeprecatedMonolithInner, Box<dyn std::error::Error>>) -> Result<(), Box<dyn std::error::Error>> {
+        let mut inner = self.0.lock().unwrap();
+        let builder = mutator(inner.take().unwrap())?;
+        inner.replace(builder);
+        Ok(())
+    }
+}
+
+impl Resource for DeprecatedMonolith {
+    type Args = Args;
+    type Dependencies = NoDependencies;
+    const NAME: &str = "DeprecatedMonolith";
+
+    fn new(_: NoDependencies, args: Args) -> Result<Self, Box<dyn std::error::Error>> {
         #[cfg(feature = "tls")]
         let tls = tls::TlsConfig::new(args.tls)?;
         #[cfg(not(feature = "tls"))]
@@ -322,57 +333,25 @@ impl Server {
         let grpc = server::grpc::GrpcServer::new(args.grpc_server, &tls)?;
 
         let http = server::http::HttpServer::new(args.http_server, &tls)?;
-        Ok(Self {
+        Ok(Self(std::sync::Mutex::new(Some(DeprecatedMonolithInner {
             #[cfg(feature = "grpc")]
             grpc,
             http,
             tls,
-        })
+        }))))
     }
 
-    /// Run a Comprehensive server asynchronously.
-    ///
-    /// This will return successfully either when there is no work to do
-    /// (which is to say that none of the available servers have been
-    /// configured to run) or when a graceful shutdown has happened (future
-    /// feature). In this case, the return value is false if no work happened
-    /// or true if some work happened but was shut down gracefully.
-    /// Otherwise this will never return unless at least one of the configured
-    /// servers fails. If this happens, all servers are stopped but only the
-    /// first error is reported.
-    pub async fn run(self) -> Result<bool, ComprehensiveError> {
-        let mut sigterm =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-        let mut quitting = false;
-        let shutdown_notify = Notify::new();
-
-        let tls = self.tls.run(&shutdown_notify).fuse();
-        let http = self.http.run(&shutdown_notify).fuse();
+    async fn run_with_termination_signal<'a>(&'a self, term: &'a ShutdownNotify<'a>) -> Result<(), Box<dyn std::error::Error>> {
+        let inner = self.0.lock().unwrap().take().unwrap();
+        let tls = inner.tls.run(term).fuse();
+        let http = inner.http.run(term).fuse();
 
         #[cfg(feature = "grpc")]
-        let grpc = self.grpc.run(&shutdown_notify).fuse();
+        let grpc = inner.grpc.run(term).fuse();
         #[cfg(not(feature = "grpc"))]
         let grpc = std::future::ready(Ok(())).fuse();
 
-        let tasks = run_tasks(tls, http, grpc).fuse();
-        pin_mut!(tasks);
-        loop {
-            select! {
-                _ = sigterm.recv().fuse() => {
-                    if quitting {
-                        log::warn!("SIGTERM received again; quitting immediately.");
-                        break;
-                    }
-                    quitting = true;
-                    log::warn!("SIGTERM received; shutting down");
-                    shutdown_notify.notify_waiters();
-                    continue;
-                },
-                r = tasks => {
-                    return r.map(|_| quitting);
-                }
-            }
-        }
-        Ok(quitting)
+        run_tasks(tls, http, grpc).fuse().await?;
+        Ok(())
     }
 }

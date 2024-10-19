@@ -6,7 +6,6 @@ use prost_types::FileDescriptorSet;
 use std::collections::HashSet;
 use std::convert::Infallible;
 use std::net::{IpAddr, SocketAddr};
-use tokio::sync::Notify;
 use tonic::body::BoxBody;
 use tonic::server::NamedService;
 use tonic::service::Routes;
@@ -109,7 +108,10 @@ impl GrpcServer {
         })
     }
 
-    pub(crate) async fn run(self, shutdown_signal: &Notify) -> Result<(), ComprehensiveError> {
+    pub(crate) async fn run<'a>(
+        self,
+        shutdown_signal: &'a crate::ShutdownNotify<'a>,
+    ) -> Result<(), ComprehensiveError> {
         let mut routes = self.routes;
 
         if let Some(r) = self.reflection {
@@ -142,22 +144,22 @@ impl GrpcServer {
                 (Some((a1, mut s1)), Some((a2, mut s2))) => {
                     let s1 = s1
                         .add_routes(routes.clone())
-                        .serve_with_shutdown(a1, shutdown_signal.notified());
+                        .serve_with_shutdown(a1, shutdown_signal.subscribe());
                     let s2 = s2
                         .add_routes(routes)
-                        .serve_with_shutdown(a2, shutdown_signal.notified());
+                        .serve_with_shutdown(a2, shutdown_signal.subscribe());
                     pin_mut!(s1);
                     pin_mut!(s2);
                     futures::future::select(s1, s2).await.factor_first().0
                 }
                 (Some((a1, mut s1)), None) => {
                     s1.add_routes(routes)
-                        .serve_with_shutdown(a1, shutdown_signal.notified())
+                        .serve_with_shutdown(a1, shutdown_signal.subscribe())
                         .await
                 }
                 (None, Some((a2, mut s2))) => {
                     s2.add_routes(routes)
-                        .serve_with_shutdown(a2, shutdown_signal.notified())
+                        .serve_with_shutdown(a2, shutdown_signal.subscribe())
                         .await
                 }
                 (None, None) => std::future::ready(Ok(())).await,
@@ -170,7 +172,7 @@ impl GrpcServer {
             match self.grpc_server {
                 Some((a1, mut s1)) => {
                     s1.add_routes(routes)
-                        .serve_with_shutdown(a1, shutdown_signal.notified())
+                        .serve_with_shutdown(a1, shutdown_signal.subscribe())
                         .await
                 }
                 None => std::future::ready(Ok(())).await,
@@ -235,7 +237,7 @@ impl GrpcServer {
     }
 }
 
-impl crate::Server {
+impl crate::DeprecatedMonolithInner {
     /// Register a set of descriptors for service reflection
     ///
     /// This method accepts a serialised
@@ -287,6 +289,7 @@ mod tests {
     use std::future::Future;
     use std::net::Ipv6Addr;
     use std::sync::Arc;
+    use tokio::sync::Notify;
     #[cfg(feature = "tls")]
     use tokio_rustls::rustls;
     #[cfg(feature = "tls")]
@@ -338,7 +341,7 @@ mod tests {
 
         let quit = Arc::new(Notify::new());
         let quit_rx = Arc::clone(&quit);
-        let j = tokio::spawn(async move { grpc.run(&quit_rx).await });
+        let j = tokio::spawn(async move { grpc.run(&crate::ShutdownNotify::new(&quit_rx)).await });
         testutil::wait_until_serving(&addr).await;
 
         let uri = format!("http://[::1]:{}/", addr.port()).parse().unwrap();
@@ -376,7 +379,10 @@ mod tests {
         assert!(grpc.grpcs_server.is_none());
 
         let never_quit = Notify::new();
-        assert!(grpc.run(&never_quit).await.is_ok());
+        assert!(grpc
+            .run(&crate::ShutdownNotify::new(&never_quit))
+            .await
+            .is_ok());
         std::mem::drop(tempdir);
     }
 
@@ -534,7 +540,7 @@ mod tests {
 
         let quit = Arc::new(Notify::new());
         let quit_rx = Arc::clone(&quit);
-        let j = tokio::spawn(async move { grpc.run(&quit_rx).await });
+        let j = tokio::spawn(async move { grpc.run(&crate::ShutdownNotify::new(&quit_rx)).await });
         testutil::wait_until_serving(&addr).await;
 
         let channel = test_grpcs_channel(addr.port()).await;
@@ -565,7 +571,7 @@ mod tests {
 
         let quit = Arc::new(Notify::new());
         let quit_rx = Arc::clone(&quit);
-        let j = tokio::spawn(async move { grpc.run(&quit_rx).await });
+        let j = tokio::spawn(async move { grpc.run(&crate::ShutdownNotify::new(&quit_rx)).await });
         testutil::wait_until_serving(&addr_grpc).await;
         testutil::wait_until_serving(&addr_grpcs).await;
 

@@ -12,8 +12,6 @@ use std::sync::Arc;
 #[cfg(feature = "tls")]
 use tokio_rustls::rustls;
 
-use tokio::sync::Notify;
-
 use crate::tls;
 use crate::ComprehensiveError;
 
@@ -83,7 +81,7 @@ where
 
 fn server_with_shutdown<'a, M, A>(
     b: axum_server::Server<A>,
-    shutdown_signal: &'a Notify,
+    shutdown_signal: &'a crate::assembly::ShutdownNotify,
     make_service: M,
 ) -> impl Future<Output = std::io::Result<()>> + 'a
 where
@@ -99,7 +97,7 @@ where
 {
     let handle = axum_server::Handle::new();
     let serve_fut = b.handle(handle.clone()).serve(make_service);
-    let shutdown_signal = shutdown_signal.notified();
+    let shutdown_signal = shutdown_signal.subscribe();
     serve_until_shutdown(serve_fut, shutdown_signal, handle)
 }
 
@@ -133,7 +131,10 @@ impl HttpServer {
         })
     }
 
-    pub(crate) async fn run(self, shutdown_signal: &Notify) -> Result<(), ComprehensiveError> {
+    pub(crate) async fn run<'a>(
+        self,
+        shutdown_signal: &'a crate::assembly::ShutdownNotify<'a>,
+    ) -> Result<(), ComprehensiveError> {
         let http = self.http_addr.map(|a| {
             log::info!("Insecure HTTP listening on {}", a);
             axum_server::bind(a)
@@ -185,7 +186,7 @@ impl HttpServer {
     }
 }
 
-impl crate::Server {
+impl crate::DeprecatedMonolithInner {
     /// Configure the HTTP and/or HTTPS server
     ///
     /// The supplied closure is called with the [`axum::Router`] object that
@@ -196,19 +197,18 @@ impl crate::Server {
     /// ```
     /// use axum::response::IntoResponse;
     ///
-    /// # use clap::Parser;
-    /// # #[derive(Parser, Debug)]
-    /// # struct Args {
-    /// #     #[command(flatten)]
-    /// #     comprehensive: comprehensive::Args,
-    /// # }
     /// async fn demo_page() -> impl axum::response::IntoResponse {
     ///     "hello".into_response()
     /// }
     ///
-    /// let s = comprehensive::Server::builder(Args::parse().comprehensive)
+    /// #[derive(comprehensive::ResourceDependencies)]
+    /// struct TopDependencies(std::sync::Arc<comprehensive::DeprecatedMonolith>);
+    ///
+    /// comprehensive::Assembly::<TopDependencies>::new()
     ///     .unwrap()
-    ///     .http_app(|app| app.route("/fooz", axum::routing::get(demo_page)));
+    ///     .top.0.configure(|b| Ok(b
+    ///         .http_app(|app| app.route("/fooz", axum::routing::get(demo_page)))
+    ///     ));
     /// ```
     pub fn http_app(self, m: impl FnOnce(axum::Router) -> axum::Router) -> Self {
         let http = self.http.http_app(m);
@@ -221,6 +221,7 @@ mod tests {
     use prometheus::register_int_counter;
     use std::net::Ipv6Addr;
     use std::sync::Arc;
+    use tokio::sync::Notify;
 
     use super::*;
     use crate::testutil;
@@ -259,7 +260,10 @@ mod tests {
         assert!(http.https_details.is_none());
 
         let never_quit = Notify::new();
-        assert!(http.run(&never_quit).await.is_ok());
+        assert!(http
+            .run(&crate::ShutdownNotify::new(&never_quit))
+            .await
+            .is_ok());
         std::mem::drop(tempdir);
     }
 
@@ -279,7 +283,7 @@ mod tests {
 
         let quit = Arc::new(Notify::new());
         let quit_rx = Arc::clone(&quit);
-        let j = tokio::spawn(async move { http.run(&quit_rx).await });
+        let j = tokio::spawn(async move { http.run(&crate::ShutdownNotify::new(&quit_rx)).await });
         testutil::wait_until_serving(&addr).await;
 
         let url = format!("http://[::1]:{}/", addr.port());
@@ -326,7 +330,7 @@ mod tests {
 
         let quit = Arc::new(Notify::new());
         let quit_rx = Arc::clone(&quit);
-        let j = tokio::spawn(async move { http.run(&quit_rx).await });
+        let j = tokio::spawn(async move { http.run(&&crate::ShutdownNotify::new(&quit_rx)).await });
         testutil::wait_until_serving(&addr).await;
 
         let cacert = reqwest::Certificate::from_pem(tls::testdata::CACERT).expect("cacert");
@@ -361,7 +365,7 @@ mod tests {
 
         let quit = Arc::new(Notify::new());
         let quit_rx = Arc::clone(&quit);
-        let j = tokio::spawn(async move { http.run(&quit_rx).await });
+        let j = tokio::spawn(async move { http.run(&crate::ShutdownNotify::new(&quit_rx)).await });
         testutil::wait_until_serving(&addr_http).await;
         testutil::wait_until_serving(&addr_https).await;
 

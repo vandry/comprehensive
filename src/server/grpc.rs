@@ -242,10 +242,10 @@ impl crate::DeprecatedMonolithInner {
     ///
     /// This method accepts a serialised
     /// [`FileDescriptorSet`](https://github.com/protocolbuffers/protobuf/blob/main/src/google/protobuf/descriptor.proto)
-    /// proto. It should be called qith the relevant descriptors before calling
+    /// proto. It should be called with the relevant descriptors before calling
     /// [`add_grpc_service`].
     ///
-    /// [`add_grpc_service`]: crate::Server::add_grpc_service
+    /// [`add_grpc_service`]: crate::DeprecatedMonolithInner::add_grpc_service
     pub fn register_encoded_file_descriptor_set(self, serialised_fds: &[u8]) -> Self {
         let grpc = self
             .grpc
@@ -267,8 +267,8 @@ impl crate::DeprecatedMonolithInner {
     /// called with a descriptor for this service, or
     /// [`disable_grpc_reflection`] must have been called instead.
     ///
-    /// [`register_encoded_file_descriptor_set`]: crate::Server::register_encoded_file_descriptor_set
-    /// [`disable_grpc_reflection`]: crate::Server::disable_grpc_reflection
+    /// [`register_encoded_file_descriptor_set`]: crate::DeprecatedMonolithInner::register_encoded_file_descriptor_set
+    /// [`disable_grpc_reflection`]: crate::DeprecatedMonolithInner::disable_grpc_reflection
     pub fn add_grpc_service<S>(self, svc: S) -> Result<Self, ComprehensiveError>
     where
         S: Service<Request<BoxBody>, Response = Response<BoxBody>, Error = Infallible>

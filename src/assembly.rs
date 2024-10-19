@@ -450,7 +450,7 @@ where
             active_list(&names)
         );
         let mut combined =
-            stream_select!(stream.map(|r| Some(r)), termination_signal.map(|_| None));
+            stream_select!(stream.map(Some), termination_signal.map(|_| None));
         loop {
             if running_count == 0 {
                 break;

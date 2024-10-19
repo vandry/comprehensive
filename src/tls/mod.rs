@@ -173,9 +173,9 @@ impl ReloadableKeyAndCert {
     fn new(key_path: PathBuf, cert_path: PathBuf) -> Result<Self, ComprehensiveError> {
         let mut loader = ReloadableKeyAndCertLoader {
             provider: CryptoProvider::get_default().expect("default CryptoProvider"),
-            key_path: key_path,
+            key_path,
             key_meta: None,
-            cert_path: cert_path,
+            cert_path,
             cert_meta: None,
         };
         #[cfg(feature = "grpc")]
@@ -247,19 +247,20 @@ impl Resource for TlsConfig {
         };
         Ok(Self {
             inner: std::sync::Mutex::new(inner),
-            cacert: args.cacert.map(|path| std::fs::read(path)).transpose()?,
+            cacert: args.cacert.map(std::fs::read).transpose()?,
         })
     }
 
     async fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
         let inner = self.inner.lock().unwrap().take();
-        Ok(match inner {
+        match inner {
             None => (),
             Some(mut inner) => loop {
                 tokio::time::sleep(RELOAD_INTERVAL).await;
                 inner.maybe_reload();
             },
-        })
+        };
+        Ok(())
     }
 }
 
@@ -272,7 +273,7 @@ impl TlsConfig {
         let inner = self.inner.lock().unwrap();
         match inner.as_ref() {
             None => Err(ComprehensiveError::NoTlsFlags),
-            Some(ref inner) => Ok(Arc::clone(&inner.resolver)),
+            Some(inner) => Ok(Arc::clone(&inner.resolver)),
         }
     }
 
@@ -285,7 +286,7 @@ impl TlsConfig {
         let inner = self.inner.lock().unwrap();
         match inner.as_ref() {
             None => Err(ComprehensiveError::NoTlsFlags),
-            Some(ref inner) => {
+            Some(inner) => {
                 let identity = tonic::transport::Identity::from_pem(
                     &inner.pem_key_and_cert[1],
                     &inner.pem_key_and_cert[0],

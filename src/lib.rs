@@ -120,7 +120,9 @@ use tokio_rustls::rustls;
 pub mod assembly;
 mod server;
 
-pub use assembly::{Assembly, NoArgs, NoDependencies, Resource, ResourceDependencies, ShutdownNotify};
+pub use assembly::{
+    Assembly, NoArgs, NoDependencies, Resource, ResourceDependencies, ShutdownNotify,
+};
 
 // This is necessary for using the macros defined in comprehensive_macros
 // within this crate.
@@ -153,9 +155,6 @@ mod testutil;
 ///
 /// | Flag                | Default    | Meaning                 |
 /// |---------------------|------------|-------------------------|
-/// | `--key_path`        | *none*     | Path to TLS key in PEM format. If unset, secure servers cannot be configured. |
-/// | `--cert_path`       | *none*     | Path to TLS certificate in PEM format. If unset, secure servers cannot be configured. |
-/// | `--cacert`          | *none*     | Path to TLS root certificate for verifying gRPCs clients, in PEM format. If unset, clients are not verified. |
 /// | `--grpc_port`       | *none*     | TCP port number for insecure gRPC server. If unset, plain gRPC is not served. |
 /// | `--grpc_bind_addr`  | `::`       | Binding IP address for gRPC. Used only if `--grpc_port` is set. |
 /// | `--grpcs_port`      | *none*     | TCP port number for secure gRPC server. If unset, gRPCs is not served. |
@@ -194,15 +193,15 @@ pub enum ComprehensiveError {
     TonicTransportError(tonic::transport::Error),
     /// Indicates an attempt to add a gRPC service without supplying its
     /// service descriptor first. Descriptors must be registered using
-    /// [`Server::register_encoded_file_descriptor_set`] before calling
-    /// [`Server::add_grpc_service`] to add the service. The reason this is
+    /// [`DeprecatedMonolithInner::register_encoded_file_descriptor_set`] before calling
+    /// [`DeprecatedMonolithInner::add_grpc_service`] to add the service. The reason this is
     /// an error is to help encourage server reflection (which is a valuable
     /// diagnostic tool) to be always available for every service.
     /// Unfortunately Tonic does not currently attach service descriptors to
     /// service traits so that this can be done automatically.
     ///
-    /// To decline server reflection, call [`Server::disable_grpc_reflection`]
-    /// before [`Server::add_grpc_service`] instead.
+    /// To decline server reflection, call [`DeprecatedMonolithInner::disable_grpc_reflection`]
+    /// before [`DeprecatedMonolithInner::add_grpc_service`] instead.
     #[cfg(feature = "grpc")]
     NoServiceDescriptor(&'static str),
 }
@@ -298,7 +297,12 @@ impl DeprecatedMonolith {
     ///
     /// This interface will be removed as components are factored out
     /// from [`DeprecatedMonolith`] to their own [`Resource`] types.
-    pub fn configure(&self, mutator: impl FnOnce(DeprecatedMonolithInner) -> Result<DeprecatedMonolithInner, Box<dyn std::error::Error>>) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn configure(
+        &self,
+        mutator: impl FnOnce(
+            DeprecatedMonolithInner,
+        ) -> Result<DeprecatedMonolithInner, Box<dyn std::error::Error>>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let mut inner = self.0.lock().unwrap();
         let builder = mutator(inner.take().unwrap())?;
         inner.replace(builder);
@@ -318,7 +322,10 @@ impl Resource for DeprecatedMonolith {
     type Dependencies = DeprecatedMonolithDependencies;
     const NAME: &str = "DeprecatedMonolith";
 
-    fn new(d: DeprecatedMonolithDependencies, args: Args) -> Result<Self, Box<dyn std::error::Error>> {
+    fn new(
+        d: DeprecatedMonolithDependencies,
+        args: Args,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         #[cfg(feature = "tls")]
         let tls = d.tls;
         #[cfg(not(feature = "tls"))]
@@ -338,7 +345,10 @@ impl Resource for DeprecatedMonolith {
         }))))
     }
 
-    async fn run_with_termination_signal<'a>(&'a self, term: &'a ShutdownNotify<'a>) -> Result<(), Box<dyn std::error::Error>> {
+    async fn run_with_termination_signal<'a>(
+        &'a self,
+        term: &'a ShutdownNotify<'a>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let inner = self.0.lock().unwrap().take().unwrap();
         let http = inner.http.run(term).fuse();
 

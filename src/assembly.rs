@@ -29,25 +29,51 @@ use async_trait::async_trait;
 use clap::{ArgMatches, Args, Command, FromArgMatches};
 use downcast_rs::{impl_downcast, DowncastSync};
 use futures::stream::FuturesUnordered;
-use futures::{poll, StreamExt};
+use futures::{poll, stream_select, FutureExt, Stream, StreamExt};
 use std::any::TypeId;
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::error::Error;
 use std::future::Future;
+use std::pin::pin;
 use std::sync::Arc;
 use std::task::Poll;
+use tokio::sync::{futures::Notified, Notify};
+
+/// Passed to [`Resource::run_with_termination_signal`] to offer resources
+/// a chance to react to a termination request signal. Interested resources
+/// should call [`ShutdownNotify::subscribe`].
+pub struct ShutdownNotify<'a>(&'a Notify);
+
+impl<'a> ShutdownNotify<'a> {
+    /// Returns a new [`Future`] which will resolve when termination
+    /// is requested.
+    pub fn subscribe(&'a self) -> Notified<'a> {
+        self.0.notified()
+    }
+}
 
 #[async_trait]
 trait ResourceObject: DowncastSync {
-    async fn run(&self, selfindex: usize) -> (usize, Result<(), Box<dyn Error>>);
+    async fn run<'a>(
+        &self,
+        selfindex: usize,
+        subscribe_to_termination: &'a ShutdownNotify,
+    ) -> (usize, Result<(), Box<dyn Error>>);
 }
 impl_downcast!(sync ResourceObject);
 
 #[async_trait]
 impl<T: Resource + Send> ResourceObject for T {
-    async fn run(&self, selfindex: usize) -> (usize, Result<(), Box<dyn Error>>) {
-        (selfindex, Resource::run(self).await)
+    async fn run<'a>(
+        &self,
+        selfindex: usize,
+        subscribe_to_termination: &'a ShutdownNotify,
+    ) -> (usize, Result<(), Box<dyn Error>>) {
+        (
+            selfindex,
+            Resource::run_with_termination_signal(self, subscribe_to_termination).await,
+        )
     }
 }
 
@@ -99,6 +125,23 @@ pub trait Resource: ResourceObject + Sized {
     /// The default implementation exits immediately.
     fn run(&self) -> impl Future<Output = Result<(), Box<dyn Error>>> + Send {
         async { Ok(()) }
+    }
+
+    /// Execute a background task belonging to this resource. Awaited
+    /// together with the tasks for all other resourcees in [`Assembly::run`].
+    ///
+    /// The default implementation delegates to [`Resource::run`] except that
+    /// it exits (successfully) as soon as a termination signal is received.
+    fn run_with_termination_signal<'a>(
+        &'a self,
+        subscribe_to_termination: &'a ShutdownNotify<'a>,
+    ) -> impl Future<Output = Result<(), Box<dyn Error>>> + Send + 'a {
+        let term_signal = subscribe_to_termination.subscribe();
+        async move {
+            let runner = pin!(Resource::run(self));
+            let term = pin!(term_signal.map(|_| Ok(())));
+            futures::future::select(runner, term).await.factor_first().0
+        }
     }
 }
 
@@ -347,12 +390,31 @@ where
     /// resources terminate successfully. (Returns immediately on an empty
     /// graph.)
     pub async fn run(self) -> Result<(), Box<dyn Error>> {
+        self.run_with_termination_signal(tokio_stream::wrappers::SignalStream::new(
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?,
+        ))
+        .await
+    }
+
+    /// Run an [`Assembly`] by invoking and awaiting [`Resource::run`] on every
+    /// resource in the graph.
+    ///
+    /// Callers should usually use [`Assembly::run`] instead, which installs a
+    /// `SIGTERM` handler and then calls this with it.
+    pub async fn run_with_termination_signal(
+        self,
+        termination_signal: impl Stream<Item = ()> + Unpin,
+    ) -> Result<(), Box<dyn Error>> {
         let mut names = self
             .resources
             .iter()
             .map(|e| Some(e.name))
             .collect::<Vec<_>>()
             .into_boxed_slice();
+        let mut running_count = self.resources.len();
+        let mut quitting = false;
+        let shutdown_notify = Notify::new();
+        let notify_interface = ShutdownNotify(&shutdown_notify);
         log::info!(
             "Comprehensive starting with {} resources: {}",
             self.resources.len(),
@@ -362,13 +424,14 @@ where
             .resources
             .iter()
             .enumerate()
-            .map(|(i, entry)| entry.resource.run(i))
+            .map(|(i, entry)| entry.resource.run(i, &notify_interface))
             .collect();
 
         // Flush out all the initialisation work, including resources with empty
         // run methods.
         while let Poll::Ready(Some((i, result))) = poll!(stream.next()) {
             let name = mark_complete(&mut names, i);
+            running_count -= 1;
             if let Err(e) = result {
                 log::error!("{} failed: {}", name, e);
                 return Err(e);
@@ -381,15 +444,37 @@ where
             stream.len(),
             active_list(&names)
         );
-        while let Some((i, result)) = stream.next().await {
-            let name = mark_complete(&mut names, i);
-            match result {
-                Err(e) => {
-                    log::error!("{} failed: {}", name, e);
-                    return Err(e);
+        let mut combined =
+            stream_select!(stream.map(|r| Some(r)), termination_signal.map(|_| None));
+        loop {
+            if running_count == 0 {
+                break;
+            }
+            let Some(r) = combined.next().await else {
+                break;
+            };
+            match r {
+                Some((i, result)) => {
+                    let name = mark_complete(&mut names, i);
+                    running_count -= 1;
+                    match result {
+                        Err(e) => {
+                            log::error!("{} failed: {}", name, e);
+                            return Err(e);
+                        }
+                        Ok(()) => {
+                            log::info!("{} exited successfully", name);
+                        }
+                    }
                 }
-                Ok(()) => {
-                    log::info!("{} exited successfully", name);
+                None => {
+                    if quitting {
+                        log::warn!("SIGTERM received again; quitting immediately.");
+                        break;
+                    }
+                    quitting = true;
+                    log::warn!("SIGTERM received; shutting down");
+                    shutdown_notify.notify_waiters();
                 }
             }
         }
@@ -605,11 +690,91 @@ mod tests {
             Assembly::<TopDependencies>::new()
         }
         .unwrap()
-        .run()
+        .run_with_termination_signal(futures::stream::pending())
         .await;
         let Err(e) = res else {
             panic!("poll should have returned an error");
         };
         assert_eq!(e.to_string(), "no good");
+    }
+
+    struct RunUntilSignaled(Notify);
+
+    impl Resource for RunUntilSignaled {
+        type Args = NoArgs;
+        type Dependencies = NoDependencies;
+        const NAME: &str = "RunUntilSignaled";
+
+        fn new(_: NoDependencies, _: NoArgs) -> Result<Self, Box<dyn std::error::Error>> {
+            Ok(Self(Notify::new()))
+        }
+
+        async fn run(&self) -> Result<(), Box<dyn Error>> {
+            Ok(self.0.notified().await)
+        }
+    }
+
+    #[derive(ResourceDependencies)]
+    struct RunUntilSignaledTop(Arc<RunUntilSignaled>);
+
+    #[tokio::test]
+    async fn runs_until_resource_quits() {
+        let assembly = Assembly::<RunUntilSignaledTop>::new().unwrap();
+        let notify = &Arc::clone(&assembly.top.0).0;
+        let mut r = pin!(assembly.run_with_termination_signal(futures::stream::pending()));
+        assert!(poll!(&mut r).is_pending());
+        notify.notify_waiters();
+        assert!(poll!(&mut r).is_ready());
+    }
+
+    #[tokio::test]
+    async fn runs_until_overall_shutdown() {
+        let assembly = Assembly::<RunUntilSignaledTop>::new().unwrap();
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let mut r =
+            pin!(assembly
+                .run_with_termination_signal(tokio_stream::wrappers::ReceiverStream::new(rx)));
+        assert!(poll!(&mut r).is_pending());
+        let _ = tx.send(()).await;
+        assert!(poll!(&mut r).is_ready());
+    }
+
+    struct RunStubbornly;
+
+    impl Resource for RunStubbornly {
+        type Args = NoArgs;
+        type Dependencies = NoDependencies;
+        const NAME: &str = "RunStubbornly";
+
+        fn new(_: NoDependencies, _: NoArgs) -> Result<Self, Box<dyn std::error::Error>> {
+            Ok(Self)
+        }
+
+        async fn run_with_termination_signal<'a>(
+            &'a self,
+            _subscribe_to_termination: &'a ShutdownNotify<'a>,
+        ) -> Result<(), Box<dyn Error>> {
+            Ok(futures::future::pending().await)
+        }
+    }
+
+    #[derive(ResourceDependencies)]
+    struct RunStubbornlyTop(Arc<RunStubbornly>);
+
+    #[tokio::test]
+    async fn needs_2_sigterms() {
+        let assembly = Assembly::<RunStubbornlyTop>::new().unwrap();
+        let _ = assembly.top.0;
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let mut r =
+            pin!(assembly
+                .run_with_termination_signal(tokio_stream::wrappers::ReceiverStream::new(rx)));
+        assert!(poll!(&mut r).is_pending());
+        let _ = tx.send(()).await;
+        // Does not quit after the first request.
+        assert!(poll!(&mut r).is_pending());
+        let _ = tx.send(()).await;
+        // Does quit after the second.
+        assert!(poll!(&mut r).is_ready());
     }
 }

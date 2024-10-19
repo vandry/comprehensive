@@ -31,6 +31,7 @@ prost-types = { version = "0.13", optional = true }
 rustls-pemfile = { version = "2.1", optional = true }
 tokio = { version = "1.40", features = ["macros", "rt-multi-thread", "signal"] }
 tokio-rustls = { version = "0.26", optional = true }
+tokio-stream = { version = "0.1", features = ["signal"] }
 tonic = { version = "0.12", optional = true }
 tonic-health = { version = "0.12", optional = true }
 tonic-reflection = { version = "0.12", optional = true }

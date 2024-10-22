@@ -1,14 +1,6 @@
 use std::net::{IpAddr, Ipv6Addr, SocketAddr, TcpListener};
 use tokio::net::TcpStream;
 
-#[cfg(feature = "grpc")]
-pub(crate) mod pb {
-    pub(crate) mod comprehensive {
-        tonic::include_proto!("comprehensive");
-        pub(crate) const FILE_DESCRIPTOR_SET: &[u8] = tonic::include_file_descriptor_set!("fdset");
-    }
-}
-
 pub(crate) fn pick_unused_port(not_this_one: Option<u16>) -> u16 {
     let start = rand::random::<u16>() & 0x7fff;
     for low_bits in start..start + 50 {

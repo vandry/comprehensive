@@ -357,6 +357,17 @@ where
     /// Build a new [`Assembly`] from the given resources and all their
     /// transitive dependencies.
     pub fn new() -> Result<Self, Box<dyn Error>> {
+        Self::new_from_argv(std::env::args_os())
+    }
+
+    /// Build a new [`Assembly`] from the given resources and all their
+    /// transitive dependencies, with a given command line argv.
+    /// Mostly for testing.
+    pub fn new_from_argv<I, A>(argv: I) -> Result<Self, Box<dyn Error>>
+    where
+        I: IntoIterator<Item = A>,
+        A: Into<std::ffi::OsString> + Clone,
+    {
         let mut registry = HashMap::new();
         let mut cx = RegisterContext {
             registry: &mut registry,
@@ -367,7 +378,7 @@ where
         T::register(&mut cx);
         let command = GlobalArgs::augment_args(cx.command.take().unwrap());
 
-        let mut arg_matches = command.get_matches();
+        let mut arg_matches = command.get_matches_from(argv);
         let global_args = GlobalArgs::from_arg_matches(&arg_matches)?;
 
         if global_args.write_graph_and_exit {
@@ -449,8 +460,7 @@ where
             stream.len(),
             active_list(&names)
         );
-        let mut combined =
-            stream_select!(stream.map(Some), termination_signal.map(|_| None));
+        let mut combined = stream_select!(stream.map(Some), termination_signal.map(|_| None));
         loop {
             if running_count == 0 {
                 break;

@@ -165,7 +165,7 @@ impl ResolvesServerCert for ReloadableKeyAndCertResolver {
 struct ReloadableKeyAndCert {
     loader: ReloadableKeyAndCertLoader,
     resolver: Arc<ReloadableKeyAndCertResolver>,
-    #[cfg(feature = "grpc")]
+    #[cfg(feature = "unreloadable_tls")]
     pem_key_and_cert: [Vec<u8>; 2],
 }
 
@@ -178,16 +178,16 @@ impl ReloadableKeyAndCert {
             cert_path,
             cert_meta: None,
         };
-        #[cfg(feature = "grpc")]
+        #[cfg(feature = "unreloadable_tls")]
         let (certified_key, key_pem, cert_pem) = loader.load()?;
-        #[cfg(not(feature = "grpc"))]
+        #[cfg(not(feature = "unreloadable_tls"))]
         let (certified_key, _, _) = loader.load()?;
         Ok(Self {
             loader,
             resolver: Arc::new(ReloadableKeyAndCertResolver(ArcSwap::from_pointee(
                 certified_key,
             ))),
-            #[cfg(feature = "grpc")]
+            #[cfg(feature = "unreloadable_tls")]
             pem_key_and_cert: [key_pem, cert_pem],
         })
     }
@@ -264,6 +264,19 @@ impl Resource for TlsConfig {
     }
 }
 
+/// struct returned by [`TlsConfig::snapshot`] that contains a snapshot of
+/// the currently loaded TLS certificate and corresponding key, as well as
+/// a CA certificate for verifying peers.
+#[cfg(feature = "unreloadable_tls")]
+pub struct TlsDataSnapshot {
+    /// X.509 key in PEM format.
+    pub key: Vec<u8>,
+    /// X.509 certificate in PEM format.
+    pub cert: Vec<u8>,
+    /// X.509 CA certificate in PEM format.
+    pub cacert: Option<Vec<u8>>,
+}
+
 impl TlsConfig {
     /// Returns a struct that implements the
     /// [`rustls::server::ResolvesServerCert`] trait. This can be
@@ -277,27 +290,20 @@ impl TlsConfig {
         }
     }
 
-    /// Returns a preloaded [`tonic::transport::ServerTlsConfig`] object
-    /// with the currently loaded key and certificate. This is unreloadable
+    /// Returns an object with raw [`Vec<u8>`] PEM representations of the
+    /// currently loaded key and certificate. This is unreloadable
     /// unfortunately so it should only be used for `tonic`, which
     /// currently cannot consume a [`rustls::server::ResolvesServerCert`].
-    #[cfg(feature = "grpc")]
-    pub fn snapshot(&self) -> Result<tonic::transport::ServerTlsConfig, ComprehensiveError> {
+    #[cfg(feature = "unreloadable_tls")]
+    pub fn snapshot(&self) -> Result<TlsDataSnapshot, ComprehensiveError> {
         let inner = self.inner.lock().unwrap();
         match inner.as_ref() {
             None => Err(ComprehensiveError::NoTlsFlags),
-            Some(inner) => {
-                let identity = tonic::transport::Identity::from_pem(
-                    &inner.pem_key_and_cert[1],
-                    &inner.pem_key_and_cert[0],
-                );
-                let mut tls = tonic::transport::ServerTlsConfig::new().identity(identity);
-                if let Some(ref cacert) = self.cacert {
-                    let cert = tonic::transport::Certificate::from_pem(cacert);
-                    tls = tls.client_ca_root(cert);
-                }
-                Ok(tls)
-            }
+            Some(inner) => Ok(TlsDataSnapshot {
+                key: inner.pem_key_and_cert[0].clone(),
+                cert: inner.pem_key_and_cert[1].clone(),
+                cacert: self.cacert.clone(),
+            }),
         }
     }
 

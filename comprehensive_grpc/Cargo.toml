@@ -1,0 +1,38 @@
+[package]
+name = "comprehensive_grpc"
+version = "0.3.0"
+edition = "2021"
+repository = "https://github.com/vandry/comprehensive.git"
+homepage = "https://github.com/vandry/comprehensive"
+description = "A harness for creating consistently-shaped servers will less boilerplate"
+license = "MIT"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+comprehensive = { path = "..", version = "=0.3.0" }
+comprehensive_macros = { path = "../comprehensive_macros", version = "=0.3.0" }
+const_format = "0.2"
+futures = "0.3"
+http = "1.1"
+log = "0.4"
+prometheus = "0.13"
+prost = "0.13"
+prost-types = "0.13"
+tokio = "1.40"
+tonic = "0.12"
+tonic-health = "0.12"
+tonic-reflection = "0.12"
+tonic_prometheus_layer = "0.1"
+tower = "0.5"
+tower-layer = "0.3"
+
+[features]
+tls = ["comprehensive/tls", "comprehensive/unreloadable_tls", "tonic/tls"]
+
+[build-dependencies]
+tonic-build = "0.12"
+
+[dev-dependencies]
+rand = "0.8"
+tokio-rustls = "0.26"
+tokio-stream = "0.1"

@@ -1,12 +1,13 @@
 [workspace]
 resolver = "2"
 members = [
+  "comprehensive_grpc",
   "comprehensive_macros",
 ]
 
 [package]
 name = "comprehensive"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 repository = "https://github.com/vandry/comprehensive.git"
 homepage = "https://github.com/vandry/comprehensive"
@@ -19,30 +20,21 @@ async-trait = "0.1"
 axum = "0.7"
 axum-server = "0.7"
 clap = { version = "4.5", features = ["derive"] }
-comprehensive_macros = { path = "comprehensive_macros", version = "=0.2.0" }
+comprehensive_macros = { path = "comprehensive_macros", version = "=0.3.0" }
 downcast-rs = "1.2"
 futures = "0.3"
 http = "1.1"
 hyper = "1.4"
 log = "0.4"
 prometheus = "0.13"
-prost = { version = "0.13", optional = true }
-prost-types = { version = "0.13", optional = true }
 rustls-pemfile = { version = "2.1", optional = true }
 tokio = { version = "1.40", features = ["macros", "rt-multi-thread", "signal"] }
 tokio-rustls = { version = "0.26", optional = true }
 tokio-stream = { version = "0.1", features = ["signal"] }
-tonic = { version = "0.12", optional = true }
-tonic-health = { version = "0.12", optional = true }
-tonic-reflection = { version = "0.12", optional = true }
-tonic_prometheus_layer = { version = "0.1", optional = true }
-tower-layer = { version = "0.3", optional = true }
-tower = { version = "0.5", optional = true }
 
 [features]
-grpc = ["dep:prost", "dep:prost-types", "dep:tonic", "dep:tonic-build", "dep:tonic-health", "dep:tonic-reflection", "dep:tonic_prometheus_layer", "dep:tower", "dep:tower-layer"]
-grpc_acl = ["grpc"]
-tls = ["tonic?/tls", "axum-server/tls-rustls", "dep:arc-swap", "dep:tokio-rustls", "dep:rustls-pemfile"]
+tls = ["axum-server/tls-rustls", "dep:arc-swap", "dep:tokio-rustls", "dep:rustls-pemfile"]
+unreloadable_tls = []
 
 [dev-dependencies]
 rand = "0.8"
@@ -50,6 +42,3 @@ regex = "1.11"
 reqwest = "0.12"
 tempfile = "3"
 tokio-stream = "0.1"
-
-[build-dependencies]
-tonic-build = { version = "0.12", optional = true }

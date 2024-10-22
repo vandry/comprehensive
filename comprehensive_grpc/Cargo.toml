@@ -7,6 +7,10 @@ homepage = "https://github.com/vandry/comprehensive"
 description = "A harness for creating consistently-shaped servers will less boilerplate"
 license = "MIT"
 
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
 comprehensive = { path = "..", version = "=0.3.0" }

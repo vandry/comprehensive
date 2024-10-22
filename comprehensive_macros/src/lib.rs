@@ -1,3 +1,7 @@
+//! Macros in support of [`comprehensive`]. It is not necessary to depend on this crate directly.
+//!
+//! [`comprehensive`]: https://docs.rs/comprehensive/latest/comprehensive/
+
 extern crate proc_macro;
 use proc_macro2::{Span, TokenStream};
 use quote::{format_ident, quote, quote_spanned};

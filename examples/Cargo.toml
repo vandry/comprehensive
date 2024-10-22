@@ -1,0 +1,23 @@
+[package]
+edition = "2021"
+license = "MIT"
+name = "examples"
+publish = false
+version = "0.1.0"
+
+[[bin]]
+name = "helloworld-grpc-server"
+path = "src/helloworld-grpc-server.rs"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+comprehensive = { path = "..", version = "0.3", features = ["tls"] }
+comprehensive_grpc = { path = "../comprehensive_grpc", version = "0.3", features = ["tls"] }
+env_logger = "0.10"
+prost = "0.13"
+tokio = { version = "1.40", features = ["rt-multi-thread", "macros"] }
+tokio-rustls = "0.26"
+tonic = "0.12"
+
+[build-dependencies]
+tonic-build = "0.12"

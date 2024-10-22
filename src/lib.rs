@@ -31,12 +31,18 @@
 //!
 //! Comprehensive is still in early development. Many more features are planned.
 //!
+//! # Examples
+//!
+//! [Hello World gRPC server]
+//!
 //! # Feature Flags
 //!
 //! - `tls`: Enables secure versions of each protocol (currently gRPC and HTTP).
 //!   Requires [rustls](https://crates.io/crates/rustls).
 //!
 //! Most features, such as HTTP and Prometheus metrics, are always available.
+//!
+//! [Hello World gRPC server]: https://github.com/vandry/comprehensive/blob/master/examples/src/helloworld-grpc-server.rs
 
 #![warn(missing_docs)]
 

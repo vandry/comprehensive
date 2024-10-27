@@ -9,7 +9,7 @@ use syn::punctuated::Punctuated;
 use syn::spanned::Spanned;
 use syn::{
     parse_macro_input, Attribute, Data, DeriveInput, Fields, GenericArgument, Generics, Ident,
-    PathArguments, Type,
+    LitStr, PathArguments, Type,
 };
 
 fn find_type_inside_arc(ty: &Type) -> Result<&Type, Span> {
@@ -181,6 +181,123 @@ fn derive_grpc_service_internal(
 pub fn derive_grpc_service(item: proc_macro::TokenStream) -> proc_macro::TokenStream {
     let input: DeriveInput = parse_macro_input!(item);
     derive_grpc_service_internal(&input.ident, &input.generics, &input.attrs)
+        .unwrap_or_else(|e| {
+            let e = e.to_compile_error();
+            quote! { #e }
+        })
+        .into()
+}
+
+fn get_str_lit_val(v: &syn::Expr) -> Result<LitStr, Span> {
+    let syn::Expr::Lit(exprlit) = v else {
+        return Err(v.span());
+    };
+    let syn::Lit::Str(ref litstr) = exprlit.lit else {
+        return Err(exprlit.lit.span());
+    };
+    Ok(litstr.clone())
+}
+
+fn is_router(f: &syn::Field) -> bool {
+    f.attrs.iter().any(|a| a.path().is_ident("router"))
+}
+
+fn derive_h_s_i(
+    name: &Ident,
+    data: &Data,
+    generics: &Generics,
+    attrs: &[Attribute],
+) -> Result<TokenStream, syn::Error> {
+    let mut flag_prefix: Option<LitStr> = None;
+    for attr in attrs {
+        if attr.path().is_ident("flag_prefix") {
+            flag_prefix = match get_str_lit_val(&attr.meta.require_name_value()?.value) {
+                Ok(prefix) => Some(prefix),
+                Err(span) => {
+                    return Ok(quote_spanned! {
+                        span => compile_error!("flag_prefix argument must be str literal");
+                    });
+                }
+            };
+        }
+    }
+    let Some(flag_prefix) = flag_prefix else {
+        return Ok(quote! {
+            compile_error!("`[#flag_prefix = \"foo_\"]` is required");
+        });
+    };
+    let Data::Struct(ref st) = data else {
+        return Ok(quote! {
+            compile_error!("`#[derive(HttpServingInstance)]` requires a struct");
+        });
+    };
+    let router_members: Vec<syn::Member> = match st.fields {
+        Fields::Named(ref f) => f
+            .named
+            .iter()
+            .filter_map(|field| {
+                if is_router(field) {
+                    Some(syn::Member::Named(field.ident.clone().unwrap()))
+                } else {
+                    None
+                }
+            })
+            .take(2)
+            .collect(),
+        Fields::Unnamed(ref f) => f
+            .unnamed
+            .iter()
+            .enumerate()
+            .filter_map(|(i, field)| {
+                if is_router(field) {
+                    Some(syn::Member::Unnamed(syn::Index {
+                        index: i as u32,
+                        span: field.span(),
+                    }))
+                } else {
+                    None
+                }
+            })
+            .take(2)
+            .collect(),
+        Fields::Unit => Vec::new(),
+    };
+    if router_members.len() != 1 {
+        return Ok(quote! {
+            compile_error!("exactly 1 struct field must be annotated with #[router]");
+        });
+    }
+    let router_member = router_members.get(0).unwrap();
+
+    let http_port_flag_name = format!("{}http-port", flag_prefix.value());
+    let http_port_flag_name_lit = LitStr::new(&http_port_flag_name, flag_prefix.span());
+    let http_bind_addr_flag_name = format!("{}http-bind-addr", flag_prefix.value());
+    let http_bind_addr_flag_name_lit = LitStr::new(&http_bind_addr_flag_name, flag_prefix.span());
+    let https_port_flag_name = format!("{}https-port", flag_prefix.value());
+    let https_port_flag_name_lit = LitStr::new(&https_port_flag_name, flag_prefix.span());
+    let https_bind_addr_flag_name = format!("{}https-bind-addr", flag_prefix.value());
+    let https_bind_addr_flag_name_lit = LitStr::new(&https_bind_addr_flag_name, flag_prefix.span());
+
+    let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
+    Ok(quote! {
+        #[automatically_derived]
+        impl #impl_generics ::comprehensive::http::HttpServingInstance for #name #ty_generics #where_clause {
+            const HTTP_PORT_FLAG_NAME: &str = #http_port_flag_name_lit ;
+            const HTTP_BIND_ADDR_FLAG_NAME: &str = #http_bind_addr_flag_name_lit ;
+            const HTTPS_PORT_FLAG_NAME: &str = #https_port_flag_name_lit ;
+            const HTTPS_BIND_ADDR_FLAG_NAME: &str = #https_bind_addr_flag_name_lit ;
+
+            fn get_router(&self) -> ::axum::Router {
+                self. #router_member .clone()
+            }
+        }
+    })
+}
+
+#[proc_macro_derive(HttpServingInstance, attributes(flag_prefix, router))]
+pub fn derive_http_serving_instance(item: proc_macro::TokenStream) -> proc_macro::TokenStream {
+    let input: DeriveInput = parse_macro_input!(item);
+    derive_h_s_i(&input.ident, &input.data, &input.generics, &input.attrs)
         .unwrap_or_else(|e| {
             let e = e.to_compile_error();
             quote! { #e }

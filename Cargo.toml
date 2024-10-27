@@ -8,12 +8,13 @@ members = [
 
 [package]
 name = "comprehensive"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 repository = "https://github.com/vandry/comprehensive.git"
 homepage = "https://github.com/vandry/comprehensive"
 description = "A harness for creating consistently-shaped servers will less boilerplate"
 license = "MIT"
+autoexamples = false
 
 [package.metadata.docs.rs]
 all-features = true
@@ -22,10 +23,11 @@ rustdoc-args = ["--cfg", "docsrs"]
 [dependencies]
 arc-swap = { version = "1.7", optional = true }
 async-trait = "0.1"
+atomic-take = "1.1"
 axum = "0.7"
 axum-server = "0.7"
 clap = { version = "4.5", features = ["derive"] }
-comprehensive_macros = { path = "comprehensive_macros", version = "=0.3.0" }
+comprehensive_macros = { path = "comprehensive_macros", version = "=0.4.0" }
 downcast-rs = "1.2"
 futures = "0.3"
 http = "1.1"
@@ -47,3 +49,4 @@ regex = "1.11"
 reqwest = "0.12"
 tempfile = "3"
 tokio-stream = "0.1"
+tower-service = "0.3"

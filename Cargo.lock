@@ -121,6 +121,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "atomic-take"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a8ab6b55fe97976e46f91ddbed8d147d966475dc29b2032757ba47e02376fbc3"
+
+[[package]]
 name = "atomic-waker"
 version = "1.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -400,10 +406,11 @@ checksum = "d3fd119d74b830634cea2a0f58bbd0d54540518a14397557951e79340abc28c0"
 
 [[package]]
 name = "comprehensive"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "arc-swap",
  "async-trait",
+ "atomic-take",
  "axum",
  "axum-server",
  "clap",
@@ -422,11 +429,12 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tokio-stream",
+ "tower-service",
 ]
 
 [[package]]
 name = "comprehensive_grpc"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "clap",
  "comprehensive",
@@ -453,7 +461,7 @@ dependencies = [
 
 [[package]]
 name = "comprehensive_macros"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "proc-macro2",
  "quote",

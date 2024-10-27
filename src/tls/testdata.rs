@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-const USER1_KEY: &[u8] = br#"
+pub(crate) const USER1_KEY: &[u8] = br#"
 -----BEGIN PRIVATE KEY-----
 MIIJQQIBADANBgkqhkiG9w0BAQEFAASCCSswggknAgEAAoICAQDxusR41enNC45F
 YXfe1hBRFqEBUtILRwKmIo4vfBWFqwVoAAW4S9gJ75gD9O+1hD3lolH/7IJUBXfI

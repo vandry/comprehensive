@@ -46,8 +46,8 @@ struct TestService;
 struct TopDependencies {
     // Including this causes the gRPC server to run.
     _test_service: std::sync::Arc<TestService>,
-    // Temporary resource type while migrating!
-    _monolith: std::sync::Arc<comprehensive::DeprecatedMonolith>,
+    // Serves metrics!
+    _diag: std::sync::Arc<comprehensive::diag::HttpServer>,
 }
 
 #[tokio::main]

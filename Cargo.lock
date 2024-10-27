@@ -295,6 +295,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b048fb63fd8b5923fc5aa7b340d8e156aec7ec02f0c78fa8a6ddc2613f6f71de"
 
 [[package]]
+name = "boxcar"
+version = "0.2.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fba19c552ee63cb6646b75e1166d1bdb8a6d34a6d19e319dec88c8adadff2db3"
+
+[[package]]
 name = "bumpalo"
 version = "3.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -406,19 +412,21 @@ checksum = "d3fd119d74b830634cea2a0f58bbd0d54540518a14397557951e79340abc28c0"
 
 [[package]]
 name = "comprehensive"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "arc-swap",
  "async-trait",
  "atomic-take",
  "axum",
  "axum-server",
+ "boxcar",
  "clap",
  "comprehensive_macros",
  "downcast-rs",
  "futures",
  "http",
  "hyper",
+ "lazy_static",
  "log",
  "prometheus",
  "rand",
@@ -434,8 +442,9 @@ dependencies = [
 
 [[package]]
 name = "comprehensive_grpc"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
+ "atomic-take",
  "clap",
  "comprehensive",
  "comprehensive_macros",

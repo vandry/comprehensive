@@ -51,6 +51,7 @@ use tokio_rustls::rustls;
 
 pub mod assembly;
 pub mod diag;
+pub mod health;
 pub mod http;
 
 pub use assembly::{

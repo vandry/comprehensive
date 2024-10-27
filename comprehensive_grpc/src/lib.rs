@@ -121,6 +121,7 @@
 
 #![warn(missing_docs)]
 
+use atomic_take::AtomicTake;
 use comprehensive::{NoArgs, NoDependencies, Resource, ResourceDependencies, ShutdownNotify};
 use futures::{future::Either, pin_mut, FutureExt};
 use prost::Message;
@@ -409,6 +410,25 @@ pub struct GrpcServerDependencies {
     grpc: Arc<insecure_server::InsecureGrpcServer>,
     #[cfg(feature = "tls")]
     grpcs: Arc<secure_server::SecureGrpcServer>,
+    health: Arc<comprehensive::health::HealthReporter>,
+}
+
+struct HealthRelay {
+    health_subscriber: tokio::sync::watch::Receiver<bool>,
+    health_reporter: tonic_health::server::HealthReporter,
+}
+
+impl HealthRelay {
+    async fn relay(&mut self) {
+        loop {
+            let s = match *self.health_subscriber.borrow_and_update() {
+                true => tonic_health::ServingStatus::Serving,
+                false => tonic_health::ServingStatus::NotServing,
+            };
+            self.health_reporter.set_service_status("ready", s).await;
+            let _ = self.health_subscriber.changed().await;
+        }
+    }
 }
 
 /// [`comprehensive`] [`Resource`] implementing a gRPC server using [`tonic`].
@@ -422,12 +442,28 @@ pub struct GrpcServerDependencies {
 /// * RPC count metrics, courtesy or [`tonic_prometheus_layer`]
 /// * gRPC reflection
 /// * graceful shutdown
-/// * health reporting (not yet; currently just static)
+/// * health reporting
+///
+/// # Health reporting
+///
+/// Although the gRPC health reporting supports fine-grained service-by-service
+/// health status, Comprehensive does not use that. The entire assembly is
+/// considered healthy if all signals are healthy, and unhealthy otherwise.
+/// This translates to gRPC health reporting using 2 pseudo-services:
+///
+/// * "" (empty string): This service is always considered healthy.
+///   Use this as a liveness check that the server is able to start and run.
+/// * "ready": This service is considered healthy iff the assembly is healthy.
+///   Use this as a readiness check that the server is willing to accept
+///   traffic.
 ///
 /// [`Assembly`]: comprehensive::Assembly
 pub struct GrpcServer {
     inner: std::sync::Mutex<Option<GrpcServerInner>>,
-    deps: GrpcServerDependencies,
+    grpc: Arc<insecure_server::InsecureGrpcServer>,
+    #[cfg(feature = "tls")]
+    grpcs: Arc<secure_server::SecureGrpcServer>,
+    health_relay: AtomicTake<HealthRelay>,
 }
 
 impl GrpcServer {
@@ -511,25 +547,31 @@ impl Resource for GrpcServer {
 
     fn new(d: GrpcServerDependencies, _: NoArgs) -> Result<Self, Box<dyn std::error::Error>> {
         tonic_prometheus_layer_use_default_registry();
-        let (_health_reporter, health_service) = tonic_health::server::health_reporter();
+        let (health_reporter, health_service) = tonic_health::server::health_reporter();
         Ok(Self {
             inner: std::sync::Mutex::new(Some(GrpcServerInner {
                 routes: Some(Routes::new(health_service)),
                 reflection: Some(ReflectionInfo::default()),
             })),
-            deps: d,
+            grpc: d.grpc,
+            #[cfg(feature = "tls")]
+            grpcs: d.grpcs,
+            health_relay: AtomicTake::new(HealthRelay {
+                health_subscriber: d.health.subscribe(),
+                health_reporter,
+            }),
         })
     }
 
     async fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
         #[cfg(not(feature = "tls"))]
-        if self.deps.grpc.addr.is_none() {
+        if self.grpc.addr.is_none() {
             log::warn!("No insecure gRPC listener, and secure gRPC is not available because feature \"tls\" is not built.");
             return Ok(());
         }
 
         #[cfg(feature = "tls")]
-        if self.deps.grpc.addr.is_none() && self.deps.grpcs.addr.is_none() {
+        if self.grpc.addr.is_none() && self.grpcs.addr.is_none() {
             log::warn!("No insecure or secure gRPC listener.");
             return Ok(());
         }
@@ -561,25 +603,25 @@ impl Resource for GrpcServer {
         }
 
         #[cfg(not(feature = "tls"))]
-        self.deps.grpc.conf.put(ServingConfig { base, routes });
+        self.grpc.conf.put(ServingConfig { base, routes });
 
         #[cfg(feature = "tls")]
-        match (
-            self.deps.grpc.addr.is_some(),
-            self.deps.grpcs.addr.is_some(),
-        ) {
+        match (self.grpc.addr.is_some(), self.grpcs.addr.is_some()) {
             (false, false) => (),
-            (true, false) => self.deps.grpc.conf.put(ServingConfig { base, routes }),
-            (false, true) => self.deps.grpcs.conf.put(ServingConfig { base, routes }),
+            (true, false) => self.grpc.conf.put(ServingConfig { base, routes }),
+            (false, true) => self.grpcs.conf.put(ServingConfig { base, routes }),
             (true, true) => {
-                self.deps.grpc.conf.put(ServingConfig {
+                self.grpc.conf.put(ServingConfig {
                     base: base.clone(),
                     routes: routes.clone(),
                 });
-                self.deps.grpcs.conf.put(ServingConfig { base, routes });
+                self.grpcs.conf.put(ServingConfig { base, routes });
             }
         }
 
+        if let Some(mut health_relay) = self.health_relay.take() {
+            health_relay.relay().await;
+        }
         Ok(())
     }
 }

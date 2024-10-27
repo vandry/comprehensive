@@ -39,9 +39,9 @@ fn plain_grpc_create() -> (comprehensive::Assembly<JustAServer>, SocketAddr) {
     let (argv, _) = test_args(true, false);
     let assembly = comprehensive::Assembly::<JustAServer>::new_from_argv(argv).unwrap();
 
-    let addr = assembly.top.server.deps.grpc.addr.unwrap();
+    let addr = assembly.top.server.grpc.addr.unwrap();
     #[cfg(feature = "tls")]
-    assert!(assembly.top.server.deps.grpcs.addr.is_none());
+    assert!(assembly.top.server.grpcs.addr.is_none());
     (assembly, addr)
 }
 
@@ -97,9 +97,9 @@ async fn nothing_enabled() {
     let argv = vec!["cmd"];
     let assembly = comprehensive::Assembly::<JustAServer>::new_from_argv(argv).unwrap();
 
-    assert!(assembly.top.server.deps.grpc.addr.is_none());
+    assert!(assembly.top.server.grpc.addr.is_none());
     #[cfg(feature = "tls")]
-    assert!(assembly.top.server.deps.grpcs.addr.is_none());
+    assert!(assembly.top.server.grpcs.addr.is_none());
 
     assert!(assembly
         .run_with_termination_signal(futures::stream::pending())
@@ -293,8 +293,8 @@ async fn grpcs() {
     let (argv, _) = test_args(false, true);
     let assembly = comprehensive::Assembly::<JustAServer>::new_from_argv(argv).unwrap();
 
-    assert!(assembly.top.server.deps.grpc.addr.is_none());
-    let addr = assembly.top.server.deps.grpcs.addr.unwrap();
+    assert!(assembly.top.server.grpc.addr.is_none());
+    let addr = assembly.top.server.grpcs.addr.unwrap();
 
     let (tx, rx) = tokio::sync::oneshot::channel();
     let j = tokio::spawn(async move {
@@ -318,8 +318,8 @@ async fn grpc_and_grpcs() {
     let (argv, _) = test_args(true, true);
     let assembly = comprehensive::Assembly::<JustAServer>::new_from_argv(argv).unwrap();
 
-    let addr_grpc = assembly.top.server.deps.grpc.addr.unwrap();
-    let addr_grpcs = assembly.top.server.deps.grpcs.addr.unwrap();
+    let addr_grpc = assembly.top.server.grpc.addr.unwrap();
+    let addr_grpcs = assembly.top.server.grpcs.addr.unwrap();
 
     let (tx, rx) = tokio::sync::oneshot::channel();
     let j = tokio::spawn(async move {

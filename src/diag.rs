@@ -2,12 +2,15 @@
 //!
 //! Currently this serves only Prometheus metrics.
 
+use axum::extract::State;
 use axum::response::IntoResponse;
 use axum::Router;
 use prometheus::Encoder;
+use std::sync::Arc;
 
+use crate::health::HealthReporter;
 use crate::http::HttpServingInstance;
-use crate::{NoDependencies, Resource};
+use crate::{Resource, ResourceDependencies};
 
 async fn serve_metrics_page() -> impl axum::response::IntoResponse {
     let encoder = prometheus::TextEncoder::new();
@@ -23,13 +26,30 @@ async fn serve_metrics_page() -> impl axum::response::IntoResponse {
     res
 }
 
+async fn serve_health_page(
+    State(state): State<Arc<HealthReporter>>,
+) -> Result<axum::body::Bytes, http::StatusCode> {
+    if state.is_healthy() {
+        Ok("OK\r\n".into())
+    } else {
+        Err(http::StatusCode::INTERNAL_SERVER_ERROR)
+    }
+}
+
 #[doc(hidden)]
 #[derive(clap::Args, Debug)]
 #[group(skip)]
 pub struct Args {
     #[arg(long, default_value = "/metrics")]
     metrics_path: String,
+
+    #[arg(long, default_value = "/healthz")]
+    health_path: String,
 }
+
+#[doc(hidden)]
+#[derive(ResourceDependencies)]
+pub struct DiagInstanceDependencies(Arc<HealthReporter>);
 
 #[doc(hidden)]
 #[derive(HttpServingInstance)]
@@ -38,15 +58,18 @@ pub struct DiagInstance(#[router] Router);
 
 impl Resource for DiagInstance {
     type Args = Args;
-    type Dependencies = NoDependencies;
+    type Dependencies = DiagInstanceDependencies;
     const NAME: &str = "Diagnostics HTTP server";
 
-    fn new(_: NoDependencies, args: Args) -> Result<Self, Box<dyn std::error::Error>> {
+    fn new(d: DiagInstanceDependencies, args: Args) -> Result<Self, Box<dyn std::error::Error>> {
         let mut app = Router::new();
         if !args.metrics_path.is_empty() {
             app = app.route(&args.metrics_path, axum::routing::get(serve_metrics_page));
         }
-        Ok(Self(app))
+        if !args.health_path.is_empty() {
+            app = app.route(&args.health_path, axum::routing::get(serve_health_page));
+        }
+        Ok(Self(app.with_state(d.0)))
     }
 }
 
@@ -64,6 +87,7 @@ impl Resource for DiagInstance {
 /// | `--diag-https_port`      | *none*     | TCP port number for secure HTTP server. If unset, HTTPS is not served. |
 /// | `--diag-https_bind_addr` | `::`       | Binding IP address for HTTPS. Used only if `--https_port` is set. |
 /// | `--metrics_path`         | `/metrics` | HTTP and/or HTTPS path where metrics are served. Set to empty to disable. |
+/// | `--health_path`          | `/healthz` | HTTP and/or HTTPS path where health status is served. Set to empty to disable. |
 pub type HttpServer = crate::http::HttpServer<DiagInstance>;
 
 #[cfg(test)]

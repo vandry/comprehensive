@@ -177,12 +177,14 @@ mod insecure_server {
     pub(super) struct InsecureHttpServerArgs<I: HttpServingInstance> {
         #[arg(
             long(I::HTTP_PORT_FLAG_NAME),
+            id(I::HTTP_PORT_FLAG_NAME),
             help = "TCP port number for insecure HTTP server. If unset, plain HTTP is not served."
         )]
         http_port: Option<u16>,
 
         #[arg(
             long(I::HTTP_BIND_ADDR_FLAG_NAME),
+            id(I::HTTP_BIND_ADDR_FLAG_NAME),
             default_value = "::",
             help = "Binding IP address for HTTP. Used only if the corresponding port is set."
         )]
@@ -256,12 +258,14 @@ mod secure_server {
     pub(super) struct SecureHttpServerArgs<I: HttpServingInstance> {
         #[arg(
             long(I::HTTPS_PORT_FLAG_NAME),
+            id(I::HTTPS_PORT_FLAG_NAME),
             help = "TCP port number for HTTPS server. If unset, HTTPS is not served."
         )]
         https_port: Option<u16>,
 
         #[arg(
             long(I::HTTPS_BIND_ADDR_FLAG_NAME),
+            id(I::HTTPS_BIND_ADDR_FLAG_NAME),
             default_value = "::",
             help = "Binding IP address for HTTPS. Used only if the corresponding port is set."
         )]
@@ -582,5 +586,31 @@ mod tests {
 
         let _ = tx.send(());
         let _ = j.await;
+    }
+
+    #[derive(HttpServingInstance)]
+    #[flag_prefix = "bar-"]
+    pub struct BarServer(#[router] Router);
+
+    impl Resource for BarServer {
+        type Args = NoArgs;
+        type Dependencies = NoDependencies;
+        const NAME: &str = "Second Test HTTP server";
+
+        fn new(_: NoDependencies, _: NoArgs) -> Result<Self, Box<dyn std::error::Error>> {
+            Ok(Self(Router::new()))
+        }
+    }
+
+    #[derive(ResourceDependencies)]
+    struct JustTwoServers {
+        _server1: Arc<HttpServer<FooServer>>,
+        _server2: Arc<HttpServer<BarServer>>,
+    }
+
+    #[test]
+    fn two_servers() {
+        let argv = vec!["cmd"];
+        let _ = comprehensive::Assembly::<JustTwoServers>::new_from_argv(argv).unwrap();
     }
 }

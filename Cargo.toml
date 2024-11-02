@@ -3,6 +3,7 @@ resolver = "2"
 members = [
   "comprehensive_grpc",
   "comprehensive_macros",
+  "comprehensive_s3",
   "examples",
 ]
 

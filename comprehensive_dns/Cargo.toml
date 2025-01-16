@@ -1,0 +1,16 @@
+[package]
+name = "comprehensive_dns"
+version = "0.1.0"
+edition = "2021"
+repository = "https://github.com/vandry/comprehensive.git"
+homepage = "https://github.com/vandry/comprehensive"
+description = "A DNS resolver for https://crates.io/crates/comprehensive"
+license = "MIT"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[dependencies]
+comprehensive = { path = "..", version = "0.5" }
+trust-dns-resolver = "0.23"

@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+  "comprehensive_dns",
   "comprehensive_grpc",
   "comprehensive_macros",
   "comprehensive_s3",

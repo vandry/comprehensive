@@ -26,6 +26,8 @@
 //! ```
 
 use arc_swap::ArcSwap;
+use rustls::RootCertStore;
+use rustls::client::{ClientConfig, ResolvesClientCert};
 use rustls::crypto::CryptoProvider;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::{ClientHello, ResolvesServerCert};
@@ -162,6 +164,16 @@ impl ResolvesServerCert for ReloadableKeyAndCertResolver {
     }
 }
 
+impl ResolvesClientCert for ReloadableKeyAndCertResolver {
+    fn resolve(&self, _root_hint_subjects: &[&[u8]], _sigschemes: &[rustls::SignatureScheme]) -> Option<Arc<CertifiedKey>> {
+        self.real_resolve()
+    }
+
+    fn has_certs(&self) -> bool {
+        true
+    }
+}
+
 struct ReloadableKeyAndCert {
     loader: ReloadableKeyAndCertLoader,
     resolver: Arc<ReloadableKeyAndCertResolver>,
@@ -230,6 +242,7 @@ impl ReloadableKeyAndCert {
 /// interface can take advantage of that.
 pub struct TlsConfig {
     inner: std::sync::Mutex<Option<ReloadableKeyAndCert>>,
+    client_config: Arc<ClientConfig>,
     #[allow(dead_code)]
     cacert: Option<Vec<u8>>,
 }
@@ -245,9 +258,39 @@ impl Resource for TlsConfig {
         } else {
             None
         };
+        let mut roots = RootCertStore::empty();
+        let raw_roots = if let Some(cacert_file) = args.cacert {
+            let contents = std::fs::read(&cacert_file)?;
+            roots.add_parsable_certificates(rustls_pemfile::certs(&mut Cursor::new(&contents)).filter_map(|r| {
+                match r {
+                    Ok(cert) => Some(cert),
+                    Err(e) => {
+                        log::warn!("Error reading TLS root certificate: {}", e);
+                        None
+                    }
+                }
+            }));
+            if roots.is_empty() {
+                log::warn!("No root certificates loaded from file {}", cacert_file.display());
+            }
+            Some(contents)
+        } else {
+            None
+        };
+        let roots = Arc::new(roots);
+        let client_config = ClientConfig::builder()
+            .with_root_certificates(roots);
+        let client_config = match inner {
+            Some(ref inner) => {
+                let resolver = Arc::clone(&inner.resolver);
+                client_config.with_client_cert_resolver(resolver)
+            }
+            None => client_config.with_no_client_auth(),
+        };
         Ok(Self {
             inner: std::sync::Mutex::new(inner),
-            cacert: args.cacert.map(std::fs::read).transpose()?,
+            client_config: Arc::new(client_config),
+            cacert: raw_roots,
         })
     }
 
@@ -288,6 +331,12 @@ impl TlsConfig {
             None => Err(ComprehensiveError::NoTlsFlags),
             Some(inner) => Ok(Arc::clone(&inner.resolver)),
         }
+    }
+
+    /// Returns a TLS [`ClientConfig`] built from the runtime configuration.
+    /// If a local key and certificate are supplied then this will do client auth.
+    pub fn client_config(&self) -> Arc<ClientConfig> {
+        Arc::clone(&self.client_config)
     }
 
     /// Returns an object with raw [`Vec<u8>`] PEM representations of the

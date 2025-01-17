@@ -3,13 +3,14 @@
 //! [`comprehensive`]: https://docs.rs/comprehensive/latest/comprehensive/
 
 extern crate proc_macro;
+use convert_case::{Case, Casing};
 use proc_macro2::{Span, TokenStream};
-use quote::{format_ident, quote, quote_spanned};
+use quote::{format_ident, quote, quote_spanned, ToTokens};
 use syn::punctuated::Punctuated;
 use syn::spanned::Spanned;
 use syn::{
-    parse_macro_input, Attribute, Data, DeriveInput, Fields, GenericArgument, Generics, Ident,
-    LitStr, PathArguments, Type,
+    parse_macro_input, Attribute, Data, DeriveInput, Fields, GenericArgument, Generics, Ident, Lit,
+    LitBool, LitStr, Path, PathArguments, Type, Visibility,
 };
 
 fn find_type_inside_arc(ty: &Type) -> Result<&Type, Span> {
@@ -303,4 +304,160 @@ pub fn derive_http_serving_instance(item: proc_macro::TokenStream) -> proc_macro
             quote! { #e }
         })
         .into()
+}
+
+fn path_and_single_generic_type(ty: &Type) -> Result<(&Path, &Type), Span> {
+    let Type::Path(ref path) = ty else {
+        return Err(ty.span());
+    };
+    let Some(last) = path.path.segments.last() else {
+        return Err(path.path.segments.span());
+    };
+    let PathArguments::AngleBracketed(ref generics) = last.arguments else {
+        return Err(last.arguments.span());
+    };
+    if generics.args.len() != 1 {
+        return Err(generics.span());
+    }
+    let GenericArgument::Type(ref gty) = generics.args.first().unwrap() else {
+        return Err(generics.span());
+    };
+    Ok((&path.path, gty))
+}
+
+fn client_type(ty: &Type) -> Result<(bool, &Path), Span> {
+    let (path1, inner) = path_and_single_generic_type(ty)?;
+    let seg = &path1.segments;
+    if seg.len() == 1 {
+        let seg1 = &seg.first().unwrap().ident;
+        if *seg1 == Ident::new("Option", seg1.span()) {
+            let (path2, _) = path_and_single_generic_type(inner)?;
+            return Ok((true, path2));
+        }
+    }
+    Ok((false, path1))
+}
+
+fn derive_struct(
+    vis: &Visibility,
+    name: &Ident,
+    generics: &Generics,
+    fields: &Fields,
+    attrs: &[Attribute],
+) -> TokenStream {
+    let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
+    let mut fields_it = fields.iter();
+    let client_field = fields_it.next().unwrap();
+    let cts = client_field.ty.span();
+
+    let mut propagate_health = true;
+    for attr in attrs {
+        if attr.path().is_ident("no_propagate_health") {
+            propagate_health = false;
+        }
+    }
+
+    let (is_option, client_type) = match client_type(&client_field.ty) {
+        Ok(v) => v,
+        Err(span) => {
+            return quote_spanned! {
+                span => compile_error!("First field of struct must be pb::client::Type<_> or Option<pb::client::Type<_>>");
+            };
+        }
+    };
+
+    let mut builder = client_type.clone();
+    if let Some(last) = builder.segments.last_mut() {
+        last.arguments = PathArguments::None;
+    }
+    builder
+        .segments
+        .push(Ident::new("with_origin", builder.segments.last().span()).into());
+
+    let name_str = name.to_string();
+    let name_lit = Lit::Str(LitStr::new(&name_str, name.span()));
+    let label = Lit::Str(LitStr::new(&name_str.to_case(Case::Snake), name.span()));
+    let required = Lit::Bool(LitBool::new(!is_option, client_type.span()));
+    let flag_prefix = format!("{}-", name_str.to_case(Case::Kebab));
+    let flag_prefix_span = name.span();
+    let flag_prefix = Lit::Str(LitStr::new(&flag_prefix, flag_prefix_span));
+
+    let (producer, cloner, client_return_type) = if is_option {
+        (
+            quote_spanned! { cts => param.map(|(stack, uri)| #builder (stack, uri)) },
+            quote! { as_ref().map(|c| c.clone()) },
+            quote_spanned! { cts => Option < #client_type > },
+        )
+    } else {
+        (
+            // unwrap okay because we made it a required arg in Clap
+            quote_spanned! { cts => { let (stack, uri) = param.unwrap(); #builder (stack, uri) } },
+            quote! { clone() },
+            client_type.to_token_stream(),
+        )
+    };
+    let (builder, get0, get1) = match client_field.ident {
+        None => (
+            quote_spanned! { fields.span() => Self( #producer , worker ) },
+            quote! { self.0 },
+            quote! { self.1 },
+        ),
+        Some(ref client_field_name) => {
+            let worker_field_name = fields_it.next().unwrap().ident.as_ref().unwrap();
+            (
+                quote_spanned! {
+                    fields.span() => Self {
+                        #client_field_name : #producer ,
+                        #worker_field_name : worker,
+                    }
+                },
+                quote! { self. #client_field_name },
+                quote! { self. #worker_field_name },
+            )
+        }
+    };
+
+    quote! {
+        #[automatically_derived]
+        impl #impl_generics ::comprehensive_grpc::client::InstanceDescriptor for #name #ty_generics #where_clause {
+            const REQUIRED: bool = #required ;
+            ::comprehensive_grpc::declare_client_flag_name_constants!( #flag_prefix );
+        }
+
+        #[automatically_derived]
+        impl #impl_generics ::comprehensive::Resource for #name #ty_generics #where_clause {
+            type Args = ::comprehensive_grpc::client::GrpcClientArgs<Self>;
+            type Dependencies = ::comprehensive_grpc::client::GRPCClientDependencies;
+            const NAME: &'static str = #name_lit ;
+
+            fn new(d: ::comprehensive_grpc::client::GRPCClientDependencies, a: ::comprehensive_grpc::client::GrpcClientArgs<Self>) -> ::std::result::Result<Self, ::std::boxed::Box<dyn ::std::error::Error>> {
+                let (param, worker) = ::comprehensive_grpc::client::new(a, #label , #propagate_health , d)?;
+                Ok( #builder )
+            }
+
+            async fn run(&self) -> ::std::result::Result<(), ::std::boxed::Box<dyn ::std::error::Error>> {
+                #get1 .go().await;
+                Ok(())
+            }
+        }
+
+        #[automatically_derived]
+        impl #impl_generics #name #ty_generics #where_clause {
+            #vis fn client(&self) -> #client_return_type {
+                #get0 . #cloner
+            }
+        }
+    }
+}
+
+#[proc_macro_derive(GrpcClient, attributes(no_propagate_health))]
+pub fn derive_grpc_client(item: proc_macro::TokenStream) -> proc_macro::TokenStream {
+    let input: DeriveInput = parse_macro_input!(item);
+    match input.data {
+        Data::Struct(ref s) if s.fields.len() == 2 => derive_struct(&input.vis, &input.ident, &input.generics, &s.fields, &input.attrs),
+        _ => quote_spanned! {
+            input.span() => compile_error!("`#[derive(GrpcClient)]` requires a struct with exactly 2 fields");
+        },
+    }
+    .into()
 }

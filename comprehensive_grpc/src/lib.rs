@@ -1,10 +1,42 @@
-//! [`comprehensive`] [`Resource`] types for gRPC serving
+//! [`comprehensive`] [`Resource`] types for gRPC client and server.
 //!
 //! This crate provides [`Resource`] types for use in a [`comprehensive`]
 //! [`Assembly`]. To use it, build an [`Assembly`] and include resources
 //! from this crate in the dependency graph.
 //!
-//! # Usage
+//! # Client Usage
+//!
+//! Define a struct containing a [`tonic`] client wrapped around a channel and
+//! worker, and derive [`GrpcClient`] on it. This will become a
+//! [`comprehensive::Resource`] that can be depended upon. Call `.client()`
+//! to get a (cheap) clone of the gRPC client.
+//!
+//! ```
+//! # mod pb {
+//! #     tonic::include_proto!("comprehensive");
+//! # }
+//! use comprehensive_grpc::GrpcClient;
+//! use comprehensive_grpc::client::{Channel, ClientWorker};
+//!
+//! #[derive(GrpcClient)]
+//! struct MyClientResource(
+//!     pb::test_client::TestClient<Channel>,
+//!     ClientWorker
+//! );
+//!
+//! struct OtherResourceThatConsumesClient {
+//!     the_client: std::sync::Arc<MyClientResource>,
+//! }
+//!
+//! impl OtherResourceThatConsumesClient {
+//!     async fn something(&self) {
+//!         let mut tonic_client = self.the_client.client();
+//!         println!("{:?}", tonic_client.greet(()).await);
+//!     }
+//! }
+//! ```
+//!
+//! # Server Usage
 //!
 //! There are 2 ways to use it:
 //!
@@ -14,6 +46,8 @@
 //! the server to run with the service in question (and others) installed:
 //!
 //! ```
+//! # #[cfg(feature = "tls")]
+//! # let _ = tokio_rustls::rustls::crypto::aws_lc_rs::default_provider().install_default();
 //! # mod pb {
 //! #     tonic::include_proto!("comprehensive");
 //! #     pub const FILE_DESCRIPTOR_SET: &[u8] = tonic::include_file_descriptor_set!("fdset");
@@ -58,6 +92,8 @@
 //! The server can bee configured to add gRPC services to it:
 //!
 //! ```
+//! # #[cfg(feature = "tls")]
+//! # let _ = tokio_rustls::rustls::crypto::aws_lc_rs::default_provider().install_default();
 //! # mod pb {
 //! #     tonic::include_proto!("comprehensive");
 //! #     pub const FILE_DESCRIPTOR_SET: &[u8] = tonic::include_file_descriptor_set!("fdset");
@@ -86,14 +122,29 @@
 //! );
 //! ```
 //!
+//! # Command line flags for the gRPC client
+//!
+//! Each flag is prefixed with the name of the resource that it belongs to,
+//! converted to kebab case (`struct VerySpecialClient` →
+//! `--very-special-client-`). See [`warm_channels::grpc_channel`] and
+//! [`warm_channels::grpc::GRPCChannelConfig`] for details on most
+//! parameters.
+//!
+//! | Flag                       | Default    | Meaning                 |
+//! |----------------------------|------------|-------------------------|
+//! | `PREFIXuri`                | *none*     | URI identifying the backend gRPC server. |
+//! | `PREFIXconnect-uri`        | *none*     | Alternate URI for name resolution. |
+//! | `PREFIXn-subchannels-want` | 3          | Backend pool size. |
+//! | etc...                     |            | More settings from [`warm_channels`] |
+//!
 //! # Command line flags for the gRPC server
 //!
 //! | Flag                | Default    | Meaning                 |
 //! |---------------------|------------|-------------------------|
-//! | `--grpc_port`       | *none*     | TCP port number for insecure gRPC server. If unset, plain gRPC is not served. |
-//! | `--grpc_bind_addr`  | `::`       | Binding IP address for gRPC. Used only if `--grpc_port` is set. |
-//! | `--grpcs_port`      | *none*     | TCP port number for secure gRPC server. If unset, gRPCs is not served. |
-//! | `--grpcs_bind_addr` | `::`       | Binding IP address for gRPCs. Used only if `--grpcs_port` is set. |
+//! | `--grpc-port`       | *none*     | TCP port number for insecure gRPC server. If unset, plain gRPC is not served. |
+//! | `--grpc-bind-addr`  | `::`       | Binding IP address for gRPC. Used only if `--grpc_port` is set. |
+//! | `--grpcs-port`      | *none*     | TCP port number for secure gRPC server. If unset, gRPCs is not served. |
+//! | `--grpcs-bind-addr` | `::`       | Binding IP address for gRPCs. Used only if `--grpcs_port` is set. |
 //!
 //! # On descriptors
 //!
@@ -136,6 +187,8 @@ use tonic::server::NamedService;
 use tonic::service::Routes;
 use tonic_prometheus_layer::MetricsLayer;
 use tower::Service;
+
+pub mod client;
 
 fn tonic_prometheus_layer_use_default_registry() {
     let _ = tonic_prometheus_layer::metrics::try_init_settings(
@@ -626,7 +679,7 @@ impl Resource for GrpcServer {
     }
 }
 
-pub use comprehensive_macros::GrpcService;
+pub use comprehensive_macros::{GrpcClient, GrpcService};
 #[doc(hidden)]
 pub use const_format; // Assumed by the derive macro
 

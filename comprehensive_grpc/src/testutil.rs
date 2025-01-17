@@ -1,3 +1,4 @@
+use comprehensive::{NoArgs, NoDependencies, Resource};
 use std::net::{IpAddr, Ipv6Addr, SocketAddr, TcpListener};
 use tokio::net::TcpStream;
 
@@ -67,3 +68,35 @@ pub(crate) mod tls {
         }
     }
 }
+
+pub(crate) struct TestServer;
+
+impl Resource for TestServer {
+    type Args = NoArgs;
+    type Dependencies = NoDependencies;
+    const NAME: &str = "TestServer";
+
+    fn new(_: NoDependencies, _: NoArgs) -> Result<Self, Box<dyn std::error::Error>> {
+        Ok(Self)
+    }
+}
+
+#[tonic::async_trait]
+impl pb::comprehensive::test_server::Test for TestServer {
+    async fn greet(
+        &self,
+        _: tonic::Request<()>,
+    ) -> Result<tonic::Response<pb::comprehensive::GreetResponse>, tonic::Status> {
+        Ok(tonic::Response::new(
+            pb::comprehensive::GreetResponse {
+                message: Some(String::from("hello")),
+            },
+        ))
+    }
+}
+
+#[derive(crate::GrpcService)]
+#[implementation(TestServer)]
+#[service(pb::comprehensive::test_server::TestServer)]
+#[descriptor(pb::comprehensive::FILE_DESCRIPTOR_SET)]
+pub(crate) struct HelloService;

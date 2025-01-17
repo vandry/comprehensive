@@ -1,6 +1,6 @@
 [package]
 name = "comprehensive_grpc"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2021"
 repository = "https://github.com/vandry/comprehensive.git"
 homepage = "https://github.com/vandry/comprehensive"
@@ -14,8 +14,10 @@ rustdoc-args = ["--cfg", "docsrs"]
 [dependencies]
 atomic-take = "1.1"
 clap = { version = "4.5", features = ["derive"] }
-comprehensive = { path = "..", version = "=0.5.0" }
-comprehensive_macros = { path = "../comprehensive_macros", version = "=0.4.0" }
+clap_builder = { version = "4.5", features = ["string"] }
+comprehensive = { path = "..", version = "0.5.1" }
+comprehensive_dns = { path = "../comprehensive_dns", version = "0.1" }
+comprehensive_macros = { path = "../comprehensive_macros", version = "0.4.1" }
 const_format = "0.2"
 futures = "0.3"
 http = "1.1"
@@ -30,14 +32,16 @@ tonic-reflection = "0.12"
 tonic_prometheus_layer = "0.1"
 tower = "0.5"
 tower-layer = "0.3"
+warm_channels = { version = "0.1", features = ["grpc"] }
 
 [features]
-tls = ["comprehensive/tls", "comprehensive/unreloadable_tls", "tonic/tls"]
+tls = ["comprehensive/tls", "comprehensive/unreloadable_tls", "tonic/tls", "warm_channels/tls"]
 
 [build-dependencies]
 tonic-build = "0.12"
 
 [dev-dependencies]
 rand = "0.8"
+test-log = "0.2"
 tokio-rustls = "0.26"
 tokio-stream = "0.1"

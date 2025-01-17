@@ -146,40 +146,8 @@ async fn check_greeter(channel: tonic::transport::Channel) {
     assert_eq!(resp.message.expect("message field"), "hello");
 }
 
-struct TestServer;
-
-impl Resource for TestServer {
-    type Args = NoArgs;
-    type Dependencies = NoDependencies;
-    const NAME: &str = "TestServer";
-
-    fn new(_: NoDependencies, _: NoArgs) -> Result<Self, Box<dyn std::error::Error>> {
-        Ok(Self)
-    }
-}
-
-#[tonic::async_trait]
-impl testutil::pb::comprehensive::test_server::Test for TestServer {
-    async fn greet(
-        &self,
-        _: tonic::Request<()>,
-    ) -> Result<tonic::Response<testutil::pb::comprehensive::GreetResponse>, tonic::Status> {
-        Ok(tonic::Response::new(
-            testutil::pb::comprehensive::GreetResponse {
-                message: Some(String::from("hello")),
-            },
-        ))
-    }
-}
-
-#[derive(GrpcService)]
-#[implementation(TestServer)]
-#[service(testutil::pb::comprehensive::test_server::TestServer)]
-#[descriptor(testutil::pb::comprehensive::FILE_DESCRIPTOR_SET)]
-struct HelloService;
-
 #[derive(ResourceDependencies)]
-struct OwnServer(Arc<HelloService>);
+struct OwnServer(Arc<testutil::HelloService>);
 
 #[tokio::test]
 async fn grpc_own_service() {
@@ -195,7 +163,7 @@ async fn grpc_own_service() {
 }
 
 #[derive(GrpcService)]
-#[implementation(TestServer)]
+#[implementation(testutil::TestServer)]
 #[service(testutil::pb::comprehensive::test_server::TestServer)]
 struct NoDescriptorService;
 

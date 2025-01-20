@@ -21,6 +21,7 @@ comprehensive_macros = { path = "../comprehensive_macros", version = "0.4.1" }
 const_format = "0.2"
 futures = "0.3"
 http = "1.1"
+humantime = "2.1"
 log = "0.4"
 prometheus = "0.13"
 prost = "0.13"

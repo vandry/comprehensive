@@ -40,11 +40,13 @@ use comprehensive::ResourceDependencies;
 use comprehensive_dns::DNSResolver;
 use futures::{Stream, StreamExt, TryStreamExt};
 use http::Uri;
+use humantime::{format_duration, parse_duration};
 use std::future::Future;
 use std::marker::PhantomData;
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration;
 use warm_channels::grpc::{grpc_channel, GRPCChannel, GRPCChannelConfig};
 use warm_channels::resolver::ResolveUriError;
 use warm_channels::stream::{IPOrUNIXAddress, StreamConnector};
@@ -91,6 +93,13 @@ pub trait InstanceDescriptor {
     const CONNECT_URI_FLAG_NAME: &str;
     const N_SUBCHANNELS_WANT_FLAG_NAME: &str;
     const N_SUBCHANNELS_HEALTHY_MIN_FLAG_NAME: &str;
+    const N_SUBCHANNELS_HEALTHY_CRITICAL_MIN_FLAG_NAME: &str;
+    const LOG_UNHEALTHY_INITIAL_DELAY_FLAG_NAME: &str;
+    const LOG_UNHEALTHY_REPEAT_DELAY_FLAG_NAME: &str;
+    const NO_HEALTH_CHECK_ENABLE_FLAG_NAME: &str;
+    const HEALTH_CHECK_SERVICE_FLAG_NAME: &str;
+    const HEALTH_CHECK_TIMEOUT_FLAG_NAME: &str;
+    const HEALTH_CHECK_INTERVAL_FLAG_NAME: &str;
 }
 
 #[doc(hidden)]
@@ -102,6 +111,17 @@ macro_rules! declare_client_flag_name_constants {
         const N_SUBCHANNELS_WANT_FLAG_NAME: &str = concat!($prefix, "n-subchannels-want");
         const N_SUBCHANNELS_HEALTHY_MIN_FLAG_NAME: &str =
             concat!($prefix, "n-subchannels-healthy-min");
+        const N_SUBCHANNELS_HEALTHY_CRITICAL_MIN_FLAG_NAME: &str =
+            concat!($prefix, "n-subchannels-healthy-critical-min");
+        const LOG_UNHEALTHY_INITIAL_DELAY_FLAG_NAME: &str =
+            concat!($prefix, "log-unhealthy-initial-delay");
+        const LOG_UNHEALTHY_REPEAT_DELAY_FLAG_NAME: &str =
+            concat!($prefix, "log-unhealthy-repeat-delay");
+        const NO_HEALTH_CHECK_ENABLE_FLAG_NAME: &str =
+            concat!("no-", $prefix, "health-check-enable");
+        const HEALTH_CHECK_SERVICE_FLAG_NAME: &str = concat!($prefix, "health-check-service");
+        const HEALTH_CHECK_TIMEOUT_FLAG_NAME: &str = concat!($prefix, "health-check-timeout");
+        const HEALTH_CHECK_INTERVAL_FLAG_NAME: &str = concat!($prefix, "health-check-interval");
     };
 }
 
@@ -132,6 +152,21 @@ pub struct GrpcClientArgs<I> {
     _i: PhantomData<I>,
 }
 
+fn format_optional_duration(d: Option<Duration>) -> clap::builder::Str {
+    match d {
+        None => "none".into(),
+        Some(dd) => clap::builder::Str::from(format_duration(dd).to_string()),
+    }
+}
+
+fn parse_optional_duration(d: &str) -> Result<Option<Duration>, humantime::DurationError> {
+    Ok(if d == "none" {
+        None
+    } else {
+        Some(parse_duration(d)?)
+    })
+}
+
 impl<I: InstanceDescriptor> Args for GrpcClientArgs<I> {
     fn augment_args(cmd: Command) -> Command {
         let default = GRPCChannelConfig::default();
@@ -139,6 +174,24 @@ impl<I: InstanceDescriptor> Args for GrpcClientArgs<I> {
             clap::builder::Str::from(default.pool.n_subchannels_want.to_string());
         let n_subchannels_healthy_min =
             clap::builder::Str::from(default.pool.n_subchannels_healthy_min.to_string());
+        let n_subchannels_healthy_critical_min =
+            clap::builder::Str::from(default.pool.n_subchannels_healthy_critical_min.to_string());
+        let log_unhealthy_initial_delay =
+            format_optional_duration(default.pool.log_unhealthy_initial_delay);
+        let log_unhealthy_repeat_delay =
+            format_optional_duration(default.pool.log_unhealthy_repeat_delay);
+        let health_check_timeout =
+            clap::builder::Str::from(format_duration(default.health_checking.timeout).to_string());
+        let health_check_interval =
+            clap::builder::Str::from(format_duration(default.health_checking.interval).to_string());
+        let mut hc_service_flag = Arg::new(I::HEALTH_CHECK_SERVICE_FLAG_NAME)
+            .long(I::HEALTH_CHECK_SERVICE_FLAG_NAME)
+            .conflicts_with(I::NO_HEALTH_CHECK_ENABLE_FLAG_NAME)
+            .help("gRPC health checking protocol service name.");
+        if let Some(ref service) = default.health_checking.service {
+            hc_service_flag = hc_service_flag.default_value((**service).to_owned());
+        }
+
         cmd
             .arg(
                 Arg::new(I::URI_FLAG_NAME)
@@ -166,6 +219,50 @@ impl<I: InstanceDescriptor> Args for GrpcClientArgs<I> {
                     .value_parser(value_parser!(usize))
                     .default_value(&n_subchannels_healthy_min)
                     .help("Number of healthy subchannels below which we report ourselves as unhealthy.")
+            )
+            .arg(
+                Arg::new(I::N_SUBCHANNELS_HEALTHY_CRITICAL_MIN_FLAG_NAME)
+                    .long(I::N_SUBCHANNELS_HEALTHY_CRITICAL_MIN_FLAG_NAME)
+                    .value_parser(value_parser!(usize))
+                    .default_value(&n_subchannels_healthy_critical_min)
+                    .help("Number of healthy subchannels below which ignore subchannel health and send requests anyway.")
+            )
+            .arg(
+                Arg::new(I::LOG_UNHEALTHY_INITIAL_DELAY_FLAG_NAME)
+                    .long(I::LOG_UNHEALTHY_INITIAL_DELAY_FLAG_NAME)
+                    .value_parser(parse_optional_duration)
+                    .default_value(&log_unhealthy_initial_delay)
+                    .help("Log about unhealthy channels after this amount of time, or \"none\".")
+            )
+            .arg(
+                Arg::new(I::LOG_UNHEALTHY_REPEAT_DELAY_FLAG_NAME)
+                    .long(I::LOG_UNHEALTHY_REPEAT_DELAY_FLAG_NAME)
+                    .value_parser(parse_optional_duration)
+                    .default_value(&log_unhealthy_repeat_delay)
+                    .help("Log again about unhealthy channels after this amount of time, or \"none\".")
+            )
+            .arg(
+                Arg::new(I::NO_HEALTH_CHECK_ENABLE_FLAG_NAME)
+                    .long(I::NO_HEALTH_CHECK_ENABLE_FLAG_NAME)
+                    .value_parser(value_parser!(bool))
+                    .help("Disable gRPC health checking.")
+            )
+            .arg(hc_service_flag)
+            .arg(
+                Arg::new(I::HEALTH_CHECK_TIMEOUT_FLAG_NAME)
+                    .long(I::HEALTH_CHECK_TIMEOUT_FLAG_NAME)
+                    .value_parser(parse_duration)
+                    .default_value(&health_check_timeout)
+                    .conflicts_with(I::NO_HEALTH_CHECK_ENABLE_FLAG_NAME)
+                    .help("Timeout for each individual health check probe.")
+            )
+            .arg(
+                Arg::new(I::HEALTH_CHECK_INTERVAL_FLAG_NAME)
+                    .long(I::HEALTH_CHECK_INTERVAL_FLAG_NAME)
+                    .value_parser(parse_duration)
+                    .default_value(&health_check_interval)
+                    .conflicts_with(I::NO_HEALTH_CHECK_ENABLE_FLAG_NAME)
+                    .help("Interval between each individual health check probe.")
             )
     }
 
@@ -208,6 +305,31 @@ impl<I: InstanceDescriptor> FromArgMatches for GrpcClientArgs<I> {
         self.config.pool.n_subchannels_healthy_min = matches
             .remove_one(I::N_SUBCHANNELS_HEALTHY_MIN_FLAG_NAME)
             .expect("has default_value");
+        self.config.pool.n_subchannels_healthy_critical_min = matches
+            .remove_one(I::N_SUBCHANNELS_HEALTHY_CRITICAL_MIN_FLAG_NAME)
+            .expect("has default_value");
+        self.config.pool.log_unhealthy_initial_delay = matches
+            .remove_one(I::LOG_UNHEALTHY_INITIAL_DELAY_FLAG_NAME)
+            .expect("has default_value");
+        self.config.pool.log_unhealthy_repeat_delay = matches
+            .remove_one(I::LOG_UNHEALTHY_REPEAT_DELAY_FLAG_NAME)
+            .expect("has default_value");
+        if matches
+            .remove_one(I::NO_HEALTH_CHECK_ENABLE_FLAG_NAME)
+            .unwrap_or_default()
+        {
+            self.config.health_checking.service = None;
+        } else {
+            self.config.health_checking.service = matches
+                .remove_one::<String>(I::HEALTH_CHECK_SERVICE_FLAG_NAME)
+                .map(Into::into);
+            self.config.health_checking.timeout = matches
+                .remove_one::<Duration>(I::HEALTH_CHECK_TIMEOUT_FLAG_NAME)
+                .expect("has default_value");
+            self.config.health_checking.interval = matches
+                .remove_one::<Duration>(I::HEALTH_CHECK_INTERVAL_FLAG_NAME)
+                .expect("has default_value");
+        }
         Ok(())
     }
 }

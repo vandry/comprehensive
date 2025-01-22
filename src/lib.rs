@@ -33,7 +33,8 @@
 //!
 //! # Examples
 //!
-//! [Hello World gRPC server]
+//! - [Hello World gRPC server]
+//! - [Hello World gRPC client]
 //!
 //! # Feature Flags
 //!
@@ -43,6 +44,7 @@
 //! Most features, such as HTTP and Prometheus metrics, are always available.
 //!
 //! [Hello World gRPC server]: https://github.com/vandry/comprehensive/blob/master/examples/src/helloworld-grpc-server.rs
+//! [Hello World gRPC client]: https://github.com/vandry/comprehensive/blob/master/examples/src/helloworld-grpc-client.rs
 
 #![warn(missing_docs)]
 

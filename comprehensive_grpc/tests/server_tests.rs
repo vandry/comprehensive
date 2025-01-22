@@ -1,4 +1,10 @@
+use comprehensive::{NoArgs, Resource, ResourceDependencies};
+use comprehensive_grpc::{GrpcServer, GrpcService};
+use futures::FutureExt;
+use std::ffi::OsString;
 use std::future::Future;
+use std::net::SocketAddr;
+use std::sync::Arc;
 #[cfg(feature = "tls")]
 use tokio_rustls::rustls;
 #[cfg(feature = "tls")]
@@ -9,39 +15,51 @@ use tonic_reflection::pb::v1::{
     ServerReflectionRequest,
 };
 
-use super::*;
+pub mod testutil;
 
 #[derive(ResourceDependencies)]
 struct JustAServer {
-    server: Arc<GrpcServer>,
+    _server: Arc<GrpcServer>,
 }
 
 fn test_args(
-    use_grpc: bool,
-    use_grpcs: bool,
-) -> (impl IntoIterator<Item = std::ffi::OsString>, u16) {
-    let p1 = testutil::pick_unused_port(None);
+    grpc_port: Option<u16>,
+    grpcs_port: Option<u16>,
+) -> impl IntoIterator<Item = OsString> {
     let mut v = vec!["cmd".into()];
-    if use_grpc {
+    if let Some(p1) = grpc_port {
         v.push(format!("--grpc-port={}", p1).into());
         v.push("--grpc-bind-addr=::1".into());
     }
     #[cfg(feature = "tls")]
-    if use_grpcs {
-        v.push(format!("--grpcs-port={}", testutil::pick_unused_port(Some(p1))).into());
+    if let Some(port) = grpcs_port {
+        v.push(format!("--grpcs-port={}", port).into());
         v.push("--grpcs-bind-addr=::1".into());
+        if let Some(p) = std::env::var_os("CARGO_MANIFEST_DIR") {
+            let mut a = OsString::from("--key-path=");
+            a.push(&p);
+            a.push(OsString::from("/tls_testdata/user1.key.pem"));
+            v.push(a);
+            let mut a = OsString::from("--cert-path=");
+            a.push(&p);
+            a.push(OsString::from("/tls_testdata/user1.certificate.pem"));
+            v.push(a);
+            let mut a = OsString::from("--cacert=");
+            a.push(p);
+            a.push(OsString::from("/tls_testdata/ca.certificate.pem"));
+            v.push(a);
+        }
     }
-    let _ = use_grpcs;
-    (v, p1)
+    let _ = grpcs_port;
+    v
 }
 
 fn plain_grpc_create() -> (comprehensive::Assembly<JustAServer>, SocketAddr) {
-    let (argv, _) = test_args(true, false);
+    let port = testutil::pick_unused_port();
+    let argv = test_args(Some(port), None);
     let assembly = comprehensive::Assembly::<JustAServer>::new_from_argv(argv).unwrap();
 
-    let addr = assembly.top.server.grpc.addr.unwrap();
-    #[cfg(feature = "tls")]
-    assert!(assembly.top.server.grpcs.addr.is_none());
+    let addr = ([0, 0, 0, 0, 0, 0, 0, 1], port).into();
     (assembly, addr)
 }
 
@@ -96,11 +114,6 @@ async fn check_health(channel: tonic::transport::Channel) {
 async fn nothing_enabled() {
     let argv = vec!["cmd"];
     let assembly = comprehensive::Assembly::<JustAServer>::new_from_argv(argv).unwrap();
-
-    assert!(assembly.top.server.grpc.addr.is_none());
-    #[cfg(feature = "tls")]
-    assert!(assembly.top.server.grpcs.addr.is_none());
-
     assert!(assembly
         .run_with_termination_signal(futures::stream::pending())
         .await
@@ -151,7 +164,8 @@ struct OwnServer(Arc<testutil::HelloService>);
 
 #[tokio::test]
 async fn grpc_own_service() {
-    let (argv, port) = test_args(true, false);
+    let port = testutil::pick_unused_port();
+    let argv = test_args(Some(port), None);
     let assembly = comprehensive::Assembly::<OwnServer>::new_from_argv(argv).unwrap();
     let _ = assembly.top.0;
     plain_grpc_run(
@@ -173,7 +187,7 @@ struct OwnBrokenServer(Arc<NoDescriptorService>);
 
 #[tokio::test]
 async fn fails_to_configure_without_descriptor() {
-    let (argv, _) = test_args(true, false);
+    let argv = test_args(Some(testutil::pick_unused_port()), None);
     match comprehensive::Assembly::<OwnBrokenServer>::new_from_argv(argv) {
         Ok(_) => {
             panic!("should fail");
@@ -224,7 +238,8 @@ struct NoReflectionServer(Arc<DisableReflection>, Arc<NoDescriptorService>);
 
 #[tokio::test]
 async fn without_reflection() {
-    let (argv, port) = test_args(true, false);
+    let port = testutil::pick_unused_port();
+    let argv = test_args(Some(port), None);
     // This is not great at all, but at least it works.
     let assembly = comprehensive::Assembly::<NoReflectionServer>::new_from_argv(argv).unwrap();
     let _ = assembly.top.0;
@@ -239,11 +254,16 @@ async fn without_reflection() {
 
 #[cfg(feature = "tls")]
 async fn test_grpcs_channel(port: u16) -> tonic::transport::Channel {
-    let identity =
-        tonic::transport::Identity::from_pem(tls_testdata::USER2_CERT, tls_testdata::USER2_KEY);
+    let base: std::path::PathBuf = std::env::var_os("CARGO_MANIFEST_DIR").unwrap().into();
+    let identity = tonic::transport::Identity::from_pem(
+        std::fs::read(base.join("tls_testdata/user2.certificate.pem")).expect("cert"),
+        std::fs::read(base.join("tls_testdata/user2.key.pem")).expect("key"),
+    );
     let tls = ClientTlsConfig::new()
         .identity(identity)
-        .ca_certificate(Certificate::from_pem(tls_testdata::CACERT))
+        .ca_certificate(Certificate::from_pem(
+            std::fs::read(base.join("tls_testdata/ca.certificate.pem")).expect("cacert"),
+        ))
         .domain_name("user1");
     let uri = format!("https://[::1]:{}/", port).parse().unwrap();
     tonic::transport::Channel::builder(uri)
@@ -258,11 +278,11 @@ async fn test_grpcs_channel(port: u16) -> tonic::transport::Channel {
 #[tokio::test]
 async fn grpcs() {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-    let (argv, _) = test_args(false, true);
+    let port = testutil::pick_unused_port();
+    let argv = test_args(None, Some(port));
     let assembly = comprehensive::Assembly::<JustAServer>::new_from_argv(argv).unwrap();
 
-    assert!(assembly.top.server.grpc.addr.is_none());
-    let addr = assembly.top.server.grpcs.addr.unwrap();
+    let addr = ([0, 0, 0, 0, 0, 0, 0, 1], port).into();
 
     let (tx, rx) = tokio::sync::oneshot::channel();
     let j = tokio::spawn(async move {
@@ -283,11 +303,13 @@ async fn grpcs() {
 #[tokio::test]
 async fn grpc_and_grpcs() {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-    let (argv, _) = test_args(true, true);
+    let port_grpc = testutil::pick_unused_port();
+    let port_grpcs = testutil::pick_unused_port();
+    let argv = test_args(Some(port_grpc), Some(port_grpcs));
     let assembly = comprehensive::Assembly::<JustAServer>::new_from_argv(argv).unwrap();
 
-    let addr_grpc = assembly.top.server.grpc.addr.unwrap();
-    let addr_grpcs = assembly.top.server.grpcs.addr.unwrap();
+    let addr_grpc = ([0, 0, 0, 0, 0, 0, 0, 1], port_grpc).into();
+    let addr_grpcs = ([0, 0, 0, 0, 0, 0, 0, 1], port_grpcs).into();
 
     let (tx, rx) = tokio::sync::oneshot::channel();
     let j = tokio::spawn(async move {

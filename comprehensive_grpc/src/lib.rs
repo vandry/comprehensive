@@ -356,11 +356,6 @@ mod insecure_server {
 mod secure_server {
     use super::*;
 
-    #[cfg(not(test))]
-    type TlsConfig = comprehensive::tls::TlsConfig;
-    #[cfg(test)]
-    type TlsConfig = super::testutil::tls::MockTlsConfig;
-
     #[derive(clap::Args, Debug)]
     #[group(skip)]
     pub(super) struct SecureGrpcServerArgs {
@@ -380,7 +375,7 @@ mod secure_server {
 
     #[derive(ResourceDependencies)]
     pub(super) struct SecureGrpcServerDependencies {
-        tls: Arc<TlsConfig>,
+        tls: Arc<comprehensive::tls::TlsConfig>,
     }
 
     pub(super) struct SecureGrpcServer {
@@ -702,10 +697,3 @@ pub struct GrpcServiceDependencies<T: Resource> {
     pub implementation: Arc<T>,
     pub server: Arc<GrpcServer>,
 }
-
-#[cfg(test)]
-mod server_tests;
-#[cfg(test)]
-mod testutil;
-#[cfg(all(test, feature = "tls"))]
-mod tls_testdata;

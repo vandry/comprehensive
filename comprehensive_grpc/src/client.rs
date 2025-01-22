@@ -401,15 +401,16 @@ pub fn new<I>(
 
 #[cfg(test)]
 mod tests {
-    use atomic_take::AtomicTake;
-    use comprehensive::{Assembly, NoArgs, Resource};
-    use futures::FutureExt;
-
     use super::*;
 
-    use crate::testutil::pb::comprehensive::test_client::TestClient;
-    use crate::testutil::pb::comprehensive::GreetResponse;
+    mod pb {
+        pub(crate) mod comprehensive {
+            tonic::include_proto!("comprehensive");
+        }
+    }
+
     use crate::GrpcClient;
+    use pb::comprehensive::test_client::TestClient;
 
     #[derive(GrpcClient)]
     struct OptionalTupleStruct(Option<TestClient<Channel>>, ClientWorker);
@@ -438,48 +439,6 @@ mod tests {
         required_named_struct: Arc<RequiredNamedStruct>,
     }
 
-    type Msg = Result<tonic::Response<GreetResponse>, tonic::Status>;
-
-    struct EndToEndTester {
-        client: Arc<RequiredTupleStruct>,
-        tx: AtomicTake<tokio::sync::oneshot::Sender<Msg>>,
-        rx: AtomicTake<tokio::sync::oneshot::Receiver<Msg>>,
-    }
-
-    #[derive(ResourceDependencies)]
-    struct EndToEndTesterDependencies(Arc<RequiredTupleStruct>);
-
-    impl Resource for EndToEndTester {
-        type Args = NoArgs;
-        type Dependencies = EndToEndTesterDependencies;
-        const NAME: &str = "EndToEndTester";
-
-        fn new(
-            d: EndToEndTesterDependencies,
-            _: NoArgs,
-        ) -> Result<Self, Box<dyn std::error::Error>> {
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            Ok(Self {
-                client: d.0,
-                tx: AtomicTake::new(tx),
-                rx: AtomicTake::new(rx),
-            })
-        }
-
-        async fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
-            let mut client = self.client.client();
-            let tx = self.tx.take().unwrap();
-            let _ = tx.send(client.greet(()).await);
-            Ok(())
-        }
-    }
-
-    #[derive(ResourceDependencies)]
-    struct EndToEnd {
-        _s: Arc<crate::testutil::HelloService>,
-        tester: Arc<EndToEndTester>,
-    }
-
     #[tokio::test]
     async fn create_clients() {
         let argv: Vec<std::ffi::OsString> = vec![
@@ -488,6 +447,7 @@ mod tests {
             "--required-named-struct-uri=http://localhost/".into(),
             "--optional-named-struct-uri=http://localhost/".into(),
         ];
+        let _ = tokio_rustls::rustls::crypto::aws_lc_rs::default_provider().install_default();
         let a = comprehensive::Assembly::<TestClients>::new_from_argv(argv).unwrap();
 
         let c1: Option<TestClient<Channel>> = a.top.optional_tuple_struct.client();
@@ -499,30 +459,5 @@ mod tests {
         let _ = c2.greet(());
         let _ = c3.unwrap().greet(());
         let _ = c4.greet(());
-    }
-
-    #[test_log::test(tokio::test)]
-    async fn end_to_end() {
-        let port = crate::testutil::pick_unused_port(None);
-        let argv: Vec<std::ffi::OsString> = vec![
-            "argv0".into(),
-            format!("--grpc-port={}", port).into(),
-            "--grpc-bind-addr=::1".into(),
-            format!("--required-tuple-struct-uri=http://[::1]:{}/", port).into(),
-        ];
-        let a = Assembly::<EndToEnd>::new_from_argv(argv).unwrap();
-        let tester_rx = a.top.tester.rx.take().unwrap();
-
-        let (term_tx, term_rx) = tokio::sync::oneshot::channel();
-        let j = tokio::spawn(async move {
-            let _ = a
-                .run_with_termination_signal(futures::stream::once(term_rx.map(|_| ())))
-                .await;
-        });
-        let msg = tester_rx.await.unwrap();
-        let _ = term_tx.send(());
-        let _ = j.await;
-        let response = msg.expect("successful RPC").into_inner();
-        assert_eq!(response.message.as_deref(), Some("hello"));
     }
 }

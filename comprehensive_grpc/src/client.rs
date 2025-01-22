@@ -378,6 +378,7 @@ pub fn new<I>(
     let Some(uri) = a.uri else {
         return Ok((None, ClientWorker::empty()));
     };
+    super::tonic_prometheus_layer_use_default_registry();
 
     #[cfg(feature = "tls")]
     let connector = {

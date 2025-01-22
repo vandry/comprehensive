@@ -33,7 +33,7 @@ tonic-reflection = "0.12"
 tonic_prometheus_layer = "0.1"
 tower = "0.5"
 tower-layer = "0.3"
-warm_channels = { version = "0.1", features = ["grpc"] }
+warm_channels = { version = "0.1", features = ["grpc", "metrics"] }
 
 [features]
 tls = ["comprehensive/tls", "comprehensive/unreloadable_tls", "tonic/tls", "warm_channels/tls"]
@@ -42,6 +42,7 @@ tls = ["comprehensive/tls", "comprehensive/unreloadable_tls", "tonic/tls", "warm
 tonic-build = "0.12"
 
 [dev-dependencies]
+http-body-util = "0.1"
 rand = "0.8"
 test-log = "0.2"
 tokio-rustls = "0.26"

@@ -1,13 +1,12 @@
-//! A collection of assembled runnable [`Resource`] objects
+//! A collection of assembled runnable application components called Resources.
 //!
-//! A [`Resource`] is an item of work which may depend on other resources
+//! A resource is an application component which may depend on other resources
 //! and gets bundled with other resources into an [`Assembly`] where all
 //! the resources form a directed acyclic graph with the edges representing
 //! their dependency relationships.
 //!
-//! Only one instance of each type that implements the [`Resource`] trait
-//! exists in an [`Assembly`]: resources are meant to be shared by all
-//! consumers.
+//! Only one instance of each type of Resource exists in an [`Assembly`]:
+//! resources are meant to be shared by all consumers.
 //!
 //! Examples of typical resources types are:
 //! * server infrastructure, such as an HTTP server, or a piece of
@@ -25,152 +24,225 @@
 //! The entry point to be called from the application's main function is
 //! [`Assembly::new`].
 
-use async_trait::async_trait;
-use clap::{ArgMatches, Args, Command, FromArgMatches};
-use downcast_rs::{impl_downcast, DowncastSync};
+use clap::{ArgMatches, Args, FromArgMatches};
+use fixedbitset::FixedBitSet;
 use futures::stream::FuturesUnordered;
-use futures::{poll, stream_select, FutureExt, Stream, StreamExt};
-use std::any::TypeId;
+use futures::{poll, ready, Stream, StreamExt};
+use pin_project_lite::pin_project;
+use std::any::{Any, TypeId};
+use std::cell::OnceCell;
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::error::Error;
 use std::future::Future;
-use std::pin::pin;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::task::Poll;
-use tokio::sync::{futures::Notified, Notify};
+use std::task::{Context, Poll, Waker};
+use topological_sort::TopologicalSort;
+use try_lock::TryLock;
 
-/// Passed to [`Resource::run_with_termination_signal`] to offer resources
-/// a chance to react to a termination request signal. Interested resources
-/// should call [`ShutdownNotify::subscribe`].
-pub struct ShutdownNotify<'a>(&'a Notify);
-
-impl<'a> ShutdownNotify<'a> {
-    /// Returns a new [`Future`] which will resolve when termination
-    /// is requested.
-    pub fn subscribe(&'a self) -> Notified<'a> {
-        self.0.notified()
-    }
-
-    /// Create a new notifier. Visible for testing.
-    pub fn new(n: &'a Notify) -> Self {
-        Self(n)
-    }
+struct ShutdownSignalEntry {
+    refcount: AtomicUsize,
+    waker: TryLock<Option<Waker>>,
+    children: FixedBitSet,
 }
 
-#[async_trait]
-trait ResourceObject: DowncastSync {
-    async fn run<'a>(
-        &self,
-        selfindex: usize,
-        subscribe_to_termination: &'a ShutdownNotify,
-    ) -> (usize, Result<(), Box<dyn Error>>);
-}
-impl_downcast!(sync ResourceObject);
-
-#[async_trait]
-impl<T: Resource + Send> ResourceObject for T {
-    async fn run<'a>(
-        &self,
-        selfindex: usize,
-        subscribe_to_termination: &'a ShutdownNotify,
-    ) -> (usize, Result<(), Box<dyn Error>>) {
-        (
-            selfindex,
-            Resource::run_with_termination_signal(self, subscribe_to_termination).await,
-        )
-    }
-}
-
-/// The main unit of work in an [`Assembly`] and the trait common to each
-/// of the nodes in its DAG.
-#[allow(private_bounds)]
-pub trait Resource: ResourceObject + Sized {
-    /// Command line arguments that this [`Resource`] would like to receive.
-    /// For example a resource that implements an HTTP server might use this
-    /// to configure which address to listen on.
-    ///
-    /// This is expected to be a struct defined like so:
-    ///
-    /// ```
-    /// #[derive(clap::Args, Debug)]
-    /// #[group(skip)]
-    /// struct Args {
-    ///     #[arg(long)]
-    ///     port: Option<u16>,
-    /// }
-    /// ```
-    ///
-    /// These args will be collected along with the args from all other
-    /// resources into a [`clap::Parser`] and the individual Args instances
-    /// will be handed to each resource at constrction time.
-    type Args: clap::Args;
-
-    /// Other resources that this [`Resource`] depends on. The resources
-    /// in this collection will be constructed before this resource, then
-    /// this structure will be filled in with [`Arc`] references to those
-    /// constructed instances and passed to the constructor of the current
-    /// resource.
-    ///
-    /// This type should satisfy the [`ResourceDependencies`] trait by
-    /// deriving it.
-    type Dependencies: ResourceDependencies;
-
-    /// The name of this resource. Used in logs and resource graph
-    /// diagnostics.
-    const NAME: &str;
-
-    /// Construct a resource of this type. Called while the graph of all
-    /// resources is built in [`Assembly::new`].
-    fn new(deps: Self::Dependencies, args: Self::Args) -> Result<Self, Box<dyn Error>>;
-
-    /// Execute a background task belonging to this resource. Awaited
-    /// together with the tasks for all other resourcees in [`Assembly::run`].
-    ///
-    /// The default implementation exits immediately.
-    fn run(&self) -> impl Future<Output = Result<(), Box<dyn Error>>> + Send {
-        async { Ok(()) }
-    }
-
-    /// Execute a background task belonging to this resource. Awaited
-    /// together with the tasks for all other resourcees in [`Assembly::run`].
-    ///
-    /// The default implementation delegates to [`Resource::run`] except that
-    /// it exits (successfully) as soon as a termination signal is received.
-    fn run_with_termination_signal<'a>(
-        &'a self,
-        subscribe_to_termination: &'a ShutdownNotify<'a>,
-    ) -> impl Future<Output = Result<(), Box<dyn Error>>> + Send + 'a {
-        let term_signal = subscribe_to_termination.subscribe();
-        async move {
-            let runner = pin!(Resource::run(self));
-            let term = pin!(term_signal.map(|_| Ok(())));
-            futures::future::select(runner, term).await.factor_first().0
+impl ShutdownSignalEntry {
+    fn new(s: usize) -> Self {
+        ShutdownSignalEntry {
+            refcount: AtomicUsize::default(),
+            waker: TryLock::new(None),
+            children: FixedBitSet::with_capacity(s),
         }
     }
+}
+
+pub(crate) struct ShutdownSignal(Arc<[ShutdownSignalEntry]>);
+
+#[doc(hidden)]
+pub struct ShutdownSignalParticipant(Arc<[ShutdownSignalEntry]>, usize);
+
+impl ShutdownSignal {
+    fn new(s: usize) -> Self {
+        Self(
+            std::iter::repeat(())
+                .map(|_| ShutdownSignalEntry::new(s))
+                .take(s + 1) // An additional entry for the root
+                .collect(),
+        )
+    }
+
+    fn add_parent(inner: &mut [ShutdownSignalEntry], child: usize, parent: Option<usize>) {
+        inner[parent.unwrap_or(inner.len() - 1)]
+            .children
+            .insert(child);
+        *inner[child].refcount.get_mut() += 1
+    }
+
+    pub(crate) fn participate(&self, i: usize) -> ShutdownSignalParticipant {
+        ShutdownSignalParticipant(Arc::clone(&self.0), i)
+    }
+
+    fn into_root_participant(self) -> ShutdownSignalParticipant {
+        let i = self.0.len() - 1;
+        ShutdownSignalParticipant(self.0, i)
+    }
+}
+
+impl ShutdownSignalParticipant {
+    pub(crate) fn propagate(self) {
+        for i in self.0[self.1].children.ones() {
+            if self.0[i].refcount.fetch_sub(1, Ordering::Release) == 1 {
+                if let Some(mut maybe_waker) = self.0[i].waker.try_lock() {
+                    if let Some(waker) = maybe_waker.take() {
+                        waker.wake()
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl Drop for ShutdownSignalParticipant {
+    fn drop(&mut self) {
+        if let Some(mut maybe_waker) = self.0[self.1].waker.try_lock() {
+            let _ = maybe_waker.take();
+        }
+    }
+}
+
+impl Future for ShutdownSignalParticipant {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let entry = &self.0[self.1];
+        if entry.refcount.load(Ordering::Acquire) == 0 {
+            return Poll::Ready(());
+        }
+        if let Some(mut maybe_waker) = entry.waker.try_lock() {
+            let park = maybe_waker
+                .as_ref()
+                .map(|w| !w.will_wake(cx.waker()))
+                .unwrap_or(true);
+            let old = if park {
+                std::mem::replace(&mut *maybe_waker, Some(cx.waker().clone()))
+            } else {
+                None
+            };
+            std::mem::drop(maybe_waker);
+            if let Some(waker) = old {
+                waker.wake();
+            }
+            if entry.refcount.load(Ordering::Acquire) == 0 {
+                return Poll::Ready(());
+            }
+        }
+        Poll::Pending
+    }
+}
+
+impl futures::future::FusedFuture for ShutdownSignalParticipant {
+    fn is_terminated(&self) -> bool {
+        self.0[self.1].refcount.load(Ordering::Acquire) == 0
+    }
+}
+
+type ResourceFut = Pin<Box<dyn Future<Output = Result<(), Box<dyn Error>>> + Send>>;
+type TaskFut = IdentifiedFuture<ResourceFut>;
+
+struct Node<T: sealed::ResourceBase<U>, const U: usize> {
+    production: OnceCell<T::Production>,
+}
+
+impl<T: sealed::ResourceBase<U>, const U: usize> Default for Node<T, U> {
+    fn default() -> Self {
+        Self {
+            production: OnceCell::new(),
+        }
+    }
+}
+
+trait NodeTrait: Any {
+    fn name(&self) -> &'static str;
+    fn augment_args(&self, _: clap::Command) -> clap::Command;
+    fn make(
+        &self,
+        cx: &mut ProduceContext<'_>,
+        arg_matches: &mut ArgMatches,
+    ) -> Result<(), Box<dyn Error>>;
+    fn task(self: Box<Self>, stopper: ShutdownSignalParticipant) -> ResourceFut;
+}
+
+impl<T: sealed::ResourceBase<U>, const U: usize> NodeTrait for Node<T, U> {
+    fn name(&self) -> &'static str {
+        T::NAME
+    }
+
+    fn augment_args(&self, c: clap::Command) -> clap::Command {
+        <T as sealed::ResourceBase<U>>::augment_args(c)
+    }
+
+    fn make(
+        &self,
+        cx: &mut ProduceContext<'_>,
+        arg_matches: &mut ArgMatches,
+    ) -> Result<(), Box<dyn Error>> {
+        let _ = self
+            .production
+            .set(<T as sealed::ResourceBase<U>>::make(cx, arg_matches)?);
+        Ok(())
+    }
+
+    fn task(mut self: Box<Self>, stopper: ShutdownSignalParticipant) -> ResourceFut {
+        <T as sealed::ResourceBase<U>>::task(stopper, self.production.take().unwrap())
+    }
+}
+
+struct NodeRelationship {
+    parent: Option<usize>,
+    child: usize,
 }
 
 /// Opaque type used in the implementation of the [`ResourceDependencies`]
 /// trait, which should be derived.
 #[doc(hidden)]
 pub struct RegisterContext<'a> {
-    registry: &'a mut HashMap<TypeId, bool>,
-    command: Option<Command>,
-    write_graph: Option<&'a mut dyn std::io::Write>,
-    parent: Option<TypeId>,
-}
-
-struct ResourceEntry {
-    name: &'static str,
-    resource: Arc<dyn ResourceObject>,
+    type_map: &'a mut HashMap<TypeId, usize>,
+    parent: Option<usize>,
+    nodes: &'a mut Vec<Box<dyn NodeTrait>>,
+    relationships: &'a mut Vec<NodeRelationship>,
 }
 
 /// Opaque type used in the implementation of the [`ResourceDependencies`]
 /// trait, which should be derived.
 #[doc(hidden)]
 pub struct ProduceContext<'a> {
-    registry: &'a mut HashMap<TypeId, ResourceEntry>,
-    arg_matches: &'a mut ArgMatches,
+    type_map: HashMap<TypeId, usize>,
+    nodes: &'a Vec<Box<dyn NodeTrait>>,
+}
+
+pub(crate) mod sealed {
+    use super::{
+        Arc, ArgMatches, Error, ProduceContext, RegisterContext, ResourceFut,
+        ShutdownSignalParticipant,
+    };
+
+    pub trait ResourceBase<const T: usize>: Send + Sync + 'static {
+        const NAME: &str;
+        type Production;
+
+        fn register_recursive(_: &mut RegisterContext<'_>) {}
+        fn augment_args(c: clap::Command) -> clap::Command {
+            c
+        }
+        fn make(
+            cx: &mut ProduceContext<'_>,
+            arg_matches: &mut ArgMatches,
+        ) -> Result<Self::Production, Box<dyn Error>>;
+        fn shared(re: &Self::Production) -> Arc<Self>;
+        fn task(stopper: ShutdownSignalParticipant, re: Self::Production) -> ResourceFut;
+    }
 }
 
 /// Opaque type used in the implementation of the [`ResourceDependencies`]
@@ -180,78 +252,56 @@ pub struct Registrar<T> {
     _never_constructed: T,
 }
 
-impl<T: Resource> Registrar<T> {
-    pub fn register(cx: &mut RegisterContext<'_>) {
+impl<T> Registrar<T> {
+    pub fn register<const U: usize>(cx: &mut RegisterContext<'_>)
+    where
+        T: sealed::ResourceBase<U>,
+    {
         let me = TypeId::of::<T>();
-        if let Some(ref mut w) = cx.write_graph {
-            writeln!(
-                w,
-                "  \"{}\" -> \"t-{:?}\"",
-                match cx.parent {
-                    Some(ref tid) => format!("t-{:?}", tid),
-                    None => String::from("top"),
-                },
-                me
-            )
-            .unwrap();
+        let next_i = cx.type_map.len();
+        let (i, prune) = match cx.type_map.entry(me) {
+            Entry::Vacant(e) => {
+                e.insert(next_i);
+                (next_i, false)
+            }
+            Entry::Occupied(e) => (*e.get(), true),
+        };
+        cx.relationships.push(NodeRelationship {
+            parent: cx.parent,
+            child: i,
+        });
+        if prune {
+            return;
         }
-        match cx.registry.entry(me) {
-            Entry::Vacant(e) => e.insert(false),
-            Entry::Occupied(e) => match e.get() {
-                false => {
-                    panic!(
-                        "Disallowed cyclic dependency in Comprehensive graph involving {}",
-                        T::NAME
-                    );
-                }
-                true => {
-                    return;
-                }
-            },
-        };
-        let old_parent = if let Some(ref mut w) = cx.write_graph {
-            writeln!(w, "  \"t-{:?}\" [label={:?}]", me, T::NAME).unwrap();
-            cx.parent.replace(me)
-        } else {
-            None
-        };
-        T::Dependencies::register(cx);
-        cx.parent = old_parent;
-        cx.command = Some(T::Args::augment_args(cx.command.take().unwrap()));
-        cx.registry.entry(me).and_modify(|v| *v = true);
+        cx.nodes.push(Box::new(Node::<T, U>::default()));
+        let parent = cx.parent.replace(i);
+        <T as sealed::ResourceBase<U>>::register_recursive(cx);
+        cx.parent = parent;
     }
 
-    pub fn produce(cx: &mut ProduceContext<'_>) -> Result<Arc<T>, Box<dyn Error>> {
+    pub fn produce<const U: usize>(cx: &mut ProduceContext<'_>) -> Result<Arc<T>, Box<dyn Error>>
+    where
+        T: sealed::ResourceBase<U>,
+    {
         let me = TypeId::of::<T>();
-        let v = match cx.registry.get(&me) {
-            None => {
-                let deps = T::Dependencies::produce(cx)?;
-                let args = T::Args::from_arg_matches(cx.arg_matches)?;
-                let v: Arc<dyn ResourceObject> = Arc::new(T::new(deps, args)?);
-                cx.registry.insert(
-                    me,
-                    ResourceEntry {
-                        name: T::NAME,
-                        resource: Arc::clone(&v),
-                    },
-                );
-                v
-            }
-            Some(v) => Arc::clone(&v.resource),
-        };
-        let Ok(v) = v.downcast_arc::<T>() else {
-            panic!("bad downcast");
-        };
-        Ok(v)
+        let i = cx.type_map.get(&me).expect("dependency not mapped");
+        let n: &dyn Any = cx.nodes[*i].as_ref();
+        Ok(<T as sealed::ResourceBase<U>>::shared(
+            n.downcast_ref::<Node<T, U>>()
+                .expect("bad downcast")
+                .production
+                .get()
+                .unwrap(),
+        ))
     }
 }
 
 /// This trait expresses the collection of types of other resources that a
-/// [`Resource`] depends on. It is also used to list the top-level resource
+/// Resource depends on. It is also used to list the top-level resource
 /// types at the roots of the [`Assembly`] graph.
 ///
 /// This must be implemented on a struct containing zero or more fields of
-/// type [`Arc<T>`] where T is a [`Resource`]. On that structure, the trait
+/// type [`Arc<T>`] where T is a Resource. On that structure, the trait
 /// should be derived.
 ///
 /// ```
@@ -259,7 +309,7 @@ impl<T: Resource> Registrar<T> {
 /// use std::sync::Arc;
 ///
 /// # struct OtherResource;
-/// # impl comprehensive::Resource for OtherResource {
+/// # impl comprehensive::v0::Resource for OtherResource {
 /// #     type Args = NoArgs;
 /// #     type Dependencies = NoDependencies;
 /// #     const NAME: &str = "other resource";
@@ -277,7 +327,7 @@ impl<T: Resource> Registrar<T> {
 /// }
 /// ```
 ///
-/// **On the use of [`Arc`]**: During initialisation, a [`Resource`] might
+/// **On the use of [`Arc`]**: During initialisation, a Resource might
 /// reasonably desire mutable references to its dependencies, but this is
 /// not available since the dependencies are supplied as [`Arc<T>`].
 /// Resources can get around this by offering interior mutability APIs
@@ -285,10 +335,10 @@ impl<T: Resource> Registrar<T> {
 /// tradeoff. An alternative design was considered where the dependencies
 /// were supplied as `&'a mut T` (where `'a` is the lifetime of the
 /// [`Assembly`]) but that arguably had worse issues since resources could
-/// not retain those references outside of [`Resource::new`] (since the
-/// reference needs to be available to another consumer). Solutions are
-/// possible in case more longer-lived access is required, but these are
-/// arguably not better than the [`Arc`] solution.
+/// not retain those references outside of [`crate::v0::Resource::new`]
+/// (since the reference needs to be available to another consumer).
+/// Solutions are possible in case more longer-lived access is required,
+/// but these are arguably not better than the [`Arc`] solution.
 pub trait ResourceDependencies: Sized {
     /// Opaque method used in the implementation of the
     /// [`ResourceDependencies`] trait, which should be derived.
@@ -301,6 +351,28 @@ pub trait ResourceDependencies: Sized {
 
 pub use comprehensive_macros::ResourceDependencies;
 
+pin_project! {
+    struct IdentifiedFuture<F> {
+        #[pin] fut: F,
+        identifier: usize,
+    }
+}
+
+impl<F> IdentifiedFuture<F> {
+    fn new(fut: F, identifier: usize) -> Self {
+        Self { fut, identifier }
+    }
+}
+
+impl<F: Future> Future for IdentifiedFuture<F> {
+    type Output = (usize, F::Output);
+
+    fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
+        let this = self.project();
+        Poll::Ready((*this.identifier, ready!(this.fut.poll(cx))))
+    }
+}
+
 /// Main entry point for a Comprehensive server.
 ///
 /// ```
@@ -311,7 +383,9 @@ pub use comprehensive_macros::ResourceDependencies;
 ///    comprehensive::Assembly::<TopDependencies>::new()?.run().await
 /// }
 pub struct Assembly<T> {
-    resources: Box<[ResourceEntry]>,
+    shutdown_notify: ShutdownSignal,
+    tasks: FuturesUnordered<TaskFut>,
+    names: Box<[Option<&'static str>]>,
     /// The constructed instances of the top-level (root) dependencies.
     /// Access to this is freqently not required as these resources
     /// will work autonomously once included in the graph.
@@ -350,10 +424,150 @@ fn active_list(names: &[Option<&'static str>]) -> String {
     v.join(", ")
 }
 
+pin_project! {
+    struct TerminationSignal<T> {
+        #[pin] signal_stream: Option<T>,
+        shutdown_notify: Option<ShutdownSignalParticipant>,
+    }
+}
+
+impl<T> TerminationSignal<T> {
+    fn new(signal_stream: T, shutdown_notify: ShutdownSignalParticipant) -> Self {
+        Self {
+            signal_stream: Some(signal_stream),
+            shutdown_notify: Some(shutdown_notify),
+        }
+    }
+}
+
+impl<T: Stream> Future for TerminationSignal<T> {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let mut this = self.project();
+        loop {
+            if let Some(s) = this.signal_stream.as_mut().as_pin_mut() {
+                let _ = ready!(s.poll_next(cx));
+                match this.shutdown_notify.take() {
+                    Some(n) => {
+                        log::warn!("SIGTERM received; shutting down");
+                        n.propagate();
+                        continue;
+                    }
+                    None => {
+                        log::warn!("SIGTERM received again; quitting immediately.");
+                    }
+                }
+            }
+            this.signal_stream.set(None);
+            return Poll::Ready(());
+        }
+    }
+}
+
+impl<T: Stream> futures::future::FusedFuture for TerminationSignal<T> {
+    fn is_terminated(&self) -> bool {
+        self.signal_stream.is_none()
+    }
+}
+
+#[derive(Debug)]
+struct CycleError {
+    resources_in_cycle: Box<[&'static str]>,
+}
+
+impl CycleError {
+    fn new(resources_in_cycle: impl Iterator<Item = &'static str>) -> Self {
+        Self {
+            resources_in_cycle: resources_in_cycle.collect::<Vec<_>>().into_boxed_slice(),
+        }
+    }
+}
+
+impl std::fmt::Display for CycleError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Cycle in Resource graph, involving: {}",
+            self.resources_in_cycle.join(", ")
+        )
+    }
+}
+
+impl std::error::Error for CycleError {}
+
+fn build_order(
+    ts: TopologicalSort<usize>,
+    expect_len: usize,
+) -> Result<Vec<usize>, impl Iterator<Item = usize>> {
+    if expect_len == 0 {
+        return Ok(Vec::new());
+    }
+    let mut build_order = ts.collect::<Vec<_>>();
+    if build_order.len() == expect_len + 1 {
+        // The last node in the build order should be the root.
+        if build_order.pop().expect("always has size > 0") != expect_len {
+            panic!("Dependency graph was built wrong: root was not sorted last");
+        }
+        Ok(build_order)
+    } else {
+        let mut not_in_cycle = FixedBitSet::with_capacity(expect_len - 1);
+        for i in build_order {
+            if i < not_in_cycle.len() {
+                not_in_cycle.insert(i);
+            }
+        }
+        not_in_cycle.toggle_range(..);
+        Err(not_in_cycle.into_ones())
+    }
+}
+
+struct AssemblySetup {
+    nodes: Vec<Box<dyn NodeTrait>>,
+    type_map: HashMap<TypeId, usize>,
+    build_order: Vec<usize>,
+    shutdown_notify: ShutdownSignal,
+}
+
 impl<T> Assembly<T>
 where
     T: ResourceDependencies,
 {
+    fn setup() -> Result<AssemblySetup, CycleError> {
+        let mut nodes = Vec::new();
+        let mut type_map = HashMap::new();
+        let mut relationships = Vec::new();
+        let mut cx = RegisterContext {
+            type_map: &mut type_map,
+            parent: None,
+            nodes: &mut nodes,
+            relationships: &mut relationships,
+        };
+        T::register(&mut cx);
+
+        let mut shutdown_notify = ShutdownSignal::new(nodes.len());
+        let shutdown_notify_edit = Arc::get_mut(&mut shutdown_notify.0).unwrap();
+        for NodeRelationship { parent, child } in &relationships {
+            ShutdownSignal::add_parent(shutdown_notify_edit, *child, *parent);
+        }
+        let topo_sort = relationships
+            .into_iter()
+            .map(|NodeRelationship { parent, child }| {
+                topological_sort::DependencyLink::from((parent.unwrap_or(nodes.len()), child))
+            })
+            .collect::<TopologicalSort<_>>();
+
+        let build_order = build_order(topo_sort, nodes.len())
+            .map_err(|e| CycleError::new(e.into_iter().map(|i| nodes[i].name())))?;
+
+        Ok(AssemblySetup {
+            nodes,
+            type_map,
+            build_order,
+            shutdown_notify,
+        })
+    }
+
     /// Build a new [`Assembly`] from the given resources and all their
     /// transitive dependencies.
     pub fn new() -> Result<Self, Box<dyn Error>> {
@@ -368,41 +582,57 @@ where
         I: IntoIterator<Item = A>,
         A: Into<std::ffi::OsString> + Clone,
     {
-        let mut registry = HashMap::new();
-        let mut cx = RegisterContext {
-            registry: &mut registry,
-            command: Some(clap::Command::new("Assembly")),
-            write_graph: None,
-            parent: None,
-        };
-        T::register(&mut cx);
-        let command = GlobalArgs::augment_args(cx.command.take().unwrap());
+        let AssemblySetup {
+            nodes,
+            type_map,
+            build_order,
+            shutdown_notify,
+        } = Self::setup()?;
 
-        let mut arg_matches = command.get_matches_from(argv);
+        let mut command = Some(clap::Command::new("Assembly"));
+        for n in &nodes {
+            let c = command.take().unwrap();
+            command = Some(n.augment_args(c));
+        }
+        let mut arg_matches =
+            GlobalArgs::augment_args(command.take().unwrap()).get_matches_from(argv);
         let global_args = GlobalArgs::from_arg_matches(&arg_matches)?;
-
         if global_args.write_graph_and_exit {
             Self::write_graph(&mut std::io::stdout());
             std::process::exit(0);
         }
 
-        let mut registry = HashMap::new();
         let mut cx = ProduceContext {
-            registry: &mut registry,
-            arg_matches: &mut arg_matches,
+            type_map,
+            nodes: &nodes,
         };
+        for i in build_order {
+            nodes[i].make(&mut cx, &mut arg_matches)?;
+        }
         let top = T::produce(&mut cx)?;
-        let resources = registry
-            .into_values()
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
-        Ok(Self { resources, top })
+
+        let names = nodes.iter().map(|n| Some(n.name())).collect();
+        let tasks = nodes
+            .into_iter()
+            .enumerate()
+            .map(|(i, n)| {
+                let fut = n.task(shutdown_notify.participate(i));
+                IdentifiedFuture::new(fut, i)
+            })
+            .collect();
+
+        Ok(Self {
+            tasks,
+            names,
+            top,
+            shutdown_notify,
+        })
     }
 
-    /// Run an [`Assembly`] by invoking and awaiting [`Resource::run`] on every
-    /// resource in the graph.
+    /// Run an [`Assembly`] by invoking and awaiting every resource in the graph.
     ///
-    /// Runs until either any [`Resource`] terminates with an error, or all
+    /// Runs until either any Resource terminates with an error, a termination
+    /// signal is received (and graceful shutdown is finished), or all
     /// resources terminate successfully. (Returns immediately on an empty
     /// graph.)
     pub async fn run(self) -> Result<(), Box<dyn Error>> {
@@ -412,8 +642,7 @@ where
         .await
     }
 
-    /// Run an [`Assembly`] by invoking and awaiting [`Resource::run`] on every
-    /// resource in the graph.
+    /// Run an [`Assembly`] by invoking and awaiting every resource in the graph.
     ///
     /// Callers should usually use [`Assembly::run`] instead, which installs a
     /// `SIGTERM` handler and then calls this with it.
@@ -421,75 +650,64 @@ where
         self,
         termination_signal: impl Stream<Item = ()> + Unpin,
     ) -> Result<(), Box<dyn Error>> {
-        let mut names = self
-            .resources
-            .iter()
-            .map(|e| Some(e.name))
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
-        let mut running_count = self.resources.len();
-        let mut quitting = false;
-        let shutdown_notify = Notify::new();
-        let notify_interface = ShutdownNotify(&shutdown_notify);
+        let Self {
+            mut tasks,
+            shutdown_notify,
+            mut names,
+            top: _,
+        } = self;
         log::info!(
             "Comprehensive starting with {} resources: {}",
-            self.resources.len(),
+            names.len(),
             active_list(&names)
         );
-        let mut stream: FuturesUnordered<_> = self
-            .resources
-            .iter()
-            .enumerate()
-            .map(|(i, entry)| entry.resource.run(i, &notify_interface))
-            .collect();
 
         // Flush out all the initialisation work, including resources with empty
         // run methods.
-        while let Poll::Ready(Some((i, result))) = poll!(stream.next()) {
-            let name = mark_complete(&mut names, i);
-            running_count -= 1;
-            if let Err(e) = result {
-                log::error!("{} failed: {}", name, e);
-                return Err(e);
+        while let Poll::Ready(x) = poll!(tasks.next()) {
+            match x {
+                Some((i, result)) => {
+                    let name = mark_complete(&mut names, i);
+                    if let Err(e) = result {
+                        log::error!("{} failed: {}", name, e);
+                        return Err(e);
+                    }
+                }
+                None => {
+                    log::info!("After startup, no resources remain running. Quit.");
+                    return Ok(());
+                }
             }
         }
 
         // Blocking loop for the rest of time.
         log::info!(
             "After startup, {} resources are running: {}",
-            stream.len(),
+            tasks.len(),
             active_list(&names)
         );
-        let mut combined = stream_select!(stream.map(Some), termination_signal.map(|_| None));
+        let mut term =
+            TerminationSignal::new(termination_signal, shutdown_notify.into_root_participant());
         loop {
-            if running_count == 0 {
-                break;
-            }
-            let Some(r) = combined.next().await else {
-                break;
-            };
-            match r {
-                Some((i, result)) => {
-                    let name = mark_complete(&mut names, i);
-                    running_count -= 1;
-                    match result {
-                        Err(e) => {
-                            log::error!("{} failed: {}", name, e);
-                            return Err(e);
+            futures::select! {
+                task_result = tasks.next() => {
+                    if let Some((i, result)) = task_result {
+                        let name = mark_complete(&mut names, i);
+                        match result {
+                            Err(e) => {
+                                log::error!("{} failed: {}", name, e);
+                                return Err(e);
+                            }
+                            Ok(()) => {
+                                log::info!("{} exited successfully", name);
+                            }
                         }
-                        Ok(()) => {
-                            log::info!("{} exited successfully", name);
-                        }
-                    }
-                }
-                None => {
-                    if quitting {
-                        log::warn!("SIGTERM received again; quitting immediately.");
+                    } else {
                         break;
                     }
-                    quitting = true;
-                    log::warn!("SIGTERM received; shutting down");
-                    shutdown_notify.notify_waiters();
+                }
+                _ = term => {
+                    break;
                 }
             }
         }
@@ -501,27 +719,46 @@ where
     /// Can be invoked by running an [`Assembly`] with the special flag
     /// `--write_graph_and_exit` on the command line.
     pub fn write_graph(w: &mut dyn std::io::Write) {
+        let AssemblySetup {
+            nodes,
+            type_map: _,
+            build_order: _,
+            shutdown_notify,
+        } = Self::setup().unwrap();
+
         writeln!(w, "digraph \"Assembly\" {{").unwrap();
         writeln!(w, "  top [shape=box]").unwrap();
-        let mut registry = HashMap::new();
-        let mut cx = RegisterContext {
-            registry: &mut registry,
-            command: Some(clap::Command::new("Assembly")),
-            write_graph: Some(w),
-            parent: None,
-        };
-        T::register(&mut cx);
+        let node_count = nodes.len();
+        for (i, n) in nodes.into_iter().enumerate() {
+            writeln!(w, "  \"i-{}\" [label={:?}]", i, n.name(),).unwrap();
+        }
+        for (i, e) in shutdown_notify.0.iter().enumerate() {
+            let parent_label;
+            let parent = if i == node_count {
+                "top"
+            } else {
+                parent_label = format!("i-{}", i);
+                &parent_label
+            };
+            for child in e.children.ones() {
+                writeln!(w, "  \"{}\" -> \"i-{}\"", parent, child,).unwrap();
+            }
+        }
         writeln!(w, "}}").unwrap();
     }
 }
 
 /// Convenience type that can be used as the `Dependencies` associated
 /// type on any leaf [`Resource`].
+///
+/// [`Resource`]: [`crate::v0::Resource`]
 #[derive(ResourceDependencies)]
 pub struct NoDependencies;
 
 /// Convenience type that can be used as the `Args` associated type on
 /// any [`Resource`] that takes no command line arguments.
+///
+/// [`Resource`]: [`crate::v0::Resource`]
 #[derive(clap::Args, Debug, Default)]
 #[group(skip)]
 pub struct NoArgs {}
@@ -529,15 +766,21 @@ pub struct NoArgs {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testutil::TestExecutor;
 
+    use atomic_take::AtomicTake;
     use regex::Regex;
     use std::ops::Deref;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Mutex;
+    use std::pin::pin;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct QuitInfo {
+        expect_quit: Option<HashMap<&'static str, tokio::sync::oneshot::Receiver<()>>>,
+    }
 
     static CONSTRUCT_COUNT: AtomicUsize = AtomicUsize::new(0);
-
-    struct Leaf1 {}
+    static QUIT_REPORTER: std::sync::Mutex<QuitInfo> =
+        std::sync::Mutex::new(QuitInfo { expect_quit: None });
 
     #[derive(Debug)]
     struct NoGood;
@@ -550,36 +793,145 @@ mod tests {
 
     impl std::error::Error for NoGood {}
 
-    impl Resource for Leaf1 {
-        type Args = NoArgs;
+    trait TestResource: Send + Sync + Sized + 'static {
+        type Dependencies: ResourceDependencies;
+        const NAME: &str;
+        fn new(_: Self::Dependencies) -> Result<Self, Box<dyn std::error::Error>>;
+    }
+
+    struct FailTask;
+
+    impl Future for FailTask {
+        type Output = Result<(), Box<dyn Error>>;
+
+        fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Self::Output> {
+            Poll::Ready(Err(NoGood.into()))
+        }
+    }
+
+    pin_project! {
+        struct ReportTask {
+            name: &'static str,
+            #[pin] stopper: Option<ShutdownSignalParticipant>,
+            #[pin] block: Option<tokio::sync::oneshot::Receiver<()>>,
+        }
+    }
+
+    impl Future for ReportTask {
+        type Output = Result<(), Box<dyn Error>>;
+
+        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            let mut this = self.project();
+            if this.block.is_none() {
+                if let Some(stopper) = this.stopper.as_mut().as_pin_mut() {
+                    let _ = ready!(stopper.poll(cx));
+                    let mut qi = QUIT_REPORTER.lock().unwrap();
+                    let expect_quit = qi.expect_quit.as_mut().unwrap();
+                    let Some(fut) = expect_quit.remove(this.name) else {
+                        panic!(
+                            "{} was signalled to quit but that was not (yet) expected",
+                            this.name
+                        );
+                    };
+                    this.block.set(Some(fut));
+                }
+            }
+            if let Some(block) = this.block.as_mut().as_pin_mut() {
+                let _ = ready!(block.poll(cx));
+                this.block.set(None);
+                if let Some(stopper) = this.stopper.take() {
+                    stopper.propagate();
+                }
+            }
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl<T: TestResource> sealed::ResourceBase<{ crate::ResourceVariety::Test as usize }> for T {
+        const NAME: &str = T::NAME;
+        type Production = (Arc<Self>, bool);
+
+        fn register_recursive(cx: &mut RegisterContext<'_>) {
+            T::Dependencies::register(cx);
+        }
+
+        fn augment_args(c: clap::Command) -> clap::Command {
+            if T::NAME == "Mid" {
+                c.arg(
+                    clap::Arg::new("count")
+                        .long("count")
+                        .action(clap::ArgAction::SetTrue),
+                )
+                .arg(
+                    clap::Arg::new("report")
+                        .long("report")
+                        .action(clap::ArgAction::SetTrue),
+                )
+            } else {
+                c
+            }
+        }
+
+        fn make(
+            cx: &mut ProduceContext<'_>,
+            arg_matches: &mut ArgMatches,
+        ) -> Result<(Arc<T>, bool), Box<dyn Error>> {
+            if arg_matches
+                .get_one::<bool>("count")
+                .copied()
+                .unwrap_or_default()
+            {
+                CONSTRUCT_COUNT.fetch_add(1, Ordering::Release);
+            }
+            Ok((
+                Arc::new(T::new(T::Dependencies::produce(cx)?)?),
+                arg_matches
+                    .get_one::<bool>("report")
+                    .copied()
+                    .unwrap_or_default(),
+            ))
+        }
+
+        fn shared(re: &(Arc<T>, bool)) -> Arc<Self> {
+            Arc::clone(&re.0)
+        }
+
+        fn task(
+            stopper: ShutdownSignalParticipant,
+            p: (Arc<T>, bool),
+        ) -> Pin<Box<dyn Future<Output = Result<(), Box<dyn Error>>> + Send>> {
+            if p.1 {
+                Box::pin(ReportTask {
+                    stopper: Some(stopper),
+                    name: T::NAME,
+                    block: None,
+                })
+            } else {
+                Box::pin(FailTask)
+            }
+        }
+    }
+
+    struct Leaf1 {}
+
+    impl TestResource for Leaf1 {
         type Dependencies = NoDependencies;
         const NAME: &str = "Leaf1";
 
-        fn new(_: NoDependencies, _: NoArgs) -> Result<Self, Box<dyn std::error::Error>> {
-            CONSTRUCT_COUNT.fetch_add(1, Ordering::Release);
+        fn new(_: NoDependencies) -> Result<Self, Box<dyn std::error::Error>> {
             Ok(Self {})
-        }
-
-        async fn run(&self) -> Result<(), Box<dyn Error>> {
-            Err(Box::new(NoGood))
         }
     }
 
     #[derive(Debug)]
     struct Leaf2 {}
 
-    impl Resource for Leaf2 {
-        type Args = NoArgs;
+    impl TestResource for Leaf2 {
         type Dependencies = NoDependencies;
         const NAME: &str = "Leaf2";
 
-        fn new(_: NoDependencies, _: NoArgs) -> Result<Self, Box<dyn std::error::Error>> {
-            CONSTRUCT_COUNT.fetch_add(1, Ordering::Release);
+        fn new(_: NoDependencies) -> Result<Self, Box<dyn std::error::Error>> {
             Ok(Self {})
-        }
-
-        async fn run(&self) -> Result<(), Box<dyn Error>> {
-            Ok(())
         }
     }
 
@@ -590,13 +942,11 @@ mod tests {
         deps: MidDependencies,
     }
 
-    impl Resource for Mid {
-        type Args = NoArgs;
+    impl TestResource for Mid {
         type Dependencies = MidDependencies;
         const NAME: &str = "Mid";
 
-        fn new(deps: MidDependencies, _: NoArgs) -> Result<Self, Box<dyn std::error::Error>> {
-            CONSTRUCT_COUNT.fetch_add(1, Ordering::Release);
+        fn new(deps: MidDependencies) -> Result<Self, Box<dyn std::error::Error>> {
             Ok(Self { deps })
         }
     }
@@ -607,15 +957,13 @@ mod tests {
         l2: Arc<Leaf2>,
     }
 
-    // correct_number_of_resources is sensitive to being run at
-    // the same time as anything else that also builds the graph.
-    static SERIALISE_TEST: Mutex<()> = Mutex::new(());
+    const EMPTY: &[std::ffi::OsString] = &[];
 
     #[test]
     fn correct_number_of_resources() {
-        let _guard = SERIALISE_TEST.lock().unwrap();
+        let argv: Vec<std::ffi::OsString> = vec!["cmd".into(), "--count".into()];
         let before = CONSTRUCT_COUNT.load(Ordering::Acquire);
-        let _assembly = Assembly::<TopDependencies>::new().expect("assembly");
+        let _assembly = Assembly::<TopDependencies>::new_from_argv(argv).expect("assembly");
         let after = CONSTRUCT_COUNT.load(Ordering::Acquire);
         assert_eq!(after - before, 3);
     }
@@ -629,7 +977,7 @@ mod tests {
 
         // The node ids are opaque. Let's map them.
         let mut names = HashMap::new();
-        let re = Regex::new(r#".*"(t-[^"]+)".*label="([^"]+)".*"#).unwrap();
+        let re = Regex::new(r#".*"(i-[^"]+)".*label="([^"]+)".*"#).unwrap();
         for l in lines.iter() {
             if let Some(captures) = re.captures(l) {
                 names.insert(
@@ -666,13 +1014,14 @@ mod tests {
 
     #[test]
     fn reachability() {
-        let _guard = SERIALISE_TEST.lock().unwrap();
-        let assembly = Assembly::<TopDependencies>::new().unwrap();
+        let assembly = Assembly::<TopDependencies>::new_from_argv(EMPTY).unwrap();
         let leaf2_1 = Arc::deref(&assembly.top.mid.deps.1) as *const Leaf2;
         let leaf2_2 = Arc::deref(&assembly.top.l2) as *const Leaf2;
         assert_eq!(leaf2_1, leaf2_2);
-        // 1 path via the graph, 1 via the list of resources.
-        assert_eq!(Arc::strong_count(&assembly.top.mid.deps.0), 2);
+        // Leaf1 only via Mid
+        assert_eq!(Arc::strong_count(&assembly.top.mid.deps.0), 1);
+        // Leaf2 also via top
+        assert_eq!(Arc::strong_count(&assembly.top.mid.deps.1), 2);
     }
 
     #[derive(ResourceDependencies)]
@@ -681,105 +1030,236 @@ mod tests {
     #[derive(Debug)]
     struct CyclicResource {}
 
-    impl Resource for CyclicResource {
-        type Args = NoArgs;
+    impl TestResource for CyclicResource {
         type Dependencies = CyclicDependencies;
         const NAME: &str = "CyclicResource";
 
-        fn new(d: CyclicDependencies, _: NoArgs) -> Result<Self, Box<dyn std::error::Error>> {
+        fn new(d: CyclicDependencies) -> Result<Self, Box<dyn std::error::Error>> {
             println!("{:?}", d.0); // silence "field is never read"
             Ok(Self {})
         }
     }
 
     #[test]
-    #[should_panic(expected = "Disallowed cyclic dependency")]
-    fn cyclic_dependency() {
-        let _ = Assembly::<CyclicDependencies>::new().unwrap();
-    }
-
-    #[tokio::test]
-    async fn run_assembly() {
-        let res = {
-            let _guard = SERIALISE_TEST.lock().unwrap();
-            Assembly::<TopDependencies>::new()
-        }
-        .unwrap()
-        .run_with_termination_signal(futures::stream::pending())
-        .await;
-        let Err(e) = res else {
-            panic!("poll should have returned an error");
+    fn cyclic_dependency1() {
+        let Err(e) = Assembly::<CyclicDependencies>::new_from_argv(EMPTY) else {
+            panic!("Should have detected a cycle");
         };
-        assert_eq!(e.to_string(), "no good");
+        assert!(e.is::<CycleError>());
     }
 
-    struct RunUntilSignaled(Notify);
+    #[derive(Debug)]
+    struct CyclicResource1;
 
-    impl Resource for RunUntilSignaled {
-        type Args = NoArgs;
-        type Dependencies = NoDependencies;
-        const NAME: &str = "RunUntilSignaled";
+    impl TestResource for CyclicResource1 {
+        type Dependencies = CyclicDependencies1;
+        const NAME: &str = "CyclicResource1";
 
-        fn new(_: NoDependencies, _: NoArgs) -> Result<Self, Box<dyn std::error::Error>> {
-            Ok(Self(Notify::new()))
+        fn new(_: CyclicDependencies1) -> Result<Self, Box<dyn std::error::Error>> {
+            Ok(Self)
         }
+    }
 
-        async fn run(&self) -> Result<(), Box<dyn Error>> {
-            Ok(self.0.notified().await)
+    #[derive(Debug)]
+    struct CyclicResourceLeaf;
+
+    impl TestResource for CyclicResourceLeaf {
+        type Dependencies = NoDependencies;
+        const NAME: &str = "CyclicResourceLeaf";
+
+        fn new(_: NoDependencies) -> Result<Self, Box<dyn std::error::Error>> {
+            Ok(Self)
         }
     }
 
     #[derive(ResourceDependencies)]
-    struct RunUntilSignaledTop(Arc<RunUntilSignaled>);
-
-    #[tokio::test]
-    async fn runs_until_resource_quits() {
-        let assembly = Assembly::<RunUntilSignaledTop>::new().unwrap();
-        let notify = &Arc::clone(&assembly.top.0).0;
-        let mut r = pin!(assembly.run_with_termination_signal(futures::stream::pending()));
-        assert!(poll!(&mut r).is_pending());
-        notify.notify_waiters();
-        assert!(poll!(&mut r).is_ready());
+    struct CyclicDependencies2 {
+        _cr1: Arc<CyclicResource1>,
+        _crl: Arc<CyclicResourceLeaf>,
     }
 
-    #[tokio::test]
-    async fn runs_until_overall_shutdown() {
-        let assembly = Assembly::<RunUntilSignaledTop>::new().unwrap();
+    #[derive(Debug)]
+    struct CyclicResource2;
+
+    impl TestResource for CyclicResource2 {
+        type Dependencies = CyclicDependencies2;
+        const NAME: &str = "CyclicResource2";
+
+        fn new(_: CyclicDependencies2) -> Result<Self, Box<dyn std::error::Error>> {
+            Ok(Self)
+        }
+    }
+
+    #[derive(ResourceDependencies)]
+    struct CyclicDependencies1 {
+        _cr2: Arc<CyclicResource2>,
+    }
+
+    #[test]
+    fn cyclic_dependency2() {
+        let Err(e) = Assembly::<CyclicDependencies2>::new_from_argv(EMPTY) else {
+            panic!("Should have detected a cycle");
+        };
+        let mut cycle = e.downcast::<CycleError>().expect("CycleError");
+        cycle.resources_in_cycle.sort();
+        assert_eq!(
+            cycle.resources_in_cycle,
+            ["CyclicResource1", "CyclicResource2"].into()
+        );
+    }
+
+    #[test]
+    fn run_assembly() {
+        let mut r = pin!(Assembly::<TopDependencies>::new_from_argv(EMPTY)
+            .unwrap()
+            .run_with_termination_signal(futures::stream::pending()));
+        let mut e = TestExecutor::default();
+        match e.poll(&mut r) {
+            Poll::Ready(Err(e)) => {
+                assert_eq!(e.to_string(), "no good");
+            }
+            other => {
+                panic!("assembly await result: want error, got {:?}", other);
+            }
+        }
+    }
+
+    #[test]
+    fn shutdown_order() {
+        let argv: Vec<std::ffi::OsString> = vec!["cmd".into(), "--report".into()];
+        let assembly = Assembly::<TopDependencies>::new_from_argv(argv).unwrap();
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         let mut r =
             pin!(assembly
                 .run_with_termination_signal(tokio_stream::wrappers::ReceiverStream::new(rx)));
-        assert!(poll!(&mut r).is_pending());
-        let _ = tx.send(()).await;
-        assert!(poll!(&mut r).is_ready());
-    }
+        let mut e = TestExecutor::default();
 
-    struct RunStubbornly;
-
-    impl Resource for RunStubbornly {
-        type Args = NoArgs;
-        type Dependencies = NoDependencies;
-        const NAME: &str = "RunStubbornly";
-
-        fn new(_: NoDependencies, _: NoArgs) -> Result<Self, Box<dyn std::error::Error>> {
-            Ok(Self)
+        if let Ok(mut qi) = QUIT_REPORTER.lock() {
+            qi.expect_quit = Some(HashMap::new());
         }
 
-        async fn run_with_termination_signal<'a>(
-            &'a self,
-            _subscribe_to_termination: &'a ShutdownNotify<'a>,
-        ) -> Result<(), Box<dyn Error>> {
-            Ok(futures::future::pending().await)
+        assert!(e.poll(&mut r).is_pending());
+
+        // Quit from the top, expect only Mid to quit
+        let (mid_tx, mid_rx) = tokio::sync::oneshot::channel();
+        if let Ok(mut qi) = QUIT_REPORTER.lock() {
+            let to_quit = qi.expect_quit.as_mut().unwrap();
+            to_quit.insert("Mid", mid_rx);
+        }
+        let _ = tx.try_send(()).unwrap();
+
+        assert!(e.poll(&mut r).is_pending());
+        assert!(QUIT_REPORTER
+            .lock()
+            .unwrap()
+            .expect_quit
+            .as_ref()
+            .unwrap()
+            .is_empty());
+
+        // Allow Mid to disappear, Leaf1 and Leaf2 will then also quit.
+        let (leaf1_tx, leaf1_rx) = tokio::sync::oneshot::channel();
+        let (leaf2_tx, leaf2_rx) = tokio::sync::oneshot::channel();
+        if let Ok(mut qi) = QUIT_REPORTER.lock() {
+            let to_quit = qi.expect_quit.as_mut().unwrap();
+            to_quit.insert("Leaf1", leaf1_rx);
+            to_quit.insert("Leaf2", leaf2_rx);
+        }
+        std::mem::drop(mid_tx);
+
+        assert!(e.poll(&mut r).is_pending());
+        assert!(QUIT_REPORTER
+            .lock()
+            .unwrap()
+            .expect_quit
+            .as_ref()
+            .unwrap()
+            .is_empty());
+
+        // Allow the leaves to disappear, and that should be all.
+        std::mem::drop(leaf1_tx);
+        std::mem::drop(leaf2_tx);
+
+        assert!(e.poll(&mut r).is_ready());
+        assert!(QUIT_REPORTER
+            .lock()
+            .unwrap()
+            .expect_quit
+            .as_ref()
+            .unwrap()
+            .is_empty());
+    }
+
+    struct RunUntilSignaled(AtomicTake<tokio::sync::oneshot::Sender<()>>);
+
+    pin_project! {
+        struct RunUntilSignaledTask {
+            #[pin] test_signals_we_are_done: tokio::sync::oneshot::Receiver<()>,
+        }
+    }
+
+    impl Future for RunUntilSignaledTask {
+        type Output = Result<(), Box<dyn Error>>;
+
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            let this = self.as_mut().project();
+            let _ = ready!(this.test_signals_we_are_done.poll(cx));
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    struct RunUntilSignaledProduction {
+        shared: Arc<RunUntilSignaled>,
+        task: RunUntilSignaledTask,
+    }
+
+    impl sealed::ResourceBase<{ crate::ResourceVariety::Test as usize }> for RunUntilSignaled {
+        const NAME: &str = "RunUntilSignaled";
+        type Production = RunUntilSignaledProduction;
+
+        fn make(
+            _: &mut ProduceContext<'_>,
+            _: &mut ArgMatches,
+        ) -> Result<RunUntilSignaledProduction, Box<dyn Error>> {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            Ok(RunUntilSignaledProduction {
+                shared: Arc::new(RunUntilSignaled(AtomicTake::new(tx))),
+                task: RunUntilSignaledTask {
+                    test_signals_we_are_done: rx,
+                },
+            })
+        }
+
+        fn shared(re: &RunUntilSignaledProduction) -> Arc<RunUntilSignaled> {
+            Arc::clone(&re.shared)
+        }
+
+        fn task(
+            _: ShutdownSignalParticipant,
+            re: RunUntilSignaledProduction,
+        ) -> Pin<Box<dyn Future<Output = Result<(), Box<dyn Error>>> + Send>> {
+            Box::pin(re.task)
         }
     }
 
     #[derive(ResourceDependencies)]
-    struct RunStubbornlyTop(Arc<RunStubbornly>);
+    struct RunUntilSignaledTop {
+        r: Arc<RunUntilSignaled>,
+    }
+
+    #[tokio::test]
+    async fn runs_until_resource_quits() {
+        let assembly = Assembly::<RunUntilSignaledTop>::new().unwrap();
+        let notify = assembly.top.r.0.take();
+        let mut r = pin!(assembly.run_with_termination_signal(futures::stream::pending()));
+        assert!(poll!(&mut r).is_pending());
+        std::mem::drop(notify);
+        assert!(poll!(&mut r).is_ready());
+    }
 
     #[tokio::test]
     async fn needs_2_sigterms() {
-        let assembly = Assembly::<RunStubbornlyTop>::new().unwrap();
-        let _ = assembly.top.0;
+        let assembly = Assembly::<RunUntilSignaledTop>::new_from_argv(EMPTY).unwrap();
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         let mut r =
             pin!(assembly
@@ -791,5 +1271,53 @@ mod tests {
         let _ = tx.send(()).await;
         // Does quit after the second.
         assert!(poll!(&mut r).is_ready());
+    }
+
+    #[derive(Default)]
+    struct CleanShutdown(AtomicBool);
+
+    impl sealed::ResourceBase<{ crate::ResourceVariety::Test as usize }> for CleanShutdown {
+        const NAME: &str = "CleanShutdown";
+        type Production = Arc<Self>;
+
+        fn make(
+            _: &mut ProduceContext<'_>,
+            _: &mut ArgMatches,
+        ) -> Result<Arc<Self>, Box<dyn Error>> {
+            Ok(Arc::new(CleanShutdown::default()))
+        }
+
+        fn shared(re: &Arc<Self>) -> Arc<CleanShutdown> {
+            Arc::clone(re)
+        }
+
+        fn task(
+            term_signal: ShutdownSignalParticipant,
+            re: Arc<Self>,
+        ) -> Pin<Box<dyn Future<Output = Result<(), Box<dyn Error>>> + Send>> {
+            Box::pin(async move {
+                let _ = term_signal.await;
+                re.0.store(true, Ordering::Release);
+                Ok(())
+            })
+        }
+    }
+
+    #[derive(ResourceDependencies)]
+    struct CleanShutdownTop(Arc<CleanShutdown>);
+
+    #[test]
+    fn clean_shutdown() {
+        let assembly = Assembly::<CleanShutdownTop>::new_from_argv(EMPTY).unwrap();
+        let shared = Arc::clone(&assembly.top.0);
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let mut r =
+            pin!(assembly
+                .run_with_termination_signal(tokio_stream::wrappers::ReceiverStream::new(rx)));
+        let mut e = TestExecutor::default();
+        assert!(e.poll(&mut r).is_pending());
+        let _ = tx.try_send(()).unwrap();
+        assert!(e.poll(&mut r).is_ready());
+        assert!(shared.0.load(Ordering::Acquire));
     }
 }

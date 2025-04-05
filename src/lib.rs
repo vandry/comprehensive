@@ -55,10 +55,10 @@ pub mod assembly;
 pub mod diag;
 pub mod health;
 pub mod http;
+pub mod v0;
 
-pub use assembly::{
-    Assembly, NoArgs, NoDependencies, Resource, ResourceDependencies, ShutdownNotify,
-};
+pub use assembly::{Assembly, NoArgs, NoDependencies, ResourceDependencies};
+pub use v0::{Resource, ShutdownNotify};
 
 // This is necessary for using the macros defined in comprehensive_macros
 // within this crate.
@@ -69,6 +69,27 @@ pub mod tls;
 
 #[cfg(test)]
 mod testutil;
+
+#[doc(hidden)]
+pub enum ResourceVariety {
+    V0,
+    #[cfg(test)]
+    Test,
+}
+
+/// Trait for expressing any version of resource, currently only [`v0::Resource`].
+///
+/// A requirement for a resource of any variety may be expressed as:
+///
+/// ```
+/// struct ContainsAResource<T: comprehensive::AnyResource<U>, const U: usize> {
+///     resource: std::sync::Arc<T>,
+/// }
+/// ```
+pub trait AnyResource<const T: usize>: assembly::sealed::ResourceBase<T> {
+    /// The name of this resource. Used in logs and diagnostics.
+    const NAME: &str;
+}
 
 /// Error type returned by various Comprehensive functions
 #[derive(Debug)]

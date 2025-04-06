@@ -36,117 +36,11 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::task::{Context, Poll, Waker};
+use std::task::{Context, Poll};
 use topological_sort::TopologicalSort;
-use try_lock::TryLock;
 
-struct ShutdownSignalEntry {
-    refcount: AtomicUsize,
-    waker: TryLock<Option<Waker>>,
-    children: FixedBitSet,
-}
-
-impl ShutdownSignalEntry {
-    fn new(s: usize) -> Self {
-        ShutdownSignalEntry {
-            refcount: AtomicUsize::default(),
-            waker: TryLock::new(None),
-            children: FixedBitSet::with_capacity(s),
-        }
-    }
-}
-
-pub(crate) struct ShutdownSignal(Arc<[ShutdownSignalEntry]>);
-
-#[doc(hidden)]
-pub struct ShutdownSignalParticipant(Arc<[ShutdownSignalEntry]>, usize);
-
-impl ShutdownSignal {
-    fn new(s: usize) -> Self {
-        Self(
-            std::iter::repeat(())
-                .map(|_| ShutdownSignalEntry::new(s))
-                .take(s + 1) // An additional entry for the root
-                .collect(),
-        )
-    }
-
-    fn add_parent(inner: &mut [ShutdownSignalEntry], child: usize, parent: Option<usize>) {
-        inner[parent.unwrap_or(inner.len() - 1)]
-            .children
-            .insert(child);
-        *inner[child].refcount.get_mut() += 1
-    }
-
-    pub(crate) fn participate(&self, i: usize) -> ShutdownSignalParticipant {
-        ShutdownSignalParticipant(Arc::clone(&self.0), i)
-    }
-
-    fn into_root_participant(self) -> ShutdownSignalParticipant {
-        let i = self.0.len() - 1;
-        ShutdownSignalParticipant(self.0, i)
-    }
-}
-
-impl ShutdownSignalParticipant {
-    pub(crate) fn propagate(self) {
-        for i in self.0[self.1].children.ones() {
-            if self.0[i].refcount.fetch_sub(1, Ordering::Release) == 1 {
-                if let Some(mut maybe_waker) = self.0[i].waker.try_lock() {
-                    if let Some(waker) = maybe_waker.take() {
-                        waker.wake()
-                    }
-                }
-            }
-        }
-    }
-}
-
-impl Drop for ShutdownSignalParticipant {
-    fn drop(&mut self) {
-        if let Some(mut maybe_waker) = self.0[self.1].waker.try_lock() {
-            let _ = maybe_waker.take();
-        }
-    }
-}
-
-impl Future for ShutdownSignalParticipant {
-    type Output = ();
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-        let entry = &self.0[self.1];
-        if entry.refcount.load(Ordering::Acquire) == 0 {
-            return Poll::Ready(());
-        }
-        if let Some(mut maybe_waker) = entry.waker.try_lock() {
-            let park = maybe_waker
-                .as_ref()
-                .map(|w| !w.will_wake(cx.waker()))
-                .unwrap_or(true);
-            let old = if park {
-                std::mem::replace(&mut *maybe_waker, Some(cx.waker().clone()))
-            } else {
-                None
-            };
-            std::mem::drop(maybe_waker);
-            if let Some(waker) = old {
-                waker.wake();
-            }
-            if entry.refcount.load(Ordering::Acquire) == 0 {
-                return Poll::Ready(());
-            }
-        }
-        Poll::Pending
-    }
-}
-
-impl futures::future::FusedFuture for ShutdownSignalParticipant {
-    fn is_terminated(&self) -> bool {
-        self.0[self.1].refcount.load(Ordering::Acquire) == 0
-    }
-}
+use crate::shutdown::{ShutdownSignal, ShutdownSignalForwarder, ShutdownSignalParticipantCreator};
 
 type ResourceFut = Pin<Box<dyn Future<Output = Result<(), Box<dyn Error>>> + Send>>;
 type TaskFut = IdentifiedFuture<ResourceFut>;
@@ -170,8 +64,9 @@ trait NodeTrait: Any {
         &self,
         cx: &mut ProduceContext<'_>,
         arg_matches: &mut ArgMatches,
+        stoppers: ShutdownSignalParticipantCreator,
     ) -> Result<(), Box<dyn Error>>;
-    fn task(self: Box<Self>, stopper: ShutdownSignalParticipant) -> ResourceFut;
+    fn task(self: Box<Self>) -> ResourceFut;
 }
 
 impl<T: sealed::ResourceBase<U>, const U: usize> NodeTrait for Node<T, U> {
@@ -187,15 +82,18 @@ impl<T: sealed::ResourceBase<U>, const U: usize> NodeTrait for Node<T, U> {
         &self,
         cx: &mut ProduceContext<'_>,
         arg_matches: &mut ArgMatches,
+        stoppers: ShutdownSignalParticipantCreator,
     ) -> Result<(), Box<dyn Error>> {
-        let _ = self
-            .production
-            .set(<T as sealed::ResourceBase<U>>::make(cx, arg_matches)?);
+        let _ = self.production.set(<T as sealed::ResourceBase<U>>::make(
+            cx,
+            arg_matches,
+            stoppers,
+        )?);
         Ok(())
     }
 
-    fn task(mut self: Box<Self>, stopper: ShutdownSignalParticipant) -> ResourceFut {
-        <T as sealed::ResourceBase<U>>::task(stopper, self.production.take().unwrap())
+    fn task(mut self: Box<Self>) -> ResourceFut {
+        <T as sealed::ResourceBase<U>>::task(self.production.take().unwrap())
     }
 }
 
@@ -225,7 +123,7 @@ pub struct ProduceContext<'a> {
 pub(crate) mod sealed {
     use super::{
         Arc, ArgMatches, Error, ProduceContext, RegisterContext, ResourceFut,
-        ShutdownSignalParticipant,
+        ShutdownSignalParticipantCreator,
     };
 
     pub trait ResourceBase<const T: usize>: Send + Sync + 'static {
@@ -239,9 +137,10 @@ pub(crate) mod sealed {
         fn make(
             cx: &mut ProduceContext<'_>,
             arg_matches: &mut ArgMatches,
+            stoppers: ShutdownSignalParticipantCreator,
         ) -> Result<Self::Production, Box<dyn Error>>;
         fn shared(re: &Self::Production) -> Arc<Self>;
-        fn task(stopper: ShutdownSignalParticipant, re: Self::Production) -> ResourceFut;
+        fn task(re: Self::Production) -> ResourceFut;
     }
 }
 
@@ -383,7 +282,7 @@ impl<F: Future> Future for IdentifiedFuture<F> {
 ///    comprehensive::Assembly::<TopDependencies>::new()?.run().await
 /// }
 pub struct Assembly<T> {
-    shutdown_notify: ShutdownSignal,
+    shutdown_notify: ShutdownSignalForwarder,
     tasks: FuturesUnordered<TaskFut>,
     names: Box<[Option<&'static str>]>,
     /// The constructed instances of the top-level (root) dependencies.
@@ -427,12 +326,12 @@ fn active_list(names: &[Option<&'static str>]) -> String {
 pin_project! {
     struct TerminationSignal<T> {
         #[pin] signal_stream: Option<T>,
-        shutdown_notify: Option<ShutdownSignalParticipant>,
+        shutdown_notify: Option<ShutdownSignalForwarder>,
     }
 }
 
 impl<T> TerminationSignal<T> {
-    fn new(signal_stream: T, shutdown_notify: ShutdownSignalParticipant) -> Self {
+    fn new(signal_stream: T, shutdown_notify: ShutdownSignalForwarder) -> Self {
         Self {
             signal_stream: Some(signal_stream),
             shutdown_notify: Some(shutdown_notify),
@@ -546,9 +445,9 @@ where
         T::register(&mut cx);
 
         let mut shutdown_notify = ShutdownSignal::new(nodes.len());
-        let shutdown_notify_edit = Arc::get_mut(&mut shutdown_notify.0).unwrap();
+        let mut shutdown_notify_edit = shutdown_notify.get_mut().unwrap();
         for NodeRelationship { parent, child } in &relationships {
-            ShutdownSignal::add_parent(shutdown_notify_edit, *child, *parent);
+            shutdown_notify_edit.add_parent(*child, *parent);
         }
         let topo_sort = relationships
             .into_iter()
@@ -606,19 +505,36 @@ where
             type_map,
             nodes: &nodes,
         };
+        let mut participants = shutdown_notify.into_iter().map(Some).collect::<Vec<_>>();
         for i in build_order {
-            nodes[i].make(&mut cx, &mut arg_matches)?;
+            nodes[i].make(
+                &mut cx,
+                &mut arg_matches,
+                participants[i]
+                    .take()
+                    .expect("same index appears twice in build order"),
+            )?;
         }
         let top = T::produce(&mut cx)?;
+        let mut root_participant = participants
+            .last_mut()
+            .unwrap()
+            .take()
+            .expect("missing root participant")
+            .into_inner()
+            .unwrap();
+        // The root participant should be immediately ready because nothing depends on it.
+        let Poll::Ready(shutdown_notify) = Pin::new(&mut root_participant)
+            .poll(&mut Context::from_waker(std::task::Waker::noop()))
+        else {
+            panic!("graph construction bug: something depends on the root");
+        };
 
         let names = nodes.iter().map(|n| Some(n.name())).collect();
         let tasks = nodes
             .into_iter()
             .enumerate()
-            .map(|(i, n)| {
-                let fut = n.task(shutdown_notify.participate(i));
-                IdentifiedFuture::new(fut, i)
-            })
+            .map(|(i, n)| IdentifiedFuture::new(n.task(), i))
             .collect();
 
         Ok(Self {
@@ -686,8 +602,7 @@ where
             tasks.len(),
             active_list(&names)
         );
-        let mut term =
-            TerminationSignal::new(termination_signal, shutdown_notify.into_root_participant());
+        let mut term = TerminationSignal::new(termination_signal, shutdown_notify);
         loop {
             futures::select! {
                 task_result = tasks.next() => {
@@ -732,7 +647,7 @@ where
         for (i, n) in nodes.into_iter().enumerate() {
             writeln!(w, "  \"i-{}\" [label={:?}]", i, n.name(),).unwrap();
         }
-        for (i, e) in shutdown_notify.0.iter().enumerate() {
+        for (i, e) in shutdown_notify.into_iter().enumerate() {
             let parent_label;
             let parent = if i == node_count {
                 "top"
@@ -740,7 +655,7 @@ where
                 parent_label = format!("i-{}", i);
                 &parent_label
             };
-            for child in e.children.ones() {
+            for child in e.into_inner().unwrap().iter_children() {
                 writeln!(w, "  \"{}\" -> \"i-{}\"", parent, child,).unwrap();
             }
         }
@@ -766,13 +681,14 @@ pub struct NoArgs {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shutdown::ShutdownSignalParticipant;
     use crate::testutil::TestExecutor;
 
     use atomic_take::AtomicTake;
     use regex::Regex;
     use std::ops::Deref;
     use std::pin::pin;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     struct QuitInfo {
         expect_quit: Option<HashMap<&'static str, tokio::sync::oneshot::Receiver<()>>>,
@@ -814,6 +730,7 @@ mod tests {
             name: &'static str,
             #[pin] stopper: Option<ShutdownSignalParticipant>,
             #[pin] block: Option<tokio::sync::oneshot::Receiver<()>>,
+            forwarder: Option<ShutdownSignalForwarder>,
         }
     }
 
@@ -824,7 +741,7 @@ mod tests {
             let mut this = self.project();
             if this.block.is_none() {
                 if let Some(stopper) = this.stopper.as_mut().as_pin_mut() {
-                    let _ = ready!(stopper.poll(cx));
+                    *this.forwarder = Some(ready!(stopper.poll(cx)));
                     let mut qi = QUIT_REPORTER.lock().unwrap();
                     let expect_quit = qi.expect_quit.as_mut().unwrap();
                     let Some(fut) = expect_quit.remove(this.name) else {
@@ -839,8 +756,8 @@ mod tests {
             if let Some(block) = this.block.as_mut().as_pin_mut() {
                 let _ = ready!(block.poll(cx));
                 this.block.set(None);
-                if let Some(stopper) = this.stopper.take() {
-                    stopper.propagate();
+                if let Some(forwarder) = this.forwarder.take() {
+                    forwarder.propagate();
                 }
             }
             Poll::Ready(Ok(()))
@@ -849,7 +766,7 @@ mod tests {
 
     impl<T: TestResource> sealed::ResourceBase<{ crate::ResourceVariety::Test as usize }> for T {
         const NAME: &str = T::NAME;
-        type Production = (Arc<Self>, bool);
+        type Production = (Arc<Self>, Option<ShutdownSignalParticipant>);
 
         fn register_recursive(cx: &mut RegisterContext<'_>) {
             T::Dependencies::register(cx);
@@ -875,7 +792,8 @@ mod tests {
         fn make(
             cx: &mut ProduceContext<'_>,
             arg_matches: &mut ArgMatches,
-        ) -> Result<(Arc<T>, bool), Box<dyn Error>> {
+            stoppers: ShutdownSignalParticipantCreator,
+        ) -> Result<(Arc<T>, Option<ShutdownSignalParticipant>), Box<dyn Error>> {
             if arg_matches
                 .get_one::<bool>("count")
                 .copied()
@@ -885,29 +803,33 @@ mod tests {
             }
             Ok((
                 Arc::new(T::new(T::Dependencies::produce(cx)?)?),
-                arg_matches
+                if arg_matches
                     .get_one::<bool>("report")
                     .copied()
-                    .unwrap_or_default(),
+                    .unwrap_or_default()
+                {
+                    stoppers.into_inner()
+                } else {
+                    None
+                },
             ))
         }
 
-        fn shared(re: &(Arc<T>, bool)) -> Arc<Self> {
+        fn shared(re: &Self::Production) -> Arc<Self> {
             Arc::clone(&re.0)
         }
 
         fn task(
-            stopper: ShutdownSignalParticipant,
-            p: (Arc<T>, bool),
+            p: (Arc<T>, Option<ShutdownSignalParticipant>),
         ) -> Pin<Box<dyn Future<Output = Result<(), Box<dyn Error>>> + Send>> {
-            if p.1 {
-                Box::pin(ReportTask {
+            match p.1 {
+                Some(stopper) => Box::pin(ReportTask {
                     stopper: Some(stopper),
                     name: T::NAME,
                     block: None,
-                })
-            } else {
-                Box::pin(FailTask)
+                    forwarder: None,
+                }),
+                None => Box::pin(FailTask),
             }
         }
     }
@@ -1220,6 +1142,7 @@ mod tests {
         fn make(
             _: &mut ProduceContext<'_>,
             _: &mut ArgMatches,
+            _: ShutdownSignalParticipantCreator,
         ) -> Result<RunUntilSignaledProduction, Box<dyn Error>> {
             let (tx, rx) = tokio::sync::oneshot::channel();
             Ok(RunUntilSignaledProduction {
@@ -1235,7 +1158,6 @@ mod tests {
         }
 
         fn task(
-            _: ShutdownSignalParticipant,
             re: RunUntilSignaledProduction,
         ) -> Pin<Box<dyn Future<Output = Result<(), Box<dyn Error>>> + Send>> {
             Box::pin(re.task)
@@ -1278,22 +1200,25 @@ mod tests {
 
     impl sealed::ResourceBase<{ crate::ResourceVariety::Test as usize }> for CleanShutdown {
         const NAME: &str = "CleanShutdown";
-        type Production = Arc<Self>;
+        type Production = (Arc<Self>, ShutdownSignalParticipant);
 
         fn make(
             _: &mut ProduceContext<'_>,
             _: &mut ArgMatches,
-        ) -> Result<Arc<Self>, Box<dyn Error>> {
-            Ok(Arc::new(CleanShutdown::default()))
+            term_signals: ShutdownSignalParticipantCreator,
+        ) -> Result<Self::Production, Box<dyn Error>> {
+            Ok((
+                Arc::new(CleanShutdown::default()),
+                term_signals.into_inner().unwrap(),
+            ))
         }
 
-        fn shared(re: &Arc<Self>) -> Arc<CleanShutdown> {
-            Arc::clone(re)
+        fn shared(re: &Self::Production) -> Arc<CleanShutdown> {
+            Arc::clone(&re.0)
         }
 
         fn task(
-            term_signal: ShutdownSignalParticipant,
-            re: Arc<Self>,
+            (re, term_signal): Self::Production,
         ) -> Pin<Box<dyn Future<Output = Result<(), Box<dyn Error>>> + Send>> {
             Box::pin(async move {
                 let _ = term_signal.await;

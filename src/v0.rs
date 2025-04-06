@@ -42,7 +42,8 @@ use std::task::{Context, Poll};
 use tokio::sync::{futures::Notified, Notify};
 
 use crate::assembly::sealed::ResourceBase;
-use crate::assembly::{ProduceContext, RegisterContext, ShutdownSignalParticipant};
+use crate::assembly::{ProduceContext, RegisterContext};
+use crate::shutdown::{ShutdownSignalParticipant, ShutdownSignalParticipantCreator};
 use crate::ResourceDependencies;
 
 /// Passed to resources to offer resources a chance to react to a termination
@@ -163,15 +164,15 @@ where
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let mut this = self.project();
         let done = if let Some(forward) = this.forward.as_mut().as_pin_mut() {
-            matches!(forward.project().sub.poll(cx), Poll::Ready(()))
+            forward.project().sub.poll(cx)
         } else {
-            false
+            Poll::Pending
         };
-        if done {
+        if let Poll::Ready(forwarder) = done {
             if let Some(forward) = this.forward.take() {
                 forward.notify.notify_waiters();
-                forward.sub.propagate();
             }
+            forwarder.propagate();
         }
         this.fut.poll(cx)
     }
@@ -179,7 +180,7 @@ where
 
 impl<T: Resource> ResourceBase<{ crate::ResourceVariety::V0 as usize }> for T {
     const NAME: &str = T::NAME;
-    type Production = Arc<T>;
+    type Production = (Arc<T>, ShutdownSignalParticipant);
 
     fn register_recursive(cx: &mut RegisterContext<'_>) {
         T::Dependencies::register(cx);
@@ -189,19 +190,22 @@ impl<T: Resource> ResourceBase<{ crate::ResourceVariety::V0 as usize }> for T {
         T::Args::augment_args(c)
     }
 
-    fn make(cx: &mut ProduceContext<'_>, arg_matches: &mut clap::ArgMatches) -> Result<Self::Production, Box<dyn Error>> {
+    fn make(
+        cx: &mut ProduceContext<'_>,
+        arg_matches: &mut clap::ArgMatches,
+        stoppers: ShutdownSignalParticipantCreator,
+    ) -> Result<Self::Production, Box<dyn Error>> {
         let deps = T::Dependencies::produce(cx)?;
         let args = T::Args::from_arg_matches(arg_matches)?;
         let shared = Arc::new(T::new(deps, args)?);
-        Ok(shared)
+        Ok((shared, stoppers.into_inner().unwrap()))
     }
 
     fn shared(re: &Self::Production) -> Arc<T> {
-        Arc::clone(re)
+        Arc::clone(&re.0)
     }
 
     fn task(
-        stopper: ShutdownSignalParticipant,
         re: Self::Production,
     ) -> Pin<Box<dyn Future<Output = Result<(), Box<dyn Error>>> + Send>> {
         let notify = Arc::new(Notify::new());
@@ -209,10 +213,10 @@ impl<T: Resource> ResourceBase<{ crate::ResourceVariety::V0 as usize }> for T {
         Box::pin(NotifyHelper::new(
             async move {
                 let shutdown_notify = ShutdownNotify::new(&notify2);
-                re.run_with_termination_signal(&shutdown_notify).await
+                re.0.run_with_termination_signal(&shutdown_notify).await
             },
             notify,
-            stopper,
+            re.1,
         ))
     }
 }

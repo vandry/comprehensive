@@ -57,6 +57,8 @@ pub mod health;
 pub mod http;
 pub mod v0;
 
+mod shutdown;
+
 pub use assembly::{Assembly, NoArgs, NoDependencies, ResourceDependencies};
 pub use v0::{Resource, ShutdownNotify};
 

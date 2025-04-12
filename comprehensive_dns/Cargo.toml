@@ -1,7 +1,7 @@
 [package]
 name = "comprehensive_dns"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 repository = "https://github.com/vandry/comprehensive.git"
 homepage = "https://github.com/vandry/comprehensive"
 description = "A DNS resolver for https://crates.io/crates/comprehensive"

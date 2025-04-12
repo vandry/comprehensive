@@ -124,7 +124,7 @@ fn load_files(key_path: &PathBuf, cert_path: &PathBuf) -> std::io::Result<LoadRe
 fn sentinel_mismatch(old: &Option<(u64, SystemTime)>, path: &Path) -> bool {
     match old {
         None => true,
-        Some(ref old_md) => match reload_sentinel(path.metadata()) {
+        Some(old_md) => match reload_sentinel(path.metadata()) {
             None => true,
             Some(ref new_md) => old_md != new_md,
         },

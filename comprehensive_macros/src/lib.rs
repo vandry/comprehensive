@@ -14,7 +14,7 @@ use syn::{
 };
 
 fn find_type_inside_arc(ty: &Type) -> Result<&Type, Span> {
-    let Type::Path(ref path) = ty else {
+    let Type::Path(path) = ty else {
         return Err(ty.span());
     };
     let a = &path
@@ -23,14 +23,14 @@ fn find_type_inside_arc(ty: &Type) -> Result<&Type, Span> {
         .last()
         .ok_or_else(|| path.span())?
         .arguments;
-    let PathArguments::AngleBracketed(ref generics) = a else {
+    let PathArguments::AngleBracketed(generics) = a else {
         return Err(a.span());
     };
     if generics.args.len() != 1 {
         return Err(generics.span());
     };
     let generic = generics.args.first().unwrap();
-    let GenericArgument::Type(ref ty) = generic else {
+    let GenericArgument::Type(ty) = generic else {
         return Err(generic.span());
     };
     Ok(ty)
@@ -40,8 +40,8 @@ fn derive_r_d_struct(name: &Ident, generics: &Generics, fields: &Fields) -> Toke
     const NO_FIELDS: &Punctuated<syn::Field, syn::token::Comma> = &Punctuated::new();
     let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
     let dep_types = match fields {
-        Fields::Named(ref f) => &f.named,
-        Fields::Unnamed(ref f) => &f.unnamed,
+        Fields::Named(f) => &f.named,
+        Fields::Unnamed(f) => &f.unnamed,
         Fields::Unit => NO_FIELDS,
     }
     .iter()
@@ -69,7 +69,7 @@ fn derive_r_d_struct(name: &Ident, generics: &Generics, fields: &Fields) -> Toke
         Err(ts) => ts.clone(),
     });
     let definition = match fields {
-        Fields::Named(ref f) => {
+        Fields::Named(f) => {
             let elements = f.named.iter().enumerate().map(|(i, field)| {
                 let name = field.ident.as_ref().unwrap();
                 let temp = format_ident!("dep_{}", i);
@@ -79,7 +79,7 @@ fn derive_r_d_struct(name: &Ident, generics: &Generics, fields: &Fields) -> Toke
                 ::std::result::Result::Ok(Self { #( #elements )* })
             }
         }
-        Fields::Unnamed(ref f) => {
+        Fields::Unnamed(f) => {
             let elements = f.unnamed.iter().enumerate().map(|(i, _)| {
                 let temp = format_ident!("dep_{}", i);
                 quote! { #temp, }
@@ -227,7 +227,7 @@ fn derive_h_s_i(
             compile_error!("`[#flag_prefix = \"foo_\"]` is required");
         });
     };
-    let Data::Struct(ref st) = data else {
+    let Data::Struct(st) = data else {
         return Ok(quote! {
             compile_error!("`#[derive(HttpServingInstance)]` requires a struct");
         });
@@ -307,7 +307,7 @@ pub fn derive_http_serving_instance(item: proc_macro::TokenStream) -> proc_macro
 }
 
 fn path_and_single_generic_type(ty: &Type) -> Result<(&Path, &Type), Span> {
-    let Type::Path(ref path) = ty else {
+    let Type::Path(path) = ty else {
         return Err(ty.span());
     };
     let Some(last) = path.path.segments.last() else {
@@ -319,7 +319,7 @@ fn path_and_single_generic_type(ty: &Type) -> Result<(&Path, &Type), Span> {
     if generics.args.len() != 1 {
         return Err(generics.span());
     }
-    let GenericArgument::Type(ref gty) = generics.args.first().unwrap() else {
+    let GenericArgument::Type(gty) = generics.args.first().unwrap() else {
         return Err(generics.span());
     };
     Ok((&path.path, gty))

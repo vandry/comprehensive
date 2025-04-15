@@ -142,11 +142,17 @@ pin_project! {
 }
 
 pin_project! {
-    struct NotifyHelper<F> {
-        #[pin] forward: Option<NotifyForward>,
+    struct NotifyInner<F> {
         #[pin] fut: F,
         task_running: TaskRunningSentinel,
         name: &'static str,
+    }
+}
+
+pin_project! {
+    struct NotifyHelper<F> {
+        #[pin] forward: Option<NotifyForward>,
+        #[pin] inner: Option<NotifyInner<F>>,
     }
 }
 
@@ -160,16 +166,18 @@ impl<F> NotifyHelper<F> {
     ) -> Self {
         Self {
             forward: Some(NotifyForward { notify, sub }),
-            fut,
-            task_running,
-            name,
+            inner: Some(NotifyInner {
+                fut,
+                task_running,
+                name,
+            }),
         }
     }
 }
 
-impl<F, T, U> Future for NotifyHelper<F>
+impl<F, U> Future for NotifyHelper<F>
 where
-    F: Future<Output = Result<T, U>>,
+    F: Future<Output = Result<(), U>>,
     U: std::fmt::Display,
 {
     type Output = F::Output;
@@ -187,9 +195,20 @@ where
             }
             forwarder.propagate();
         }
-        let r = ready!(this.fut.poll(cx));
-        crate::assembly::log_resource_result(&r, this.name);
-        Poll::Ready(r)
+        if let Some(inner) = this.inner.as_mut().as_pin_mut() {
+            let inner = inner.project();
+            let r = ready!(inner.fut.poll(cx));
+            crate::assembly::log_resource_result(&r, inner.name);
+            this.inner.set(None);
+            if r.is_err() {
+                return Poll::Ready(r);
+            }
+        }
+        if this.forward.is_none() && this.inner.is_none() {
+            Poll::Ready(Ok(()))
+        } else {
+            Poll::Pending
+        }
     }
 }
 
@@ -392,14 +411,15 @@ mod tests {
     #[derive(ResourceDependencies)]
     struct RunUntilSignaledTop(Arc<RunUntilSignaled>);
 
-    #[tokio::test]
-    async fn runs_until_resource_quits() {
-        let assembly = Assembly::<RunUntilSignaledTop>::new().unwrap();
+    #[test]
+    fn runs_until_resource_quits() {
+        let assembly = Assembly::<RunUntilSignaledTop>::new_from_argv(EMPTY).unwrap();
         let notify = &Arc::clone(&assembly.top.0).0;
         let mut r = pin!(assembly.run_with_termination_signal(futures::stream::pending()));
-        assert!(poll!(&mut r).is_pending());
+        let mut e = TestExecutor::default();
+        assert!(e.poll(&mut r).is_pending());
         notify.notify_waiters();
-        assert!(poll!(&mut r).is_ready());
+        assert!(e.poll(&mut r).is_ready());
     }
 
     #[test]
@@ -452,5 +472,34 @@ mod tests {
         let _ = tx.send(()).await;
         // Does quit after the second.
         assert!(poll!(&mut r).is_ready());
+    }
+
+    struct DoesNothing;
+
+    impl Resource for DoesNothing {
+        type Args = NoArgs;
+        type Dependencies = RunUntilSignaledTop;
+        const NAME: &str = "RunStubbornly";
+
+        fn new(_: RunUntilSignaledTop, _: NoArgs) -> Result<Self, Box<dyn std::error::Error>> {
+            Ok(Self)
+        }
+    }
+
+    #[derive(ResourceDependencies)]
+    struct PropagatesShutdownTop(Arc<DoesNothing>);
+
+    #[test]
+    fn idle_resource_propagates_shutdown() {
+        let assembly = Assembly::<PropagatesShutdownTop>::new_from_argv(EMPTY).unwrap();
+        let _ = assembly.top.0;
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let mut r = pin!(
+            assembly.run_with_termination_signal(tokio_stream::wrappers::ReceiverStream::new(rx))
+        );
+        let mut e = TestExecutor::default();
+        assert!(e.poll(&mut r).is_pending());
+        let _ = tx.try_send(()).unwrap();
+        assert!(e.poll(&mut r).is_ready());
     }
 }

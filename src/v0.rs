@@ -36,15 +36,15 @@ use futures::FutureExt;
 use pin_project_lite::pin_project;
 use std::error::Error;
 use std::future::Future;
-use std::pin::{pin, Pin};
+use std::pin::{Pin, pin};
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use tokio::sync::{futures::Notified, Notify};
+use tokio::sync::{Notify, futures::Notified};
 
+use crate::ResourceDependencies;
 use crate::assembly::sealed::ResourceBase;
 use crate::assembly::{ProduceContext, RegisterContext};
 use crate::shutdown::{ShutdownSignalParticipant, ShutdownSignalParticipantCreator};
-use crate::ResourceDependencies;
 
 /// Passed to resources to offer resources a chance to react to a termination
 /// request signal. Interested resources should call [`ShutdownNotify::subscribe`].
@@ -323,9 +323,11 @@ mod tests {
     fn fail_assembly() {
         let argv: Vec<std::ffi::OsString> = vec!["cmd".into(), "--fail".into()];
         let mut e = TestExecutor::default();
-        let mut r = pin!(Assembly::<TopDependencies>::new_from_argv(argv)
-            .unwrap()
-            .run_with_termination_signal(futures::stream::pending()));
+        let mut r = pin!(
+            Assembly::<TopDependencies>::new_from_argv(argv)
+                .unwrap()
+                .run_with_termination_signal(futures::stream::pending())
+        );
         let Poll::Ready(Err(e)) = e.poll(&mut r) else {
             panic!("poll should have returned an error");
         };
@@ -336,9 +338,11 @@ mod tests {
     fn succeed_assembly() {
         let mut e = TestExecutor::default();
         let (tx, rx) = tokio::sync::mpsc::channel(1);
-        let mut r = pin!(Assembly::<TopDependencies>::new_from_argv(EMPTY)
-            .unwrap()
-            .run_with_termination_signal(tokio_stream::wrappers::ReceiverStream::new(rx)));
+        let mut r = pin!(
+            Assembly::<TopDependencies>::new_from_argv(EMPTY)
+                .unwrap()
+                .run_with_termination_signal(tokio_stream::wrappers::ReceiverStream::new(rx))
+        );
         assert!(e.poll(&mut r).is_pending());
         let _ = tx.try_send(()).unwrap();
         match e.poll(&mut r) {
@@ -382,9 +386,9 @@ mod tests {
     fn runs_until_overall_shutdown() {
         let assembly = Assembly::<RunUntilSignaledTop>::new().unwrap();
         let (tx, rx) = tokio::sync::mpsc::channel(1);
-        let mut r =
-            pin!(assembly
-                .run_with_termination_signal(tokio_stream::wrappers::ReceiverStream::new(rx)));
+        let mut r = pin!(
+            assembly.run_with_termination_signal(tokio_stream::wrappers::ReceiverStream::new(rx))
+        );
         let mut e = TestExecutor::default();
         assert!(e.poll(&mut r).is_pending());
         let _ = tx.try_send(()).unwrap();
@@ -418,9 +422,9 @@ mod tests {
         let assembly = Assembly::<RunStubbornlyTop>::new().unwrap();
         let _ = assembly.top.0;
         let (tx, rx) = tokio::sync::mpsc::channel(1);
-        let mut r =
-            pin!(assembly
-                .run_with_termination_signal(tokio_stream::wrappers::ReceiverStream::new(rx)));
+        let mut r = pin!(
+            assembly.run_with_termination_signal(tokio_stream::wrappers::ReceiverStream::new(rx))
+        );
         assert!(poll!(&mut r).is_pending());
         let _ = tx.send(()).await;
         // Does not quit after the first request.

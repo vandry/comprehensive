@@ -59,8 +59,8 @@ use futures::future::Either;
 use futures::pin_mut;
 use lazy_static::lazy_static;
 use prometheus::register_gauge_vec;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::watch;
 

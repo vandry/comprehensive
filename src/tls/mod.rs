@@ -165,7 +165,11 @@ impl ResolvesServerCert for ReloadableKeyAndCertResolver {
 }
 
 impl ResolvesClientCert for ReloadableKeyAndCertResolver {
-    fn resolve(&self, _root_hint_subjects: &[&[u8]], _sigschemes: &[rustls::SignatureScheme]) -> Option<Arc<CertifiedKey>> {
+    fn resolve(
+        &self,
+        _root_hint_subjects: &[&[u8]],
+        _sigschemes: &[rustls::SignatureScheme],
+    ) -> Option<Arc<CertifiedKey>> {
         self.real_resolve()
     }
 
@@ -261,25 +265,27 @@ impl Resource for TlsConfig {
         let mut roots = RootCertStore::empty();
         let raw_roots = if let Some(cacert_file) = args.cacert {
             let contents = std::fs::read(&cacert_file)?;
-            roots.add_parsable_certificates(rustls_pemfile::certs(&mut Cursor::new(&contents)).filter_map(|r| {
-                match r {
+            roots.add_parsable_certificates(
+                rustls_pemfile::certs(&mut Cursor::new(&contents)).filter_map(|r| match r {
                     Ok(cert) => Some(cert),
                     Err(e) => {
                         log::warn!("Error reading TLS root certificate: {}", e);
                         None
                     }
-                }
-            }));
+                }),
+            );
             if roots.is_empty() {
-                log::warn!("No root certificates loaded from file {}", cacert_file.display());
+                log::warn!(
+                    "No root certificates loaded from file {}",
+                    cacert_file.display()
+                );
             }
             Some(contents)
         } else {
             None
         };
         let roots = Arc::new(roots);
-        let client_config = ClientConfig::builder()
-            .with_root_certificates(roots);
+        let client_config = ClientConfig::builder().with_root_certificates(roots);
         let client_config = match inner {
             Some(ref inner) => {
                 let resolver = Arc::clone(&inner.resolver);

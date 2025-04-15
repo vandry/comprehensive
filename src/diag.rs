@@ -2,9 +2,9 @@
 //!
 //! Currently this serves only Prometheus metrics.
 
+use axum::Router;
 use axum::extract::State;
 use axum::response::IntoResponse;
-use axum::Router;
 use prometheus::Encoder;
 use std::sync::Arc;
 

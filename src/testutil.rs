@@ -106,7 +106,7 @@ impl TestExecutor {
             if let Poll::Ready(o) = fut.as_mut().poll(&mut cx) {
                 return Poll::Ready(o);
             }
-            if !self.1 .0.swap(false, std::sync::atomic::Ordering::AcqRel) {
+            if !self.1.0.swap(false, std::sync::atomic::Ordering::AcqRel) {
                 return Poll::Pending;
             }
         }

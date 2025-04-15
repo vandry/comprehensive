@@ -174,7 +174,7 @@
 
 use atomic_take::AtomicTake;
 use comprehensive::{NoArgs, NoDependencies, Resource, ResourceDependencies, ShutdownNotify};
-use futures::{future::Either, pin_mut, FutureExt};
+use futures::{FutureExt, future::Either, pin_mut};
 use prost::Message;
 use prost_types::FileDescriptorSet;
 use std::collections::HashSet;
@@ -225,9 +225,19 @@ pub enum ComprehensiveGrpcError {
 impl std::fmt::Display for ComprehensiveGrpcError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match *self {
-            Self::NoServiceDescriptor(name) => write!(f, "No file descriptor set registered covering {}. Register one with register_encoded_file_descriptor_set or call disable_reflection.", name),
-            Self::TooLateToConfigure(name) => write!(f, "Too late to call {} after the server is already started.", name),
-            Self::InternalMissingConfiguration => write!(f, "Internal error: missing GrpcServerInner."),
+            Self::NoServiceDescriptor(name) => write!(
+                f,
+                "No file descriptor set registered covering {}. Register one with register_encoded_file_descriptor_set or call disable_reflection.",
+                name
+            ),
+            Self::TooLateToConfigure(name) => write!(
+                f,
+                "Too late to call {} after the server is already started.",
+                name
+            ),
+            Self::InternalMissingConfiguration => {
+                write!(f, "Internal error: missing GrpcServerInner.")
+            }
         }
     }
 }
@@ -614,7 +624,9 @@ impl Resource for GrpcServer {
     async fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
         #[cfg(not(feature = "tls"))]
         if self.grpc.addr.is_none() {
-            log::warn!("No insecure gRPC listener, and secure gRPC is not available because feature \"tls\" is not built.");
+            log::warn!(
+                "No insecure gRPC listener, and secure gRPC is not available because feature \"tls\" is not built."
+            );
             return Ok(());
         }
 

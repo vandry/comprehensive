@@ -34,9 +34,9 @@
 //! ```
 
 use atomic_take::AtomicTake;
-use clap::{value_parser, Arg, ArgMatches, Args, Command, FromArgMatches};
-use comprehensive::health::HealthReporter;
+use clap::{Arg, ArgMatches, Args, Command, FromArgMatches, value_parser};
 use comprehensive::ResourceDependencies;
+use comprehensive::health::HealthReporter;
 use comprehensive_dns::DNSResolver;
 use futures::{Stream, StreamExt, TryStreamExt};
 use http::Uri;
@@ -47,7 +47,7 @@ use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
-use warm_channels::grpc::{grpc_channel, GRPCChannel, GRPCChannelConfig};
+use warm_channels::grpc::{GRPCChannel, GRPCChannelConfig, grpc_channel};
 use warm_channels::resolver::ResolveUriError;
 use warm_channels::stream::{IPOrUNIXAddress, StreamConnector};
 #[cfg(feature = "tls")]

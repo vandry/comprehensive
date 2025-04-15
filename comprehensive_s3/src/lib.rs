@@ -36,10 +36,10 @@ use futures::future::Either;
 use futures::pin_mut;
 #[doc(hidden)]
 pub use gensym::gensym;
-use s3::creds::Credentials;
-use s3::error::S3Error;
 use s3::Bucket;
 use s3::Region;
+use s3::creds::Credentials;
+use s3::error::S3Error;
 use std::marker::PhantomData;
 use std::sync::Arc;
 use std::time::{Duration, Instant};

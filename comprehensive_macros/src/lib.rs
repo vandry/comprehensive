@@ -5,12 +5,12 @@
 extern crate proc_macro;
 use convert_case::{Case, Casing};
 use proc_macro2::{Span, TokenStream};
-use quote::{format_ident, quote, quote_spanned, ToTokens};
+use quote::{ToTokens, format_ident, quote, quote_spanned};
 use syn::punctuated::Punctuated;
 use syn::spanned::Spanned;
 use syn::{
-    parse_macro_input, Attribute, Data, DeriveInput, Fields, GenericArgument, Generics, Ident, Lit,
-    LitBool, LitStr, Path, PathArguments, Type, Visibility,
+    Attribute, Data, DeriveInput, Fields, GenericArgument, Generics, Ident, Lit, LitBool, LitStr,
+    Path, PathArguments, Type, Visibility, parse_macro_input,
 };
 
 fn find_type_inside_arc(ty: &Type) -> Result<&Type, Span> {

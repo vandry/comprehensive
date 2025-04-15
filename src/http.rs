@@ -378,7 +378,10 @@ impl<I: HttpServingInstance> Resource for HttpServer<I> {
     async fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
         #[cfg(not(feature = "tls"))]
         if self.deps.http.conf.is_none() {
-            log::warn!("{}: No insecure HTTP listener, and secure HTTP is not available because feature \"tls\" is not built.", I::NAME);
+            log::warn!(
+                "{}: No insecure HTTP listener, and secure HTTP is not available because feature \"tls\" is not built.",
+                I::NAME
+            );
             return Ok(());
         }
 
@@ -469,10 +472,12 @@ mod tests {
         #[cfg(feature = "tls")]
         assert!(assembly.top.server.deps.https.conf.is_none());
 
-        assert!(assembly
-            .run_with_termination_signal(futures::stream::pending())
-            .await
-            .is_ok());
+        assert!(
+            assembly
+                .run_with_termination_signal(futures::stream::pending())
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]

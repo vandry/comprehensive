@@ -42,8 +42,8 @@
 
 use comprehensive::{NoArgs, NoDependencies, Resource};
 use std::sync::Arc;
-use trust_dns_resolver::system_conf::read_system_conf;
 use trust_dns_resolver::TokioAsyncResolver;
+use trust_dns_resolver::system_conf::read_system_conf;
 
 /// [`comprehensive::Resource`] for DNS resolution. For DNS resolution
 /// services, depend on this.
@@ -56,7 +56,7 @@ pub struct ResolverHandle(Arc<DNSResolver>);
 
 impl AsRef<TokioAsyncResolver> for ResolverHandle {
     fn as_ref(&self) -> &TokioAsyncResolver {
-        &self.0 .0
+        &self.0.0
     }
 }
 

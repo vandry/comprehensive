@@ -27,12 +27,12 @@
 use clap::{ArgMatches, Args, FromArgMatches};
 use fixedbitset::FixedBitSet;
 use futures::stream::FuturesUnordered;
-use futures::{poll, ready, Stream, StreamExt};
+use futures::{Stream, StreamExt, poll, ready};
 use pin_project_lite::pin_project;
 use std::any::{Any, TypeId};
 use std::cell::OnceCell;
-use std::collections::hash_map::Entry;
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::error::Error;
 use std::future::Future;
 use std::pin::Pin;
@@ -1032,9 +1032,11 @@ mod tests {
 
     #[test]
     fn run_assembly() {
-        let mut r = pin!(Assembly::<TopDependencies>::new_from_argv(EMPTY)
-            .unwrap()
-            .run_with_termination_signal(futures::stream::pending()));
+        let mut r = pin!(
+            Assembly::<TopDependencies>::new_from_argv(EMPTY)
+                .unwrap()
+                .run_with_termination_signal(futures::stream::pending())
+        );
         let mut e = TestExecutor::default();
         match e.poll(&mut r) {
             Poll::Ready(Err(e)) => {
@@ -1051,9 +1053,9 @@ mod tests {
         let argv: Vec<std::ffi::OsString> = vec!["cmd".into(), "--report".into()];
         let assembly = Assembly::<TopDependencies>::new_from_argv(argv).unwrap();
         let (tx, rx) = tokio::sync::mpsc::channel(1);
-        let mut r =
-            pin!(assembly
-                .run_with_termination_signal(tokio_stream::wrappers::ReceiverStream::new(rx)));
+        let mut r = pin!(
+            assembly.run_with_termination_signal(tokio_stream::wrappers::ReceiverStream::new(rx))
+        );
         let mut e = TestExecutor::default();
 
         if let Ok(mut qi) = QUIT_REPORTER.lock() {
@@ -1071,13 +1073,15 @@ mod tests {
         let _ = tx.try_send(()).unwrap();
 
         assert!(e.poll(&mut r).is_pending());
-        assert!(QUIT_REPORTER
-            .lock()
-            .unwrap()
-            .expect_quit
-            .as_ref()
-            .unwrap()
-            .is_empty());
+        assert!(
+            QUIT_REPORTER
+                .lock()
+                .unwrap()
+                .expect_quit
+                .as_ref()
+                .unwrap()
+                .is_empty()
+        );
 
         // Allow Mid to disappear, Leaf1 and Leaf2 will then also quit.
         let (leaf1_tx, leaf1_rx) = tokio::sync::oneshot::channel();
@@ -1090,26 +1094,30 @@ mod tests {
         std::mem::drop(mid_tx);
 
         assert!(e.poll(&mut r).is_pending());
-        assert!(QUIT_REPORTER
-            .lock()
-            .unwrap()
-            .expect_quit
-            .as_ref()
-            .unwrap()
-            .is_empty());
+        assert!(
+            QUIT_REPORTER
+                .lock()
+                .unwrap()
+                .expect_quit
+                .as_ref()
+                .unwrap()
+                .is_empty()
+        );
 
         // Allow the leaves to disappear, and that should be all.
         std::mem::drop(leaf1_tx);
         std::mem::drop(leaf2_tx);
 
         assert!(e.poll(&mut r).is_ready());
-        assert!(QUIT_REPORTER
-            .lock()
-            .unwrap()
-            .expect_quit
-            .as_ref()
-            .unwrap()
-            .is_empty());
+        assert!(
+            QUIT_REPORTER
+                .lock()
+                .unwrap()
+                .expect_quit
+                .as_ref()
+                .unwrap()
+                .is_empty()
+        );
     }
 
     struct RunUntilSignaled(AtomicTake<tokio::sync::oneshot::Sender<()>>);
@@ -1183,9 +1191,9 @@ mod tests {
     async fn needs_2_sigterms() {
         let assembly = Assembly::<RunUntilSignaledTop>::new_from_argv(EMPTY).unwrap();
         let (tx, rx) = tokio::sync::mpsc::channel(1);
-        let mut r =
-            pin!(assembly
-                .run_with_termination_signal(tokio_stream::wrappers::ReceiverStream::new(rx)));
+        let mut r = pin!(
+            assembly.run_with_termination_signal(tokio_stream::wrappers::ReceiverStream::new(rx))
+        );
         assert!(poll!(&mut r).is_pending());
         let _ = tx.send(()).await;
         // Does not quit after the first request.
@@ -1236,9 +1244,9 @@ mod tests {
         let assembly = Assembly::<CleanShutdownTop>::new_from_argv(EMPTY).unwrap();
         let shared = Arc::clone(&assembly.top.0);
         let (tx, rx) = tokio::sync::mpsc::channel(1);
-        let mut r =
-            pin!(assembly
-                .run_with_termination_signal(tokio_stream::wrappers::ReceiverStream::new(rx)));
+        let mut r = pin!(
+            assembly.run_with_termination_signal(tokio_stream::wrappers::ReceiverStream::new(rx))
+        );
         let mut e = TestExecutor::default();
         assert!(e.poll(&mut r).is_pending());
         let _ = tx.try_send(()).unwrap();

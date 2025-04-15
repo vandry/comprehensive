@@ -32,7 +32,7 @@
 //! distinct from the [`Arc`] that is shared around to reverse dependencies.
 
 use clap::{Args, FromArgMatches};
-use futures::FutureExt;
+use futures::{FutureExt, ready};
 use pin_project_lite::pin_project;
 use std::error::Error;
 use std::future::Future;
@@ -44,7 +44,9 @@ use tokio::sync::{Notify, futures::Notified};
 use crate::ResourceDependencies;
 use crate::assembly::sealed::ResourceBase;
 use crate::assembly::{ProduceContext, RegisterContext};
-use crate::shutdown::{ShutdownSignalParticipant, ShutdownSignalParticipantCreator};
+use crate::shutdown::{
+    ShutdownSignalParticipant, ShutdownSignalParticipantCreator, TaskRunningSentinel,
+};
 
 /// Passed to resources to offer resources a chance to react to a termination
 /// request signal. Interested resources should call [`ShutdownNotify::subscribe`].
@@ -143,21 +145,32 @@ pin_project! {
     struct NotifyHelper<F> {
         #[pin] forward: Option<NotifyForward>,
         #[pin] fut: F,
+        task_running: TaskRunningSentinel,
+        name: &'static str,
     }
 }
 
 impl<F> NotifyHelper<F> {
-    fn new(fut: F, notify: Arc<Notify>, sub: ShutdownSignalParticipant) -> Self {
+    fn new(
+        fut: F,
+        notify: Arc<Notify>,
+        sub: ShutdownSignalParticipant,
+        task_running: TaskRunningSentinel,
+        name: &'static str,
+    ) -> Self {
         Self {
             forward: Some(NotifyForward { notify, sub }),
             fut,
+            task_running,
+            name,
         }
     }
 }
 
-impl<F> Future for NotifyHelper<F>
+impl<F, T, U> Future for NotifyHelper<F>
 where
-    F: Future,
+    F: Future<Output = Result<T, U>>,
+    U: std::fmt::Display,
 {
     type Output = F::Output;
 
@@ -174,13 +187,15 @@ where
             }
             forwarder.propagate();
         }
-        this.fut.poll(cx)
+        let r = ready!(this.fut.poll(cx));
+        crate::assembly::log_resource_result(&r, this.name);
+        Poll::Ready(r)
     }
 }
 
 impl<T: Resource> ResourceBase<{ crate::ResourceVariety::V0 as usize }> for T {
     const NAME: &str = T::NAME;
-    type Production = (Arc<T>, ShutdownSignalParticipant);
+    type Production = (Arc<T>, ShutdownSignalParticipant, TaskRunningSentinel);
 
     fn register_recursive(cx: &mut RegisterContext<'_>) {
         T::Dependencies::register(cx);
@@ -194,11 +209,12 @@ impl<T: Resource> ResourceBase<{ crate::ResourceVariety::V0 as usize }> for T {
         cx: &mut ProduceContext<'_>,
         arg_matches: &mut clap::ArgMatches,
         stoppers: ShutdownSignalParticipantCreator,
+        task_running: TaskRunningSentinel,
     ) -> Result<Self::Production, Box<dyn Error>> {
         let deps = T::Dependencies::produce(cx)?;
         let args = T::Args::from_arg_matches(arg_matches)?;
         let shared = Arc::new(T::new(deps, args)?);
-        Ok((shared, stoppers.into_inner().unwrap()))
+        Ok((shared, stoppers.into_inner().unwrap(), task_running))
     }
 
     fn shared(re: &Self::Production) -> Arc<T> {
@@ -206,17 +222,21 @@ impl<T: Resource> ResourceBase<{ crate::ResourceVariety::V0 as usize }> for T {
     }
 
     fn task(
-        re: Self::Production,
+        (user_task, shutdown_participant, task_running): Self::Production,
     ) -> Pin<Box<dyn Future<Output = Result<(), Box<dyn Error>>> + Send>> {
         let notify = Arc::new(Notify::new());
         let notify2 = Arc::clone(&notify);
         Box::pin(NotifyHelper::new(
             async move {
                 let shutdown_notify = ShutdownNotify::new(&notify2);
-                re.0.run_with_termination_signal(&shutdown_notify).await
+                user_task
+                    .run_with_termination_signal(&shutdown_notify)
+                    .await
             },
             notify,
-            re.1,
+            shutdown_participant,
+            task_running,
+            T::NAME,
         ))
     }
 }

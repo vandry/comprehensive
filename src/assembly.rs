@@ -26,7 +26,7 @@
 
 use clap::{ArgMatches, Args, FromArgMatches};
 use fixedbitset::FixedBitSet;
-use futures::stream::FuturesUnordered;
+use futures::stream::{FusedStream, FuturesUnordered};
 use futures::{Stream, StreamExt, poll, ready};
 use pin_project_lite::pin_project;
 use std::any::{Any, TypeId};
@@ -40,10 +40,11 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use topological_sort::TopologicalSort;
 
-use crate::shutdown::{ShutdownSignal, ShutdownSignalForwarder, ShutdownSignalParticipantCreator};
+use crate::shutdown::{
+    ShutdownSignal, ShutdownSignalForwarder, ShutdownSignalParticipantCreator, TaskRunningSentinel,
+};
 
 type ResourceFut = Pin<Box<dyn Future<Output = Result<(), Box<dyn Error>>> + Send>>;
-type TaskFut = IdentifiedFuture<ResourceFut>;
 
 struct Node<T: sealed::ResourceBase<U>, const U: usize> {
     production: OnceCell<T::Production>,
@@ -65,6 +66,7 @@ trait NodeTrait: Any {
         cx: &mut ProduceContext<'_>,
         arg_matches: &mut ArgMatches,
         stoppers: ShutdownSignalParticipantCreator,
+        keepalive: TaskRunningSentinel,
     ) -> Result<(), Box<dyn Error>>;
     fn task(self: Box<Self>) -> ResourceFut;
 }
@@ -83,11 +85,13 @@ impl<T: sealed::ResourceBase<U>, const U: usize> NodeTrait for Node<T, U> {
         cx: &mut ProduceContext<'_>,
         arg_matches: &mut ArgMatches,
         stoppers: ShutdownSignalParticipantCreator,
+        keepalive: TaskRunningSentinel,
     ) -> Result<(), Box<dyn Error>> {
         let _ = self.production.set(<T as sealed::ResourceBase<U>>::make(
             cx,
             arg_matches,
             stoppers,
+            keepalive,
         )?);
         Ok(())
     }
@@ -123,7 +127,7 @@ pub struct ProduceContext<'a> {
 pub(crate) mod sealed {
     use super::{
         Arc, ArgMatches, Error, ProduceContext, RegisterContext, ResourceFut,
-        ShutdownSignalParticipantCreator,
+        ShutdownSignalParticipantCreator, TaskRunningSentinel,
     };
 
     pub trait ResourceBase<const T: usize>: Send + Sync + 'static {
@@ -138,6 +142,7 @@ pub(crate) mod sealed {
             cx: &mut ProduceContext<'_>,
             arg_matches: &mut ArgMatches,
             stoppers: ShutdownSignalParticipantCreator,
+            keepalive: TaskRunningSentinel,
         ) -> Result<Self::Production, Box<dyn Error>>;
         fn shared(re: &Self::Production) -> Arc<Self>;
         fn task(re: Self::Production) -> ResourceFut;
@@ -250,28 +255,6 @@ pub trait ResourceDependencies: Sized {
 
 pub use comprehensive_macros::ResourceDependencies;
 
-pin_project! {
-    struct IdentifiedFuture<F> {
-        #[pin] fut: F,
-        identifier: usize,
-    }
-}
-
-impl<F> IdentifiedFuture<F> {
-    fn new(fut: F, identifier: usize) -> Self {
-        Self { fut, identifier }
-    }
-}
-
-impl<F: Future> Future for IdentifiedFuture<F> {
-    type Output = (usize, F::Output);
-
-    fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
-        let this = self.project();
-        Poll::Ready((*this.identifier, ready!(this.fut.poll(cx))))
-    }
-}
-
 /// Main entry point for a Comprehensive server.
 ///
 /// ```
@@ -283,8 +266,9 @@ impl<F: Future> Future for IdentifiedFuture<F> {
 /// }
 pub struct Assembly<T> {
     shutdown_notify: ShutdownSignalForwarder,
-    tasks: FuturesUnordered<TaskFut>,
+    tasks: FuturesUnordered<ResourceFut>,
     names: Box<[Option<&'static str>]>,
+    task_quits: crate::shutdown::TaskQuits,
     /// The constructed instances of the top-level (root) dependencies.
     /// Access to this is freqently not required as these resources
     /// will work autonomously once included in the graph.
@@ -300,21 +284,6 @@ struct GlobalArgs {
         help = "Instead of running, write the Comprehensive Resource graph in Graphviz format and exit"
     )]
     write_graph_and_exit: bool,
-}
-
-fn mark_complete(names: &mut [Option<&'static str>], i: usize) -> &'static str {
-    let Some(e) = names.get_mut(i) else {
-        log::error!("Out of range resource with index {} finished", i);
-        return "unknown resource";
-    };
-    let Some(e) = e.take() else {
-        log::error!(
-            "An already finished resource with index {} finished again",
-            i
-        );
-        return "unknown resource";
-    };
-    e
 }
 
 fn active_list(names: &[Option<&'static str>]) -> String {
@@ -505,24 +474,21 @@ where
             type_map,
             nodes: &nodes,
         };
-        let mut participants = shutdown_notify.into_iter().map(Some).collect::<Vec<_>>();
+        let (task_quits, participants_iter) = shutdown_notify.into_monitors();
+        let mut participants = participants_iter.map(Some).collect::<Vec<_>>();
         for i in build_order {
-            nodes[i].make(
-                &mut cx,
-                &mut arg_matches,
-                participants[i]
-                    .take()
-                    .expect("same index appears twice in build order"),
-            )?;
+            let (notifier, participant_creator) = participants[i]
+                .take()
+                .expect("same index appears twice in build order");
+            nodes[i].make(&mut cx, &mut arg_matches, participant_creator, notifier)?;
         }
         let top = T::produce(&mut cx)?;
-        let mut root_participant = participants
+        let (_, root_participant_iter) = participants
             .last_mut()
             .unwrap()
             .take()
-            .expect("missing root participant")
-            .into_inner()
-            .unwrap();
+            .expect("missing root participant");
+        let mut root_participant = root_participant_iter.into_inner().unwrap();
         // The root participant should be immediately ready because nothing depends on it.
         let Poll::Ready(shutdown_notify) = Pin::new(&mut root_participant)
             .poll(&mut Context::from_waker(std::task::Waker::noop()))
@@ -531,17 +497,14 @@ where
         };
 
         let names = nodes.iter().map(|n| Some(n.name())).collect();
-        let tasks = nodes
-            .into_iter()
-            .enumerate()
-            .map(|(i, n)| IdentifiedFuture::new(n.task(), i))
-            .collect();
+        let tasks = nodes.into_iter().map(|n| n.task()).collect();
 
         Ok(Self {
             tasks,
             names,
             top,
             shutdown_notify,
+            task_quits,
         })
     }
 
@@ -570,6 +533,7 @@ where
             mut tasks,
             shutdown_notify,
             mut names,
+            mut task_quits,
             top: _,
         } = self;
         log::info!(
@@ -580,49 +544,67 @@ where
 
         // Flush out all the initialisation work, including resources with empty
         // run methods.
-        while let Poll::Ready(x) = poll!(tasks.next()) {
-            match x {
-                Some((i, result)) => {
-                    let name = mark_complete(&mut names, i);
-                    if let Err(e) = result {
-                        log::error!("{} failed: {}", name, e);
-                        return Err(e);
-                    }
+        loop {
+            let progress1 = match poll!(tasks.next()) {
+                Poll::Ready(Some(Err(e))) => {
+                    return Err(e);
                 }
-                None => {
-                    log::info!("After startup, no resources remain running. Quit.");
-                    return Ok(());
+                Poll::Ready(Some(Ok(()))) => true,
+                Poll::Ready(None) => false,
+                Poll::Pending => false,
+            };
+            let progress2 = match poll!(task_quits.next()) {
+                Poll::Ready(Some(i)) => {
+                    let _ = names[i].take();
+                    true
                 }
+                Poll::Ready(None) => false,
+                Poll::Pending => false,
+            };
+            if tasks.is_terminated() || task_quits.is_terminated() {
+                log::info!("After startup, no resources remain running. Quit.");
+                return Ok(());
+            }
+            if !progress1 && !progress2 {
+                break;
             }
         }
 
         // Blocking loop for the rest of time.
         log::info!(
             "After startup, {} resources are running: {}",
-            tasks.len(),
+            task_quits.len(),
             active_list(&names)
         );
         let mut term = TerminationSignal::new(termination_signal, shutdown_notify);
         loop {
             futures::select! {
                 task_result = tasks.next() => {
-                    if let Some((i, result)) = task_result {
-                        let name = mark_complete(&mut names, i);
-                        match result {
-                            Err(e) => {
-                                log::error!("{} failed: {}", name, e);
-                                return Err(e);
-                            }
-                            Ok(()) => {
-                                log::info!("{} exited successfully", name);
-                            }
+                    if let Some(result) = task_result {
+                        if result.is_err() {
+                            return result;
                         }
+                    } else {
+                        break;
+                    }
+                }
+                maybe_quit = task_quits.next() => {
+                    if let Some(i) = maybe_quit {
+                        let _ = names[i].take();
                     } else {
                         break;
                     }
                 }
                 _ = term => {
                     break;
+                }
+            }
+        }
+        if !tasks.is_terminated() {
+            // Return any errors immediately available.
+            while let Poll::Ready(Some(r)) = poll!(tasks.next()) {
+                if r.is_err() {
+                    return r;
                 }
             }
         }
@@ -647,7 +629,7 @@ where
         for (i, n) in nodes.into_iter().enumerate() {
             writeln!(w, "  \"i-{}\" [label={:?}]", i, n.name(),).unwrap();
         }
-        for (i, e) in shutdown_notify.into_iter().enumerate() {
+        for (i, (_, e)) in shutdown_notify.into_monitors().1.enumerate() {
             let parent_label;
             let parent = if i == node_count {
                 "top"
@@ -677,6 +659,17 @@ pub struct NoDependencies;
 #[derive(clap::Args, Debug, Default)]
 #[group(skip)]
 pub struct NoArgs {}
+
+pub(crate) fn log_resource_result<T, U: std::fmt::Display>(r: &Result<T, U>, name: &str) {
+    match r {
+        Err(e) => {
+            log::error!("{} failed: {}", name, e);
+        }
+        Ok(_) => {
+            log::info!("{} exited successfully", name);
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -731,6 +724,7 @@ mod tests {
             #[pin] stopper: Option<ShutdownSignalParticipant>,
             #[pin] block: Option<tokio::sync::oneshot::Receiver<()>>,
             forwarder: Option<ShutdownSignalForwarder>,
+            up: Option<TaskRunningSentinel>,
         }
     }
 
@@ -760,13 +754,18 @@ mod tests {
                     forwarder.propagate();
                 }
             }
+            let _ = this.up.take();
             Poll::Ready(Ok(()))
         }
     }
 
     impl<T: TestResource> sealed::ResourceBase<{ crate::ResourceVariety::Test as usize }> for T {
         const NAME: &str = T::NAME;
-        type Production = (Arc<Self>, Option<ShutdownSignalParticipant>);
+        type Production = (
+            Arc<Self>,
+            Option<ShutdownSignalParticipant>,
+            TaskRunningSentinel,
+        );
 
         fn register_recursive(cx: &mut RegisterContext<'_>) {
             T::Dependencies::register(cx);
@@ -793,7 +792,8 @@ mod tests {
             cx: &mut ProduceContext<'_>,
             arg_matches: &mut ArgMatches,
             stoppers: ShutdownSignalParticipantCreator,
-        ) -> Result<(Arc<T>, Option<ShutdownSignalParticipant>), Box<dyn Error>> {
+            up: TaskRunningSentinel,
+        ) -> Result<Self::Production, Box<dyn Error>> {
             if arg_matches
                 .get_one::<bool>("count")
                 .copied()
@@ -812,6 +812,7 @@ mod tests {
                 } else {
                     None
                 },
+                up,
             ))
         }
 
@@ -820,7 +821,11 @@ mod tests {
         }
 
         fn task(
-            p: (Arc<T>, Option<ShutdownSignalParticipant>),
+            p: (
+                Arc<T>,
+                Option<ShutdownSignalParticipant>,
+                TaskRunningSentinel,
+            ),
         ) -> Pin<Box<dyn Future<Output = Result<(), Box<dyn Error>>> + Send>> {
             match p.1 {
                 Some(stopper) => Box::pin(ReportTask {
@@ -828,6 +833,7 @@ mod tests {
                     name: T::NAME,
                     block: None,
                     forwarder: None,
+                    up: Some(p.2),
                 }),
                 None => Box::pin(FailTask),
             }
@@ -1125,6 +1131,7 @@ mod tests {
     pin_project! {
         struct RunUntilSignaledTask {
             #[pin] test_signals_we_are_done: tokio::sync::oneshot::Receiver<()>,
+            notifier: Option<TaskRunningSentinel>,
         }
     }
 
@@ -1134,7 +1141,8 @@ mod tests {
         fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
             let this = self.as_mut().project();
             let _ = ready!(this.test_signals_we_are_done.poll(cx));
-            Poll::Ready(Ok(()))
+            let _ = this.notifier.take();
+            Poll::Pending
         }
     }
 
@@ -1151,12 +1159,14 @@ mod tests {
             _: &mut ProduceContext<'_>,
             _: &mut ArgMatches,
             _: ShutdownSignalParticipantCreator,
+            notifier: TaskRunningSentinel,
         ) -> Result<RunUntilSignaledProduction, Box<dyn Error>> {
             let (tx, rx) = tokio::sync::oneshot::channel();
             Ok(RunUntilSignaledProduction {
                 shared: Arc::new(RunUntilSignaled(AtomicTake::new(tx))),
                 task: RunUntilSignaledTask {
                     test_signals_we_are_done: rx,
+                    notifier: Some(notifier),
                 },
             })
         }
@@ -1177,14 +1187,15 @@ mod tests {
         r: Arc<RunUntilSignaled>,
     }
 
-    #[tokio::test]
-    async fn runs_until_resource_quits() {
+    #[test]
+    fn runs_until_resource_quits() {
         let assembly = Assembly::<RunUntilSignaledTop>::new().unwrap();
         let notify = assembly.top.r.0.take();
         let mut r = pin!(assembly.run_with_termination_signal(futures::stream::pending()));
-        assert!(poll!(&mut r).is_pending());
+        let mut e = TestExecutor::default();
+        assert!(e.poll(&mut r).is_pending());
         std::mem::drop(notify);
-        assert!(poll!(&mut r).is_ready());
+        assert!(e.poll(&mut r).is_ready());
     }
 
     #[tokio::test]
@@ -1208,16 +1219,18 @@ mod tests {
 
     impl sealed::ResourceBase<{ crate::ResourceVariety::Test as usize }> for CleanShutdown {
         const NAME: &str = "CleanShutdown";
-        type Production = (Arc<Self>, ShutdownSignalParticipant);
+        type Production = (Arc<Self>, ShutdownSignalParticipant, TaskRunningSentinel);
 
         fn make(
             _: &mut ProduceContext<'_>,
             _: &mut ArgMatches,
             term_signals: ShutdownSignalParticipantCreator,
+            up: TaskRunningSentinel,
         ) -> Result<Self::Production, Box<dyn Error>> {
             Ok((
                 Arc::new(CleanShutdown::default()),
                 term_signals.into_inner().unwrap(),
+                up,
             ))
         }
 
@@ -1226,9 +1239,10 @@ mod tests {
         }
 
         fn task(
-            (re, term_signal): Self::Production,
+            (re, term_signal, up): Self::Production,
         ) -> Pin<Box<dyn Future<Output = Result<(), Box<dyn Error>>> + Send>> {
             Box::pin(async move {
+                let _keepalive = up;
                 let _ = term_signal.await;
                 re.0.store(true, Ordering::Release);
                 Ok(())

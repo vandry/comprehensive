@@ -461,3 +461,177 @@ pub fn derive_grpc_client(item: proc_macro::TokenStream) -> proc_macro::TokenStr
     }
     .into()
 }
+
+fn type_unless_self_colon_colon(ty: &Type) -> Option<Type> {
+    let Type::Path(typ) = ty else {
+        return Some(ty.clone());
+    };
+    if typ
+        .path
+        .segments
+        .first()
+        .map(|s| s.ident == "Self")
+        .unwrap_or(false)
+    {
+        // The function signature is referencing the associated
+        // type so we cannot infer the associated type from the
+        // function signature.
+        None
+    } else {
+        Some(Type::Path(typ.clone()))
+    }
+}
+
+fn get_fnarg_type(arg: &syn::FnArg) -> Result<Option<Type>, TokenStream> {
+    match arg {
+        syn::FnArg::Typed(pat) => Ok(type_unless_self_colon_colon(&pat.ty)),
+        _ => Err(quote_spanned! {
+            arg.span() => compile_error!("expected a typed argument");
+        }),
+    }
+}
+
+fn bad_return_type(ty: &Type) -> TokenStream {
+    quote_spanned! {
+        ty.span() => compile_error!("expected return type Result<_, _>");
+    }
+}
+
+fn parse_v1resource_error_return_type(ty: &Type) -> Result<Option<Type>, TokenStream> {
+    let Type::Path(typ) = ty else {
+        return Err(bad_return_type(ty));
+    };
+    let Some(result) = typ.path.segments.last() else {
+        return Err(bad_return_type(ty));
+    };
+    let syn::PathArguments::AngleBracketed(ref args) = result.arguments else {
+        return Err(bad_return_type(ty));
+    };
+    if args.args.len() != 2 {
+        return Err(bad_return_type(ty));
+    }
+    let syn::GenericArgument::Type(ref err_ty) = args.args[1] else {
+        return Err(bad_return_type(ty));
+    };
+    Ok(type_unless_self_colon_colon(err_ty))
+}
+
+#[proc_macro_attribute]
+pub fn v1resource(
+    _attr: proc_macro::TokenStream,
+    item: proc_macro::TokenStream,
+) -> proc_macro::TokenStream {
+    let mut block: syn::ItemImpl = parse_macro_input!(item);
+    let mut errors = Vec::new();
+
+    let mut dependencies = None;
+    let mut args = None;
+    let mut creation_error = None;
+
+    let mut name_already_specified = false;
+    let mut dependencies_already_specified = false;
+    let mut args_already_specified = false;
+    let mut creation_error_already_specified = false;
+
+    for item in &block.items {
+        match item {
+            syn::ImplItem::Fn(f) => {
+                if f.sig.ident == "new" {
+                    if f.sig.inputs.len() == 3 {
+                        match get_fnarg_type(&f.sig.inputs[0]) {
+                            Ok(Some(ty)) => {
+                                dependencies = Some(ty);
+                            }
+                            Ok(None) => (),
+                            Err(e) => {
+                                errors.push(e);
+                            }
+                        }
+                        match get_fnarg_type(&f.sig.inputs[1]) {
+                            Ok(Some(ty)) => {
+                                args = Some(ty);
+                            }
+                            Ok(None) => (),
+                            Err(e) => {
+                                errors.push(e);
+                            }
+                        }
+                    } else {
+                        errors.push(quote_spanned! {
+                            f.sig.inputs.span() => compile_error!("expected Resource::new to take exactly 3 arguments");
+                        });
+                    }
+                    match f.sig.output {
+                        syn::ReturnType::Type(_, ref ty) => {
+                            // Result<Arc<Self>, Self::CreationError>
+                            match parse_v1resource_error_return_type(ty) {
+                                Ok(maybe_error) => {
+                                    creation_error = maybe_error;
+                                }
+                                Err(e) => {
+                                    errors.push(e);
+                                }
+                            }
+                        }
+                        _ => {
+                            errors.push(quote_spanned! {
+                                f.sig.output.span() => compile_error!("expected a return type");
+                            });
+                        }
+                    }
+                }
+            }
+            syn::ImplItem::Const(ico) => {
+                if ico.ident == "NAME" {
+                    name_already_specified = true;
+                }
+            }
+            syn::ImplItem::Type(ity) => {
+                if ity.ident == "Dependencies" {
+                    dependencies_already_specified = true;
+                }
+                if ity.ident == "Args" {
+                    args_already_specified = true;
+                }
+                if ity.ident == "CreationError" {
+                    creation_error_already_specified = true;
+                }
+            }
+            _ => (),
+        }
+    }
+    if !name_already_specified {
+        let name = LitStr::new(
+            &block.self_ty.to_token_stream().to_string(),
+            block.self_ty.span(),
+        );
+        block.items.push(syn::ImplItem::Verbatim(quote! {
+            const NAME: &str = #name ;
+        }));
+    }
+    if !dependencies_already_specified {
+        if let Some(d) = dependencies {
+            block.items.push(syn::ImplItem::Verbatim(quote_spanned! {
+                d.span() => type Dependencies = #d ;
+            }));
+        }
+    }
+    if !args_already_specified {
+        if let Some(a) = args {
+            block.items.push(syn::ImplItem::Verbatim(quote_spanned! {
+                a.span() => type Args = #a ;
+            }));
+        }
+    }
+    if !creation_error_already_specified {
+        if let Some(e) = creation_error {
+            block.items.push(syn::ImplItem::Verbatim(quote_spanned! {
+                e.span() => type CreationError = #e ;
+            }));
+        }
+    }
+    for e in errors {
+        block.items.push(syn::ImplItem::Verbatim(e));
+    }
+    block.into_token_stream().into()
+}

@@ -29,7 +29,7 @@
 //!
 //! # Status
 //!
-//! Comprehensive is still in early development. Many more features are planned.
+//! Comprehensive is still in development. Many more features are planned.
 //!
 //! # Examples
 //!
@@ -56,6 +56,7 @@ pub mod diag;
 pub mod health;
 pub mod http;
 pub mod v0;
+pub mod v1;
 
 mod shutdown;
 
@@ -75,11 +76,13 @@ mod testutil;
 #[doc(hidden)]
 pub enum ResourceVariety {
     V0,
+    V1,
     #[cfg(test)]
     Test,
 }
 
-/// Trait for expressing any version of resource, currently only [`v0::Resource`].
+/// Trait for expressing any version of resource: either [`v0::Resource`]
+/// or [`v1::Resource`].
 ///
 /// A requirement for a resource of any variety may be expressed as:
 ///

@@ -44,7 +44,7 @@ use crate::shutdown::{
     ShutdownSignal, ShutdownSignalForwarder, ShutdownSignalParticipantCreator, TaskRunningSentinel,
 };
 
-type ResourceFut = Pin<Box<dyn Future<Output = Result<(), Box<dyn Error>>> + Send>>;
+pub(crate) type ResourceFut = Pin<Box<dyn Future<Output = Result<(), Box<dyn Error>>> + Send>>;
 
 struct Node<T: sealed::ResourceBase<U>, const U: usize> {
     production: OnceCell<T::Production>,

@@ -1,0 +1,50 @@
+[package]
+name = "comprehensive"
+version = "0.5.4"
+edition = "2024"
+rust-version = "1.86"
+repository = "https://github.com/vandry/comprehensive.git"
+homepage = "https://github.com/vandry/comprehensive"
+description = "A harness for creating consistently-shaped servers will less boilerplate"
+license = "MIT"
+autoexamples = false
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[dependencies]
+arc-swap = { version = "1.7", optional = true }
+atomic-take = "1.1"
+axum = "0.7"
+axum-server = "0.7"
+boxcar = "0.2"
+clap = { version = "4.5", features = ["derive"] }
+comprehensive_macros = { path = "../comprehensive_macros", version = "0.4.2" }
+fixedbitset = "0.5.7"
+futures = "0.3"
+http = "1.1"
+hyper = "1.4"
+lazy_static = "1.5"
+log = "0.4"
+pin-project-lite = "0.2"
+prometheus = "0.13"
+rustls-pemfile = { version = "2.1", optional = true }
+slice-dst = "1.6.0"
+tokio = { version = "1.40", features = ["macros", "rt-multi-thread", "signal"] }
+tokio-rustls = { version = "0.26", optional = true }
+tokio-stream = { version = "0.1", features = ["signal"] }
+topological-sort = "0.2.2"
+try-lock = "0.2"
+
+[features]
+tls = ["axum-server/tls-rustls", "dep:arc-swap", "dep:tokio-rustls", "dep:rustls-pemfile"]
+unreloadable_tls = []
+
+[dev-dependencies]
+rand = "0.8"
+regex = "1.11"
+reqwest = "0.12"
+tempfile = "3"
+tokio-stream = "0.1"
+tower-service = "0.3"

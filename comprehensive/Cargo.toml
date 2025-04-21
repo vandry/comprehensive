@@ -20,7 +20,8 @@ axum = "0.7"
 axum-server = "0.7"
 boxcar = "0.2"
 clap = { version = "4.5", features = ["derive"] }
-comprehensive_macros = { path = "../comprehensive_macros", version = "0.4.2" }
+comprehensive_macros = { path = "../comprehensive_macros", version = "0.4.3" }
+delegate = "0.13.3"
 fixedbitset = "0.5.7"
 futures = "0.3"
 http = "1.1"

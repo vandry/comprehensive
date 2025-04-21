@@ -25,6 +25,7 @@
 //! [`Assembly::new`].
 
 use clap::{ArgMatches, Args, FromArgMatches};
+use delegate::delegate;
 use fixedbitset::FixedBitSet;
 use futures::stream::{FusedStream, FuturesUnordered};
 use futures::{Stream, StreamExt, poll, ready};
@@ -60,6 +61,7 @@ impl<T: sealed::ResourceBase<U>, const U: usize> Default for Node<T, U> {
 
 trait NodeTrait: Any {
     fn name(&self) -> &'static str;
+    fn register_as_traits(&self, cx: sealed::TraitRegisterContext<'_>);
     fn augment_args(&self, _: clap::Command) -> clap::Command;
     fn make(
         &self,
@@ -68,12 +70,16 @@ trait NodeTrait: Any {
         stoppers: ShutdownSignalParticipantCreator,
         keepalive: TaskRunningSentinel,
     ) -> Result<(), Box<dyn Error>>;
-    fn task(self: Box<Self>) -> ResourceFut;
+    fn task(self: Box<Self>) -> Option<ResourceFut>;
 }
 
 impl<T: sealed::ResourceBase<U>, const U: usize> NodeTrait for Node<T, U> {
     fn name(&self) -> &'static str {
         T::NAME
+    }
+
+    fn register_as_traits(&self, cx: sealed::TraitRegisterContext<'_>) {
+        <T as sealed::ResourceBase<U>>::register_as_traits(cx)
     }
 
     fn augment_args(&self, c: clap::Command) -> clap::Command {
@@ -96,8 +102,10 @@ impl<T: sealed::ResourceBase<U>, const U: usize> NodeTrait for Node<T, U> {
         Ok(())
     }
 
-    fn task(mut self: Box<Self>) -> ResourceFut {
-        <T as sealed::ResourceBase<U>>::task(self.production.take().unwrap())
+    fn task(mut self: Box<Self>) -> Option<ResourceFut> {
+        Some(<T as sealed::ResourceBase<U>>::task(
+            self.production.take().unwrap(),
+        ))
     }
 }
 
@@ -106,14 +114,114 @@ struct NodeRelationship {
     child: usize,
 }
 
+struct TraitProduction(Box<dyn Any>);
+
+impl TraitProduction {
+    fn new<T: Any + ?Sized>() -> Self {
+        Self(Box::new(Vec::<Arc<T>>::new()))
+    }
+
+    fn push<T: Any + ?Sized>(&mut self, item: Arc<T>) {
+        self.0
+            .downcast_mut::<Vec<Arc<T>>>()
+            .expect("bad downcast")
+            .push(item);
+    }
+
+    fn to_vec<T: Any + ?Sized>(&self) -> Vec<Arc<T>> {
+        self.0
+            .downcast_ref::<Vec<Arc<T>>>()
+            .expect("bad downcast")
+            .clone()
+    }
+}
+
+struct TraitGraphNode(&'static str, usize);
+
+impl TraitGraphNode {
+    fn name(&self) -> &'static str {
+        self.0
+    }
+
+    fn augment_args(&self, c: clap::Command) -> clap::Command {
+        c
+    }
+
+    fn make(
+        &self,
+        _: &mut ProduceContext<'_>,
+        _: &mut ArgMatches,
+        _: ShutdownSignalParticipantCreator,
+        _: TaskRunningSentinel,
+    ) -> Result<(), Box<dyn Error>> {
+        Ok(())
+    }
+
+    fn task(self) -> Option<ResourceFut> {
+        None
+    }
+}
+
+enum GraphNode {
+    Resource(Box<dyn NodeTrait>),
+    Trait(TraitGraphNode),
+}
+
+impl GraphNode {
+    delegate! {
+        to match self {
+            Self::Resource(inner) => inner,
+            Self::Trait(inner) => inner,
+        } {
+            fn name(&self) -> &'static str;
+            fn augment_args(&self, c: clap::Command) -> clap::Command;
+            fn make(
+                &self,
+                cx: &mut ProduceContext<'_>,
+                arg_matches: &mut ArgMatches,
+                stoppers: ShutdownSignalParticipantCreator,
+                keepalive: TaskRunningSentinel,
+            ) -> Result<(), Box<dyn Error>>;
+            fn task(self) -> Option<ResourceFut>;
+        }
+    }
+
+    fn is_inert(&self) -> bool {
+        match self {
+            Self::Resource(_) => false,
+            Self::Trait(_) => true,
+        }
+    }
+}
+
 /// Opaque type used in the implementation of the [`ResourceDependencies`]
 /// trait, which should be derived.
 #[doc(hidden)]
 pub struct RegisterContext<'a> {
     type_map: &'a mut HashMap<TypeId, usize>,
     parent: Option<usize>,
-    nodes: &'a mut Vec<Box<dyn NodeTrait>>,
+    nodes: &'a mut Vec<GraphNode>,
     relationships: &'a mut Vec<NodeRelationship>,
+    next_trait_id: usize,
+}
+
+impl RegisterContext<'_> {
+    pub fn require_trait<T: Any + ?Sized>(&mut self) {
+        let me = TypeId::of::<T>();
+        let next_i = self.type_map.len();
+        let i = self.type_map.entry(me).or_insert_with(|| {
+            self.nodes.push(GraphNode::Trait(TraitGraphNode(
+                std::any::type_name::<T>(),
+                self.next_trait_id,
+            )));
+            self.next_trait_id += 1;
+            next_i
+        });
+        self.relationships.push(NodeRelationship {
+            parent: self.parent,
+            child: *i,
+        });
+    }
 }
 
 /// Opaque type used in the implementation of the [`ResourceDependencies`]
@@ -121,20 +229,65 @@ pub struct RegisterContext<'a> {
 #[doc(hidden)]
 pub struct ProduceContext<'a> {
     type_map: HashMap<TypeId, usize>,
-    nodes: &'a Vec<Box<dyn NodeTrait>>,
+    nodes: &'a Vec<GraphNode>,
+    trait_productions: Box<[Option<TraitProduction>]>,
+}
+
+impl ProduceContext<'_> {
+    pub(crate) fn get_trait_i<T: Any + ?Sized>(&self) -> Option<usize> {
+        self.type_map.get(&TypeId::of::<T>()).copied()
+    }
+
+    pub(crate) fn provide_as_trait<T: Any + ?Sized>(&mut self, i: usize, shared: Arc<T>) {
+        if let GraphNode::Trait(TraitGraphNode(_, prod_i)) = self.nodes[i] {
+            self.trait_productions[prod_i]
+                .get_or_insert_with(|| TraitProduction::new::<T>())
+                .push(shared);
+        }
+    }
+
+    pub fn produce_trait<T: Any + ?Sized>(&self) -> Vec<Arc<T>> {
+        if let Some(i) = self.type_map.get(&TypeId::of::<T>()) {
+            if let GraphNode::Trait(TraitGraphNode(_, prod_i)) = self.nodes[*i] {
+                return self.trait_productions[prod_i]
+                    .as_ref()
+                    .map(|v| v.to_vec())
+                    .unwrap_or_default();
+            }
+        }
+        Vec::new()
+    }
 }
 
 pub(crate) mod sealed {
     use super::{
-        Arc, ArgMatches, Error, ProduceContext, RegisterContext, ResourceFut,
-        ShutdownSignalParticipantCreator, TaskRunningSentinel,
+        Any, Arc, ArgMatches, Error, HashMap, NodeRelationship, ProduceContext, RegisterContext,
+        ResourceFut, ShutdownSignalParticipantCreator, TaskRunningSentinel, TypeId,
     };
+
+    pub struct TraitRegisterContext<'a> {
+        pub(super) type_map: &'a HashMap<TypeId, usize>,
+        pub(super) relationships: &'a mut Vec<NodeRelationship>,
+        pub(super) trait_provider: usize,
+    }
+
+    impl TraitRegisterContext<'_> {
+        pub(crate) fn register_as_trait<T: Any + ?Sized>(&mut self) {
+            if let Some(trait_i) = self.type_map.get(&TypeId::of::<T>()) {
+                self.relationships.push(NodeRelationship {
+                    parent: Some(*trait_i),
+                    child: self.trait_provider,
+                });
+            }
+        }
+    }
 
     pub trait ResourceBase<const T: usize>: Send + Sync + 'static {
         const NAME: &str;
         type Production;
 
         fn register_recursive(_: &mut RegisterContext<'_>) {}
+        fn register_as_traits(_: TraitRegisterContext<'_>) {}
         fn augment_args(c: clap::Command) -> clap::Command {
             c
         }
@@ -177,7 +330,8 @@ impl<T> Registrar<T> {
         if prune {
             return;
         }
-        cx.nodes.push(Box::new(Node::<T, U>::default()));
+        cx.nodes
+            .push(GraphNode::Resource(Box::new(Node::<T, U>::default())));
         let parent = cx.parent.replace(i);
         <T as sealed::ResourceBase<U>>::register_recursive(cx);
         cx.parent = parent;
@@ -189,7 +343,10 @@ impl<T> Registrar<T> {
     {
         let me = TypeId::of::<T>();
         let i = cx.type_map.get(&me).expect("dependency not mapped");
-        let n: &dyn Any = cx.nodes[*i].as_ref();
+        let GraphNode::Resource(ref gn) = cx.nodes[*i] else {
+            panic!("not a Resource");
+        };
+        let n: &dyn Any = gn.as_ref();
         Ok(<T as sealed::ResourceBase<U>>::shared(
             n.downcast_ref::<Node<T, U>>()
                 .expect("bad downcast")
@@ -204,9 +361,26 @@ impl<T> Registrar<T> {
 /// Resource depends on. It is also used to list the top-level resource
 /// types at the roots of the [`Assembly`] graph.
 ///
-/// This must be implemented on a struct containing zero or more fields of
-/// type [`Arc<T>`] where T is a Resource. On that structure, the trait
+/// This must be implemented on a struct containing zero or more fields
+/// representing dependencies requested. On that structure, the trait
 /// should be derived.
+///
+/// The types of the fields of the struct should be one of:
+///
+/// - [`Arc<T>`] where T is a Resource. That resource will be a required
+///   dependency.
+/// - [`Vec<Arc<dyn T>>`] where T is a trait that might be implemented by
+///   some resources. All of the resources that exist in the graph and
+///   implement that trait and declare that they do so in their [`Resource`]
+///   definition (using [`v1::resource`]) will be collected here.
+///
+///   Note that in order to be selected for this, a Resource has to exist
+///   somewhere in the graph already, which means that somewhere it must
+///   be declared as a dependency under its concrete name. For this, a
+///   common expected pattern is that the Assembly's top-level dependencies
+///   request it under its concrete type but otherwise do not make any use
+///   of it, enabling one or more resources elsewhere in the graph to
+///   discover it under its trait interface.
 ///
 /// ```
 /// use comprehensive::{NoArgs, NoDependencies, ResourceDependencies};
@@ -223,11 +397,13 @@ impl<T> Registrar<T> {
 /// #     }
 /// # }
 /// # type ImportantResource = OtherResource;
+/// # trait ProviderOfSomething {}
 /// #
 /// #[derive(ResourceDependencies)]
 /// struct DependenciesOfSomeResource {
 ///     other_resource: Arc<OtherResource>,
 ///     i_need_this: Arc<ImportantResource>,
+///     i_can_use_things: Vec<Arc<dyn ProviderOfSomething>>,
 /// }
 /// ```
 ///
@@ -243,6 +419,9 @@ impl<T> Registrar<T> {
 /// (since the reference needs to be available to another consumer).
 /// Solutions are possible in case more longer-lived access is required,
 /// but these are arguably not better than the [`Arc`] solution.
+///
+/// [`Resource`]: crate::v1::Resource
+/// [`v1::resource`]: crate::v1::resource
 pub trait ResourceDependencies: Sized {
     /// Opaque method used in the implementation of the
     /// [`ResourceDependencies`] trait, which should be derived.
@@ -391,10 +570,11 @@ fn build_order(
 }
 
 struct AssemblySetup {
-    nodes: Vec<Box<dyn NodeTrait>>,
+    nodes: Vec<GraphNode>,
     type_map: HashMap<TypeId, usize>,
     build_order: Vec<usize>,
     shutdown_notify: ShutdownSignal,
+    n_traits: usize,
 }
 
 impl<T> Assembly<T>
@@ -410,10 +590,22 @@ where
             parent: None,
             nodes: &mut nodes,
             relationships: &mut relationships,
+            next_trait_id: 0,
         };
         T::register(&mut cx);
+        let n_traits = cx.next_trait_id;
 
-        let mut shutdown_notify = ShutdownSignal::new(nodes.len());
+        for (i, gn) in nodes.iter().enumerate() {
+            if let GraphNode::Resource(n) = gn {
+                n.register_as_traits(sealed::TraitRegisterContext {
+                    type_map: &type_map,
+                    relationships: &mut relationships,
+                    trait_provider: i,
+                });
+            }
+        }
+
+        let mut shutdown_notify = ShutdownSignal::new(nodes.iter().map(|gn| gn.is_inert()));
         let mut shutdown_notify_edit = shutdown_notify.get_mut().unwrap();
         for NodeRelationship { parent, child } in &relationships {
             shutdown_notify_edit.add_parent(*child, *parent);
@@ -433,6 +625,7 @@ where
             type_map,
             build_order,
             shutdown_notify,
+            n_traits,
         })
     }
 
@@ -455,6 +648,7 @@ where
             type_map,
             build_order,
             shutdown_notify,
+            n_traits,
         } = Self::setup()?;
 
         let mut command = Some(clap::Command::new("Assembly"));
@@ -473,6 +667,7 @@ where
         let mut cx = ProduceContext {
             type_map,
             nodes: &nodes,
+            trait_productions: std::iter::repeat_n((), n_traits).map(|_| None).collect(),
         };
         let (task_quits, participants_iter) = shutdown_notify.into_monitors();
         let mut participants = participants_iter.map(Some).collect::<Vec<_>>();
@@ -497,7 +692,7 @@ where
         };
 
         let names = nodes.iter().map(|n| Some(n.name())).collect();
-        let tasks = nodes.into_iter().map(|n| n.task()).collect();
+        let tasks = nodes.into_iter().filter_map(|n| n.task()).collect();
 
         Ok(Self {
             tasks,
@@ -621,25 +816,28 @@ where
             type_map: _,
             build_order: _,
             shutdown_notify,
+            n_traits: _,
         } = Self::setup().unwrap();
 
         writeln!(w, "digraph \"Assembly\" {{").unwrap();
         writeln!(w, "  top [shape=box]").unwrap();
         let node_count = nodes.len();
         for (i, n) in nodes.into_iter().enumerate() {
-            writeln!(w, "  \"i-{}\" [label={:?}]", i, n.name(),).unwrap();
+            let shape = match n {
+                GraphNode::Resource(_) => "",
+                GraphNode::Trait(_) => " shape=hexagon",
+            };
+            writeln!(w, "  \"i-{}\" [label={:?}{}]", i, n.name(), shape).unwrap();
         }
-        for (i, (_, e)) in shutdown_notify.into_monitors().1.enumerate() {
+        for (from_i, to_i) in shutdown_notify.edges() {
             let parent_label;
-            let parent = if i == node_count {
+            let parent = if from_i == node_count {
                 "top"
             } else {
-                parent_label = format!("i-{}", i);
+                parent_label = format!("i-{}", from_i);
                 &parent_label
             };
-            for child in e.into_inner().unwrap().iter_children() {
-                writeln!(w, "  \"{}\" -> \"i-{}\"", parent, child,).unwrap();
-            }
+            writeln!(w, "  \"{}\" -> \"i-{}\"", parent, to_i).unwrap();
         }
         writeln!(w, "}}").unwrap();
     }
@@ -896,15 +1094,13 @@ mod tests {
         assert_eq!(after - before, 3);
     }
 
-    #[test]
-    fn correct_graph() {
-        let mut output = Vec::new();
-        Assembly::<TopDependencies>::write_graph(&mut output);
-        let digraph = String::from_utf8(output).unwrap();
+    fn fix_graph_for_comparison<'a>(
+        digraph: &'a str,
+        names: &'a mut HashMap<String, String>,
+    ) -> Vec<(&'a str, &'a str)> {
         let lines = digraph.split("\n").collect::<Vec<_>>();
 
         // The node ids are opaque. Let's map them.
-        let mut names = HashMap::new();
         let re = Regex::new(r#".*"(i-[^"]+)".*label="([^"]+)".*"#).unwrap();
         for l in lines.iter() {
             if let Some(captures) = re.captures(l) {
@@ -929,6 +1125,16 @@ mod tests {
         }
 
         edges.sort();
+        edges
+    }
+
+    #[test]
+    fn correct_graph() {
+        let mut output = Vec::new();
+        Assembly::<TopDependencies>::write_graph(&mut output);
+        let digraph = String::from_utf8(output).unwrap();
+        let mut names = HashMap::new();
+        let edges = fix_graph_for_comparison(&digraph, &mut names);
         assert_eq!(
             edges,
             vec![
@@ -1266,5 +1472,280 @@ mod tests {
         let _ = tx.try_send(()).unwrap();
         assert!(e.poll(&mut r).is_ready());
         assert!(shared.0.load(Ordering::Acquire));
+    }
+
+    trait TestTrait {}
+
+    trait NobodyImplements {}
+
+    trait NobodyInterested {}
+
+    #[derive(ResourceDependencies)]
+    struct RequiresDynDependencies(Vec<Arc<dyn TestTrait>>, Vec<Arc<dyn NobodyImplements>>);
+
+    struct RequiresDyn;
+
+    impl sealed::ResourceBase<{ crate::ResourceVariety::Test as usize }> for RequiresDyn {
+        const NAME: &str = "RequiresDyn";
+        type Production = (Arc<Self>, ShutdownSignalParticipant);
+
+        fn register_recursive(cx: &mut RegisterContext<'_>) {
+            RequiresDynDependencies::register(cx);
+        }
+
+        fn make(
+            cx: &mut ProduceContext<'_>,
+            _: &mut ArgMatches,
+            stoppers: ShutdownSignalParticipantCreator,
+            _: TaskRunningSentinel,
+        ) -> Result<Self::Production, Box<dyn Error>> {
+            let deps = RequiresDynDependencies::produce(cx)?;
+            assert!(deps.0.len() == 2);
+            assert!(deps.1.len() == 0);
+            Ok((Arc::new(RequiresDyn), stoppers.into_inner().unwrap()))
+        }
+
+        fn shared(p: &Self::Production) -> Arc<Self> {
+            Arc::clone(&p.0)
+        }
+
+        fn task(
+            p: Self::Production,
+        ) -> Pin<Box<dyn Future<Output = Result<(), Box<dyn Error>>> + Send>> {
+            Box::pin(async move {
+                p.1.await.propagate();
+                Ok(())
+            })
+        }
+    }
+
+    struct ProvidesDyn;
+
+    impl TestTrait for ProvidesDyn {}
+
+    impl NobodyInterested for ProvidesDyn {}
+
+    impl sealed::ResourceBase<{ crate::ResourceVariety::Test as usize }> for ProvidesDyn {
+        const NAME: &str = "ProvidesDyn";
+        type Production = (Arc<Self>, ShutdownSignalParticipant);
+
+        fn register_as_traits(mut cx: sealed::TraitRegisterContext<'_>) {
+            cx.register_as_trait::<dyn TestTrait>();
+            cx.register_as_trait::<dyn NobodyInterested>();
+        }
+
+        fn register_recursive(cx: &mut RegisterContext<'_>) {
+            CleanShutdownTop::register(cx);
+        }
+
+        fn make(
+            cx: &mut ProduceContext<'_>,
+            _: &mut ArgMatches,
+            stoppers: ShutdownSignalParticipantCreator,
+            _: TaskRunningSentinel,
+        ) -> Result<Self::Production, Box<dyn Error>> {
+            let _ = CleanShutdownTop::produce(cx)?;
+            let shared = Arc::new(ProvidesDyn);
+
+            if let Some(i) = cx.get_trait_i::<dyn TestTrait>() {
+                let shared2 = Arc::clone(&shared);
+                let alias: Arc<dyn TestTrait> = shared2;
+                cx.provide_as_trait(i, alias);
+            }
+
+            if let Some(i) = cx.get_trait_i::<dyn NobodyInterested>() {
+                let shared2 = Arc::clone(&shared);
+                let alias: Arc<dyn NobodyInterested> = shared2;
+                cx.provide_as_trait(i, alias);
+            }
+
+            Ok((shared, stoppers.into_inner().unwrap()))
+        }
+
+        fn shared(p: &Self::Production) -> Arc<Self> {
+            Arc::clone(&p.0)
+        }
+
+        fn task(
+            p: Self::Production,
+        ) -> Pin<Box<dyn Future<Output = Result<(), Box<dyn Error>>> + Send>> {
+            Box::pin(async move {
+                p.1.await.propagate();
+                Ok(())
+            })
+        }
+    }
+
+    struct AlsoProvidesDyn;
+
+    impl TestTrait for AlsoProvidesDyn {}
+
+    impl sealed::ResourceBase<{ crate::ResourceVariety::Test as usize }> for AlsoProvidesDyn {
+        const NAME: &str = "AlsoProvidesDyn";
+        type Production = Arc<Self>;
+
+        fn register_as_traits(mut cx: sealed::TraitRegisterContext<'_>) {
+            cx.register_as_trait::<dyn TestTrait>();
+        }
+
+        fn make(
+            cx: &mut ProduceContext<'_>,
+            _: &mut ArgMatches,
+            _: ShutdownSignalParticipantCreator,
+            _: TaskRunningSentinel,
+        ) -> Result<Self::Production, Box<dyn Error>> {
+            let shared = Arc::new(AlsoProvidesDyn);
+            if let Some(i) = cx.get_trait_i::<dyn TestTrait>() {
+                let shared2 = Arc::clone(&shared);
+                let alias: Arc<dyn TestTrait> = shared2;
+                cx.provide_as_trait(i, alias);
+            }
+            Ok(shared)
+        }
+
+        fn shared(p: &Arc<Self>) -> Arc<Self> {
+            Arc::clone(&p)
+        }
+
+        fn task(_: Arc<Self>) -> Pin<Box<dyn Future<Output = Result<(), Box<dyn Error>>> + Send>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    #[derive(ResourceDependencies)]
+    struct RequiresDynTop(Arc<RequiresDyn>, Arc<ProvidesDyn>, Arc<AlsoProvidesDyn>);
+
+    #[test]
+    fn dyn_resource() {
+        let assembly = Assembly::<RequiresDynTop>::new_from_argv(EMPTY).unwrap();
+        let _ = Arc::clone(&assembly.top.0);
+        let _ = Arc::clone(&assembly.top.1);
+        let _ = Arc::clone(&assembly.top.2);
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let mut r = pin!(
+            assembly.run_with_termination_signal(tokio_stream::wrappers::ReceiverStream::new(rx))
+        );
+        let mut e = TestExecutor::default();
+        assert!(e.poll(&mut r).is_pending());
+        let _ = tx.try_send(()).unwrap();
+        assert!(e.poll(&mut r).is_ready());
+    }
+
+    #[test]
+    fn correct_graph_with_dyn() {
+        let mut output = Vec::new();
+        Assembly::<RequiresDynTop>::write_graph(&mut output);
+        let digraph = String::from_utf8(output).unwrap();
+        let mut names = HashMap::new();
+        let edges = fix_graph_for_comparison(&digraph, &mut names);
+        assert_eq!(
+            edges,
+            vec![
+                ("ProvidesDyn", "CleanShutdown"),
+                (
+                    "RequiresDyn",
+                    "dyn comprehensive::assembly::tests::NobodyImplements"
+                ),
+                (
+                    "RequiresDyn",
+                    "dyn comprehensive::assembly::tests::TestTrait"
+                ),
+                (
+                    "dyn comprehensive::assembly::tests::TestTrait",
+                    "AlsoProvidesDyn"
+                ),
+                (
+                    "dyn comprehensive::assembly::tests::TestTrait",
+                    "ProvidesDyn"
+                ),
+                ("top", "AlsoProvidesDyn"),
+                ("top", "ProvidesDyn"),
+                ("top", "RequiresDyn"),
+            ]
+        );
+    }
+
+    struct Ant;
+    struct Dec;
+    trait AntTrait {}
+    trait DecTrait {}
+    impl AntTrait for Ant {}
+    impl DecTrait for Dec {}
+
+    #[derive(ResourceDependencies)]
+    struct AntDependencies(#[allow(dead_code)] Vec<Arc<dyn DecTrait>>);
+
+    #[derive(ResourceDependencies)]
+    struct DecDependencies(#[allow(dead_code)] Vec<Arc<dyn AntTrait>>);
+
+    impl sealed::ResourceBase<{ crate::ResourceVariety::Test as usize }> for Ant {
+        const NAME: &str = "Ant";
+        type Production = ();
+
+        fn register_as_traits(mut cx: sealed::TraitRegisterContext<'_>) {
+            cx.register_as_trait::<dyn AntTrait>();
+        }
+
+        fn register_recursive(cx: &mut RegisterContext<'_>) {
+            AntDependencies::register(cx);
+        }
+
+        fn make(
+            _: &mut ProduceContext<'_>,
+            _: &mut ArgMatches,
+            _: ShutdownSignalParticipantCreator,
+            _: TaskRunningSentinel,
+        ) -> Result<(), Box<dyn Error>> {
+            unreachable!();
+        }
+
+        fn shared(_: &()) -> Arc<Self> {
+            unreachable!();
+        }
+
+        fn task(_: ()) -> Pin<Box<dyn Future<Output = Result<(), Box<dyn Error>>> + Send>> {
+            unreachable!();
+        }
+    }
+
+    impl sealed::ResourceBase<{ crate::ResourceVariety::Test as usize }> for Dec {
+        const NAME: &str = "Dec";
+        type Production = ();
+
+        fn register_as_traits(mut cx: sealed::TraitRegisterContext<'_>) {
+            cx.register_as_trait::<dyn DecTrait>();
+        }
+
+        fn register_recursive(cx: &mut RegisterContext<'_>) {
+            DecDependencies::register(cx);
+        }
+
+        fn make(
+            _: &mut ProduceContext<'_>,
+            _: &mut ArgMatches,
+            _: ShutdownSignalParticipantCreator,
+            _: TaskRunningSentinel,
+        ) -> Result<(), Box<dyn Error>> {
+            unreachable!();
+        }
+
+        fn shared(_: &()) -> Arc<Self> {
+            unreachable!();
+        }
+
+        fn task(_: ()) -> Pin<Box<dyn Future<Output = Result<(), Box<dyn Error>>> + Send>> {
+            unreachable!();
+        }
+    }
+
+    #[derive(ResourceDependencies)]
+    struct AntDecDependencies(#[allow(dead_code)] Arc<Ant>, #[allow(dead_code)] Arc<Dec>);
+
+    #[test]
+    fn cyclic_trait_resources() {
+        let Err(e) = Assembly::<AntDecDependencies>::new_from_argv(EMPTY) else {
+            panic!("Should have detected a cycle");
+        };
+        let _ = e.downcast::<CycleError>().expect("CycleError");
     }
 }

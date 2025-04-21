@@ -25,7 +25,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use crate::ResourceDependencies;
-use crate::assembly::sealed::ResourceBase;
+use crate::assembly::sealed::{ResourceBase, TraitRegisterContext};
 use crate::assembly::{ProduceContext, RegisterContext, ResourceFut};
 use crate::shutdown::{
     ShutdownSignalParticipant, ShutdownSignalParticipantCreator, TaskRunningSentinel,
@@ -119,6 +119,40 @@ impl AssemblyRuntime<'_> {
     }
 }
 
+#[doc(hidden)]
+pub struct TraitInstallerProduce<'a, 'b, 'c, R> {
+    cx: &'a mut ProduceContext<'c>,
+    shared: &'b Arc<R>,
+    resource: &'b TaskRunningSentinel,
+}
+
+#[doc(hidden)]
+pub enum TraitInstaller<'a, 'b, 'c, R> {
+    Register(TraitRegisterContext<'b>),
+    Produce(TraitInstallerProduce<'a, 'b, 'c, R>),
+}
+
+impl<R> TraitInstaller<'_, '_, '_, R> {
+    pub fn offer<T, F>(&mut self, factory: F)
+    where
+        T: std::any::Any + ?Sized,
+        F: FnOnce(&Arc<R>) -> Arc<T>,
+    {
+        match self {
+            Self::Register(cx) => cx.register_as_trait::<T>(),
+            Self::Produce(installer) => {
+                if let Some(trait_i) = installer.cx.get_trait_i::<T>() {
+                    if installer.resource.is_dependent_of(trait_i) {
+                        installer
+                            .cx
+                            .provide_as_trait(trait_i, factory(installer.shared));
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// The main unit of work in an [`Assembly`] and the trait common to each
 /// of the nodes in its DAG.
 ///
@@ -180,13 +214,36 @@ pub trait Resource: Send + Sync + Sized + 'static {
         args: Self::Args,
         api: &mut AssemblyRuntime<'_>,
     ) -> Result<Arc<Self>, Self::CreationError>;
+
+    /// Make this resource available to other resources that declare a
+    /// dependency on a trait object. This is used for one resource to
+    /// collect dependencies on all of the other resources in the
+    /// assembly that share some property (by implementins a trait).
+    /// By default, a resource is available to be declared as a
+    /// dependency under its own name only, not as any `dyn Trait`.
+    ///
+    /// To make this resource available as one or more trait objects,
+    /// see the [`resource`] attribute macro (which will supply an
+    /// appropriate definition for this method).
+    ///
+    /// To declare a dependency on a resource that makes itself available
+    /// in this way, see the [`ResourceDependencies`] derive macro.
+    ///
+    /// [`ResourceDependencies`]: crate::ResourceDependencies
+    fn provide_as_trait<'a>(_: &'a mut TraitInstaller<'_, 'a, '_, Self>) {}
 }
 
 /// An attribute macro that can be used to automatically supply definitions
 /// for the associated types and constant of a [`Resource`].
 ///
-/// Any definitions which are already supplied will nt be synthesised. This
+/// Any definitions which are already supplied will not be synthesised. This
 /// can be useful for example for overriding `NAME`.
+///
+/// An attribute like `#[export(dyn Trait)]` may be given zero or more times.
+/// This will cause the resource to be requestable as a dependency by other
+/// resources under its identity as an implementor of the given trait in
+/// addition to its own concrete type. See [`ResourceDependencies`] for
+/// how other resources can declare such a dependency.
 ///
 /// ```
 /// # struct SomeType;
@@ -194,9 +251,13 @@ pub trait Resource: Send + Sync + Sized + 'static {
 /// # type BB = comprehensive::NoArgs;
 /// # type CC = std::convert::Infallible;
 /// # use std::sync::Arc;
+/// # trait SharedTraitForResourcesOfSomeKind {}
 /// use comprehensive::v1::{AssemblyRuntime, Resource, resource};
 ///
+/// impl SharedTraitForResourcesOfSomeKind for SomeType {}
+///
 /// #[resource]
+/// #[export(dyn SharedTraitForResourcesOfSomeKind)]  // Optional
 /// impl Resource for SomeType {
 ///     // All of these definitions are synthesised since the types can all
 ///     // be inferred from the signature of the `new` method and the type name.
@@ -212,6 +273,8 @@ pub trait Resource: Send + Sync + Sized + 'static {
 ///     }
 /// }
 /// ```
+///
+/// [`ResourceDependencies`]: crate::ResourceDependencies
 pub use comprehensive_macros::v1resource as resource;
 
 pin_project! {
@@ -374,6 +437,11 @@ impl<T: Resource> ResourceBase<{ crate::ResourceVariety::V1 as usize }> for T {
         T::Args::augment_args(c)
     }
 
+    fn register_as_traits(cx: TraitRegisterContext<'_>) {
+        let mut installer = TraitInstaller::Register(cx);
+        T::provide_as_trait(&mut installer);
+    }
+
     fn make(
         cx: &mut ProduceContext<'_>,
         arg_matches: &mut clap::ArgMatches,
@@ -386,8 +454,15 @@ impl<T: Resource> ResourceBase<{ crate::ResourceVariety::V1 as usize }> for T {
             stoppers: Some(&mut stoppers),
             task: None,
         };
+        let shared = T::new(deps, args, &mut api).map_err(Into::into)?;
+        let mut installer = TraitInstaller::Produce(TraitInstallerProduce {
+            cx,
+            shared: &shared,
+            resource: &keepalive,
+        });
+        T::provide_as_trait(&mut installer);
         Ok(private::ResourceProduction {
-            shared: T::new(deps, args, &mut api).map_err(Into::into)?,
+            shared,
             task: api.task,
             auto_stop: api.stoppers.is_some(),
             stopper: stoppers.into_inner().unwrap(),
@@ -693,5 +768,55 @@ mod tests {
         let _ = tx.try_send(()).unwrap();
         // Does quit after the second.
         assert!(e.poll(&mut r).is_ready());
+    }
+
+    trait TestTrait1: Send + Sync {}
+
+    trait TestTrait2: Send + Sync {}
+
+    #[derive(ResourceDependencies)]
+    struct RequiresDynDependencies(Vec<Arc<dyn TestTrait1>>, Vec<Arc<dyn TestTrait2>>);
+
+    struct RequiresDyn(Vec<Arc<dyn TestTrait1>>, Vec<Arc<dyn TestTrait2>>);
+
+    #[resource]
+    impl Resource for RequiresDyn {
+        fn new(
+            d: RequiresDynDependencies,
+            _: NoArgs,
+            _: &mut AssemblyRuntime<'_>,
+        ) -> Result<Arc<Self>, std::convert::Infallible> {
+            Ok(Arc::new(Self(d.0, d.1)))
+        }
+    }
+
+    struct ProvidesDyn;
+
+    impl TestTrait1 for ProvidesDyn {}
+
+    impl TestTrait2 for ProvidesDyn {}
+
+    #[resource]
+    #[export(dyn TestTrait1)]
+    #[export(dyn TestTrait2)]
+    impl Resource for ProvidesDyn {
+        fn new(
+            _: NoDependencies,
+            _: NoArgs,
+            _: &mut AssemblyRuntime<'_>,
+        ) -> Result<Arc<Self>, std::convert::Infallible> {
+            Ok(Arc::new(Self))
+        }
+    }
+
+    #[derive(ResourceDependencies)]
+    struct RequiresDynTop(Arc<RequiresDyn>, Arc<ProvidesDyn>);
+
+    #[test]
+    fn dyn_resource() {
+        let assembly = Assembly::<RequiresDynTop>::new_from_argv(EMPTY).unwrap();
+        assert_eq!(assembly.top.0.0.len(), 1);
+        assert_eq!(assembly.top.0.1.len(), 1);
+        let _ = Arc::clone(&assembly.top.1);
     }
 }

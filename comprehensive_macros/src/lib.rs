@@ -13,10 +13,17 @@ use syn::{
     Path, PathArguments, Type, Visibility, parse_macro_input,
 };
 
-fn find_type_inside_arc(ty: &Type) -> Result<&Type, Span> {
+enum DependencyType<'a> {
+    Concrete(&'a Type),
+    Trait(&'a Type),
+}
+
+fn find_dependency_type(ty: &Type) -> Result<DependencyType<'_>, Span> {
+    // We are looking for either Arc<T> or Vec<Arc<dyn Tr>>.
     let Type::Path(path) = ty else {
         return Err(ty.span());
     };
+    // a = <T> or <Arc<dyn Tr>>
     let a = &path
         .path
         .segments
@@ -33,7 +40,31 @@ fn find_type_inside_arc(ty: &Type) -> Result<&Type, Span> {
     let GenericArgument::Type(ty) = generic else {
         return Err(generic.span());
     };
-    Ok(ty)
+    // ty = T or Arc<dyn Tr>
+    let Type::Path(path) = ty else {
+        return Ok(DependencyType::Concrete(ty));
+    };
+    Ok(path
+        .path
+        .segments
+        .last()
+        .and_then(|last| match last.arguments {
+            PathArguments::AngleBracketed(ref generics) => {
+                if generics.args.len() == 1 {
+                    match generics.args.first().unwrap() {
+                        GenericArgument::Type(ty) => match ty {
+                            Type::TraitObject(_) => Some(ty),
+                            _ => None,
+                        },
+                        _ => None,
+                    }
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        })
+        .map_or(DependencyType::Concrete(ty), DependencyType::Trait))
 }
 
 fn derive_r_d_struct(name: &Ident, generics: &Generics, fields: &Fields) -> TokenStream {
@@ -45,8 +76,8 @@ fn derive_r_d_struct(name: &Ident, generics: &Generics, fields: &Fields) -> Toke
         Fields::Unit => NO_FIELDS,
     }
     .iter()
-    .map(|f| match find_type_inside_arc(&f.ty) {
-        Ok(ty) => Ok(ty),
+    .map(|f| match find_dependency_type(&f.ty) {
+        Ok(dty) => Ok(dty),
         Err(span) => Err(quote_spanned! {
             span => compile_error!("ResourceDependencies type must be Arc<T>");
         }),
@@ -54,16 +85,25 @@ fn derive_r_d_struct(name: &Ident, generics: &Generics, fields: &Fields) -> Toke
     .collect::<Vec<_>>();
 
     let registrations = dep_types.iter().map(|r| match r {
-        Ok(ty) => quote! {
+        Ok(DependencyType::Concrete(ty)) => quote! {
             ::comprehensive::assembly::Registrar::< #ty >::register(cx);
+        },
+        Ok(DependencyType::Trait(ty)) => quote! {
+            cx.require_trait::< #ty >();
         },
         Err(ts) => ts.clone(),
     });
     let productions = dep_types.iter().enumerate().map(|(i, r)| match r {
-        Ok(ty) => {
+        Ok(DependencyType::Concrete(ty)) => {
             let temp = format_ident!("dep_{}", i);
             quote! {
                 let #temp = ::comprehensive::assembly::Registrar::< #ty >::produce(cx)?;
+            }
+        }
+        Ok(DependencyType::Trait(ty)) => {
+            let temp = format_ident!("dep_{}", i);
+            quote! {
+                let #temp = cx.produce_trait::< #ty >();
             }
         }
         Err(ts) => ts.clone(),
@@ -516,6 +556,17 @@ fn parse_v1resource_error_return_type(ty: &Type) -> Result<Option<Type>, TokenSt
     Ok(type_unless_self_colon_colon(err_ty))
 }
 
+enum OursNotOurs<A, B> {
+    Ours(A),
+    NotOurs(B),
+}
+
+impl<A, B> OursNotOurs<A, B> {
+    fn ours(&self) -> bool {
+        matches!(self, Self::Ours(_))
+    }
+}
+
 #[proc_macro_attribute]
 pub fn v1resource(
     _attr: proc_macro::TokenStream,
@@ -629,6 +680,43 @@ pub fn v1resource(
                 e.span() => type CreationError = #e ;
             }));
         }
+    }
+    let (ours, not_ours): (Vec<_>, Vec<_>) = block
+        .attrs
+        .into_iter()
+        .map(|a| {
+            if matches!(a.style, syn::AttrStyle::Outer) {
+                match a.meta {
+                    syn::Meta::List(l) if l.path.is_ident("export") => OursNotOurs::Ours(l),
+                    _ => OursNotOurs::NotOurs(a),
+                }
+            } else {
+                OursNotOurs::NotOurs(a)
+            }
+        })
+        .partition(|ono| ono.ours());
+    block.attrs = not_ours
+        .into_iter()
+        .filter_map(|ono| match ono {
+            OursNotOurs::Ours(_) => None,
+            OursNotOurs::NotOurs(v) => Some(v),
+        })
+        .collect();
+    let mut exports = ours.into_iter().filter_map(|ono| match ono {
+        OursNotOurs::Ours(l) => Some(match l.parse_args::<syn::Type>() {
+            Ok(ty) => quote_spanned! {
+                ty.span() => installer.offer(|s| ::std::sync::Arc::clone(s) as ::std::sync::Arc< #ty >);
+            },
+            Err(e) => e.to_compile_error(),
+        }),
+        OursNotOurs::NotOurs(_) => None,
+    }).peekable();
+    if exports.peek().is_some() {
+        block.items.push(syn::ImplItem::Verbatim(quote! {
+            fn provide_as_trait<'provide_as_trait>(installer: &'provide_as_trait mut ::comprehensive::v1::TraitInstaller<'_, 'provide_as_trait, '_, Self>) {
+                #( #exports )*
+            }
+        }));
     }
     for e in errors {
         block.items.push(syn::ImplItem::Verbatim(e));

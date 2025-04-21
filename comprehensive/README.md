@@ -31,7 +31,7 @@ a cluster (or other collective environment).
 
 # Status
 
-Comprehensive is still in early development. Many more features are planned.
+Comprehensive is still in development. Many more features are planned.
 
 # Examples
 

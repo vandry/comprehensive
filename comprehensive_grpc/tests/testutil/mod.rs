@@ -1,6 +1,8 @@
 use atomic_take::AtomicTake;
-use comprehensive::{NoArgs, NoDependencies, Resource, ResourceDependencies};
+use comprehensive::v1::{AssemblyRuntime, Resource, resource};
+use comprehensive::{AnyResource, NoArgs, NoDependencies, ResourceDependencies};
 use comprehensive_grpc::client::Channel;
+use std::marker::PhantomData;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr, TcpListener};
 use std::sync::{Arc, Mutex};
 use tokio::net::TcpStream;
@@ -41,20 +43,23 @@ pub async fn wait_until_serving(addr: &SocketAddr) {
     }
 }
 
-pub struct TestServer;
+pub struct HelloService;
 
-impl Resource for TestServer {
-    type Args = NoArgs;
-    type Dependencies = NoDependencies;
-    const NAME: &str = "TestServer";
-
-    fn new(_: NoDependencies, _: NoArgs) -> Result<Self, Box<dyn std::error::Error>> {
-        Ok(Self)
+#[resource]
+#[export_grpc(pb::comprehensive::test_server::TestServer)]
+#[proto_descriptor(pb::comprehensive::FILE_DESCRIPTOR_SET)]
+impl Resource for HelloService {
+    fn new(
+        _: NoDependencies,
+        _: NoArgs,
+        _: &mut AssemblyRuntime<'_>,
+    ) -> Result<Arc<Self>, std::convert::Infallible> {
+        Ok(Arc::new(Self))
     }
 }
 
 #[tonic::async_trait]
-impl pb::comprehensive::test_server::Test for TestServer {
+impl pb::comprehensive::test_server::Test for HelloService {
     async fn greet(
         &self,
         _: tonic::Request<()>,
@@ -65,54 +70,43 @@ impl pb::comprehensive::test_server::Test for TestServer {
     }
 }
 
-#[derive(comprehensive_grpc::GrpcService)]
-#[implementation(TestServer)]
-#[service(pb::comprehensive::test_server::TestServer)]
-#[descriptor(pb::comprehensive::FILE_DESCRIPTOR_SET)]
-pub struct HelloService;
-
-pub trait EndToEndClient: Resource + Send + Sync + 'static {
+pub trait EndToEndClient<const U: usize>: AnyResource<U> + Send + Sync + 'static {
     fn test_client(&self) -> pb::comprehensive::test_client::TestClient<Channel>;
 }
 
 #[derive(ResourceDependencies)]
-pub struct EndToEndTesterDependencies<T: EndToEndClient>(Arc<T>);
+pub struct EndToEndTesterDependencies<T: EndToEndClient<U>, const U: usize>(Arc<T>);
 
 type Msg = Result<tonic::Response<GreetResponse>, tonic::Status>;
 
-pub struct EndToEndTester<T: EndToEndClient> {
-    client: Arc<T>,
-    tx: AtomicTake<tokio::sync::oneshot::Sender<Msg>>,
+pub struct EndToEndTester<T: EndToEndClient<U>, const U: usize> {
     pub rx: AtomicTake<tokio::sync::oneshot::Receiver<Msg>>,
+    _t: PhantomData<T>,
 }
 
-impl<T: EndToEndClient> Resource for EndToEndTester<T> {
-    type Args = NoArgs;
-    type Dependencies = EndToEndTesterDependencies<T>;
-    const NAME: &str = "EndToEndTester";
-
+#[resource]
+impl<T: EndToEndClient<U>, const U: usize> Resource for EndToEndTester<T, U> {
     fn new(
-        d: EndToEndTesterDependencies<T>,
+        d: EndToEndTesterDependencies<T, U>,
         _: NoArgs,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
+        api: &mut AssemblyRuntime<'_>,
+    ) -> Result<Arc<Self>, std::convert::Infallible> {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        Ok(Self {
-            client: d.0,
-            tx: AtomicTake::new(tx),
+        api.set_task(async move {
+            let mut client = d.0.test_client();
+            let _ = tx.send(client.greet(()).await);
+            Ok(())
+        });
+        Ok(Arc::new(Self {
             rx: AtomicTake::new(rx),
-        })
-    }
-
-    async fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let mut client = self.client.test_client();
-        let tx = self.tx.take().unwrap();
-        let _ = tx.send(client.greet(()).await);
-        Ok(())
+            _t: PhantomData,
+        }))
     }
 }
 
 #[derive(ResourceDependencies)]
-pub struct EndToEnd<T: EndToEndClient> {
+pub struct EndToEnd<T: EndToEndClient<U>, const U: usize> {
     _s: Arc<HelloService>,
-    pub tester: Arc<EndToEndTester<T>>,
+    pub tester: Arc<EndToEndTester<T, U>>,
+    _server: Arc<comprehensive_grpc::server::GrpcServer>,
 }

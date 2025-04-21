@@ -1,4 +1,4 @@
-use comprehensive::{Assembly, ResourceDependencies};
+use comprehensive::{AnyResource, Assembly, ResourceDependencies};
 use comprehensive_grpc::client::{Channel, ClientWorker};
 use comprehensive_grpc::GrpcClient;
 use futures::future::Either;
@@ -18,7 +18,7 @@ use testutil::pb::comprehensive::test_client::TestClient;
 #[derive(GrpcClient)]
 struct SampleClient(TestClient<Channel>, ClientWorker);
 
-impl testutil::EndToEndClient for SampleClient {
+impl testutil::EndToEndClient<{ SampleClient::RESOURCE_VARIETY }> for SampleClient {
     fn test_client(&self) -> TestClient<Channel> {
         self.client()
     }
@@ -27,7 +27,7 @@ impl testutil::EndToEndClient for SampleClient {
 #[derive(ResourceDependencies)]
 struct CheckHealthAndMetricsTest {
     _diag: Arc<comprehensive::diag::HttpServer>,
-    tester: Arc<testutil::EndToEndTester<SampleClient>>,
+    tester: Arc<testutil::EndToEndTester<SampleClient, { SampleClient::RESOURCE_VARIETY }>>,
 }
 
 #[test_log::test(tokio::test)]

@@ -94,6 +94,10 @@ pub enum ResourceVariety {
 pub trait AnyResource<const T: usize>: assembly::sealed::ResourceBase<T> {
     /// The name of this resource. Used in logs and diagnostics.
     const NAME: &str;
+    /// The const generic parameter of this Resource. Occasionally
+    /// necessary for hinting whicg variety of Resource is being supplied
+    /// to meet a `T: AnyResource<U>` bound.
+    const RESOURCE_VARIETY: usize = T;
 }
 
 /// Error type returned by various Comprehensive functions

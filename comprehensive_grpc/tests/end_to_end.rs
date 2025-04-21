@@ -1,18 +1,18 @@
-use comprehensive::Assembly;
-use comprehensive_grpc::client::{Channel, ClientWorker};
+use comprehensive::{AnyResource, Assembly};
 use comprehensive_grpc::GrpcClient;
+use comprehensive_grpc::client::{Channel, ClientWorker};
 use futures::FutureExt;
 
 pub mod testutil;
 
-use testutil::pb::comprehensive::test_client::TestClient;
 use testutil::EndToEnd;
+use testutil::pb::comprehensive::test_client::TestClient;
 
 #[derive(GrpcClient)]
 #[no_propagate_health]
 struct Client(TestClient<Channel>, ClientWorker);
 
-impl testutil::EndToEndClient for Client {
+impl testutil::EndToEndClient<{ Client::RESOURCE_VARIETY }> for Client {
     fn test_client(&self) -> TestClient<Channel> {
         self.client()
     }
@@ -28,7 +28,8 @@ async fn end_to_end() {
         format!("--client-uri=http://[::1]:{}/", port).into(),
     ];
     let _ = tokio_rustls::rustls::crypto::aws_lc_rs::default_provider().install_default();
-    let a = Assembly::<EndToEnd<Client>>::new_from_argv(argv).unwrap();
+    let a =
+        Assembly::<EndToEnd<Client, { Client::RESOURCE_VARIETY }>>::new_from_argv(argv).unwrap();
     let tester_rx = a.top.tester.rx.take().unwrap();
 
     let (term_tx, term_rx) = tokio::sync::oneshot::channel();

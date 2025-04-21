@@ -218,6 +218,8 @@ fn derive_grpc_service_internal(
     })
 }
 
+/// This macro is obsolete after GrpcService was converted to expect
+/// [`comprehensive::v1::Resource`].
 #[proc_macro_derive(GrpcService, attributes(implementation, service, descriptor))]
 pub fn derive_grpc_service(item: proc_macro::TokenStream) -> proc_macro::TokenStream {
     let input: DeriveInput = parse_macro_input!(item);
@@ -556,14 +558,16 @@ fn parse_v1resource_error_return_type(ty: &Type) -> Result<Option<Type>, TokenSt
     Ok(type_unless_self_colon_colon(err_ty))
 }
 
-enum OursNotOurs<A, B> {
-    Ours(A),
-    NotOurs(B),
+enum ExportType<A, B, C, D> {
+    General(A),
+    Grpc(B),
+    ProtoDescriptor(C),
+    NotOurs(D),
 }
 
-impl<A, B> OursNotOurs<A, B> {
+impl<A, B, C, D> ExportType<A, B, C, D> {
     fn ours(&self) -> bool {
-        matches!(self, Self::Ours(_))
+        !matches!(self, Self::NotOurs(_))
     }
 }
 
@@ -687,29 +691,80 @@ pub fn v1resource(
         .map(|a| {
             if matches!(a.style, syn::AttrStyle::Outer) {
                 match a.meta {
-                    syn::Meta::List(l) if l.path.is_ident("export") => OursNotOurs::Ours(l),
-                    _ => OursNotOurs::NotOurs(a),
+                    syn::Meta::List(ref l) => {
+                        if l.path.is_ident("export") {
+                            ExportType::General(l.parse_args::<Type>())
+                        } else if l.path.is_ident("export_grpc") {
+                            ExportType::Grpc(l.parse_args::<Path>())
+                        } else if l.path.is_ident("proto_descriptor") {
+                            ExportType::ProtoDescriptor(l.parse_args::<syn::Expr>())
+                        } else {
+                            ExportType::NotOurs(a)
+                        }
+                    }
+                    _ => ExportType::NotOurs(a),
                 }
             } else {
-                OursNotOurs::NotOurs(a)
+                ExportType::NotOurs(a)
             }
         })
         .partition(|ono| ono.ours());
     block.attrs = not_ours
         .into_iter()
         .filter_map(|ono| match ono {
-            OursNotOurs::Ours(_) => None,
-            OursNotOurs::NotOurs(v) => Some(v),
+            ExportType::NotOurs(v) => Some(v),
+            _ => None,
         })
         .collect();
+    let mut grpc_exports = ours
+        .iter()
+        .filter_map(|ono| match ono {
+            ExportType::Grpc(Ok(pa)) => Some(quote_spanned! {
+                pa.span() => server.add_service( #pa ::from_arc(self))?;
+            }),
+            _ => None,
+        })
+        .peekable();
+    let mut grpc_descriptors = ours
+        .iter()
+        .filter_map(|ono| match ono {
+            ExportType::ProtoDescriptor(Ok(ex)) => Some(quote_spanned! {
+                ex.span() => server.register_encoded_file_descriptor_set( #ex );
+            }),
+            _ => None,
+        })
+        .peekable();
+    let grpc_derive = if grpc_exports.peek().is_some() || grpc_descriptors.peek().is_some() {
+        let (impl_generics, ty_generics, where_clause) = block.generics.split_for_impl();
+        let self_ty = &block.self_ty;
+        Some(quote! {
+            #[automatically_derived]
+            impl #impl_generics ::comprehensive_grpc::GrpcService for #self_ty #ty_generics #where_clause {
+                fn add_to_server(
+                    self: Arc<Self>,
+                    server: &mut ::comprehensive_grpc::server::GrpcServiceAdder,
+                ) -> Result<(), ::comprehensive_grpc::ComprehensiveGrpcError> {
+                    #( #grpc_descriptors )*
+                    #( #grpc_exports )*
+                    Ok(())
+                }
+            }
+        })
+    } else {
+        None
+    };
     let mut exports = ours.into_iter().filter_map(|ono| match ono {
-        OursNotOurs::Ours(l) => Some(match l.parse_args::<syn::Type>() {
-            Ok(ty) => quote_spanned! {
-                ty.span() => installer.offer(|s| ::std::sync::Arc::clone(s) as ::std::sync::Arc< #ty >);
-            },
-            Err(e) => e.to_compile_error(),
+        ExportType::General(Ok(ty)) => Some(quote_spanned! {
+            ty.span() => installer.offer(|s| ::std::sync::Arc::clone(s) as ::std::sync::Arc< #ty >);
         }),
-        OursNotOurs::NotOurs(_) => None,
+        ExportType::General(Err(e)) => Some(e.to_compile_error()),
+        ExportType::Grpc(Ok(pa)) => Some(quote_spanned! {
+            pa.span() => installer.offer(|s| ::std::sync::Arc::clone(s) as ::std::sync::Arc<dyn ::comprehensive_grpc::GrpcService>);
+        }),
+        ExportType::Grpc(Err(e)) => Some(e.to_compile_error()),
+        ExportType::ProtoDescriptor(Ok(_)) => None,
+        ExportType::ProtoDescriptor(Err(e)) => Some(e.to_compile_error()),
+        ExportType::NotOurs(_) => None,
     }).peekable();
     if exports.peek().is_some() {
         block.items.push(syn::ImplItem::Verbatim(quote! {
@@ -721,5 +776,9 @@ pub fn v1resource(
     for e in errors {
         block.items.push(syn::ImplItem::Verbatim(e));
     }
-    block.into_token_stream().into()
+    let mut ts = block.into_token_stream();
+    if let Some(d) = grpc_derive {
+        ts.extend(d);
+    }
+    ts.into()
 }

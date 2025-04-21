@@ -1,11 +1,11 @@
-use comprehensive::{NoDependencies, Resource, ResourceDependencies};
-use comprehensive_grpc::GrpcService;
+use comprehensive::v1::{AssemblyRuntime, Resource, resource};
+use comprehensive::{NoDependencies, ResourceDependencies};
+use std::sync::Arc;
 
 // Generated protobufs for gRPC
 mod pb {
     tonic::include_proto!("comprehensive");
-    pub const FILE_DESCRIPTOR_SET: &[u8] =
-        tonic::include_file_descriptor_set!("fdset");
+    pub const FILE_DESCRIPTOR_SET: &[u8] = tonic::include_file_descriptor_set!("fdset");
 }
 
 #[derive(clap::Args, Debug)]
@@ -14,40 +14,42 @@ struct ServiceImplementationArgs {
     app_flag: Option<String>,
 }
 
-struct ServiceImplementation;
+struct TestService;
 
-impl Resource for ServiceImplementation {
-    type Args = ServiceImplementationArgs;
-    type Dependencies = NoDependencies;
-    const NAME: &str = "gRPC service implementation";
-
-    fn new(_: NoDependencies, args: ServiceImplementationArgs) -> Result<Self, Box<dyn std::error::Error>> {
+#[resource]
+#[export_grpc(pb::test_server::TestServer)]
+#[proto_descriptor(pb::FILE_DESCRIPTOR_SET)]
+impl Resource for TestService {
+    fn new(
+        _: NoDependencies,
+        args: ServiceImplementationArgs,
+        _: &mut AssemblyRuntime<'_>,
+    ) -> Result<Arc<Self>, std::convert::Infallible> {
         if let Some(app_flag) = args.app_flag {
             println!("Got --app_flag={}", app_flag);
         }
-        Ok(Self)
+        Ok(Arc::new(Self))
     }
 }
 
 #[tonic::async_trait]
-impl pb::test_server::Test for ServiceImplementation {
-    async fn greet(&self, _: tonic::Request<()>) -> Result<tonic::Response<pb::GreetResponse>, tonic::Status> {
+impl pb::test_server::Test for TestService {
+    async fn greet(
+        &self,
+        _: tonic::Request<()>,
+    ) -> Result<tonic::Response<pb::GreetResponse>, tonic::Status> {
         Ok(tonic::Response::new(pb::GreetResponse::default()))
     }
 }
 
-#[derive(GrpcService)]
-#[implementation(ServiceImplementation)]
-#[service(pb::test_server::TestServer)]
-#[descriptor(pb::FILE_DESCRIPTOR_SET)]
-struct TestService;
-
 #[derive(ResourceDependencies)]
 struct TopDependencies {
+    // Request a server (HTTPS or HTTP or both) to run.
+    _server: Arc<comprehensive_grpc::server::GrpcServer>,
     // Including this causes the gRPC server to run.
-    _test_service: std::sync::Arc<TestService>,
+    _test_service: Arc<TestService>,
     // Serves metrics!
-    _diag: std::sync::Arc<comprehensive::diag::HttpServer>,
+    _diag: Arc<comprehensive::diag::HttpServer>,
 }
 
 #[tokio::main]
@@ -59,6 +61,8 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Will start a gRPC server with or without TLS depending on flags,
     // with extra features such as server reflection, and also serve
     // HTTP and/or HTTPS (again, depending on flags) at least for metrics.
-    comprehensive::Assembly::<TopDependencies>::new()?.run().await?;
+    comprehensive::Assembly::<TopDependencies>::new()?
+        .run()
+        .await?;
     Ok(())
 }

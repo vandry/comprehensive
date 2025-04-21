@@ -1,5 +1,6 @@
-use comprehensive::{NoArgs, Resource, ResourceDependencies};
-use comprehensive_grpc::{GrpcServer, GrpcService};
+use comprehensive::v1::{AssemblyRuntime, Resource, resource};
+use comprehensive::{NoArgs, NoDependencies, ResourceDependencies};
+use comprehensive_grpc::server::GrpcServer;
 use futures::FutureExt;
 use std::ffi::OsString;
 use std::future::Future;
@@ -9,10 +10,10 @@ use std::sync::Arc;
 use tokio_rustls::rustls;
 #[cfg(feature = "tls")]
 use tonic::transport::{Certificate, ClientTlsConfig};
-use tonic_health::pb::{health_check_response, health_client, HealthCheckRequest};
+use tonic_health::pb::{HealthCheckRequest, health_check_response, health_client};
 use tonic_reflection::pb::v1::{
-    server_reflection_client, server_reflection_request, server_reflection_response,
-    ServerReflectionRequest,
+    ServerReflectionRequest, server_reflection_client, server_reflection_request,
+    server_reflection_response,
 };
 
 pub mod testutil;
@@ -114,10 +115,12 @@ async fn check_health(channel: tonic::transport::Channel) {
 async fn nothing_enabled() {
     let argv = vec!["cmd"];
     let assembly = comprehensive::Assembly::<JustAServer>::new_from_argv(argv).unwrap();
-    assert!(assembly
-        .run_with_termination_signal(futures::stream::pending())
-        .await
-        .is_ok());
+    assert!(
+        assembly
+            .run_with_termination_signal(futures::stream::pending())
+            .await
+            .is_ok()
+    );
 }
 
 #[tokio::test]
@@ -160,7 +163,7 @@ async fn check_greeter(channel: tonic::transport::Channel) {
 }
 
 #[derive(ResourceDependencies)]
-struct OwnServer(Arc<testutil::HelloService>);
+struct OwnServer(Arc<testutil::HelloService>, Arc<GrpcServer>);
 
 #[tokio::test]
 async fn grpc_own_service() {
@@ -168,6 +171,7 @@ async fn grpc_own_service() {
     let argv = test_args(Some(port), None);
     let assembly = comprehensive::Assembly::<OwnServer>::new_from_argv(argv).unwrap();
     let _ = assembly.top.0;
+    let _ = assembly.top.1;
     plain_grpc_run(
         assembly,
         ([0, 0, 0, 0, 0, 0, 0, 1], port).into(),
@@ -176,14 +180,77 @@ async fn grpc_own_service() {
     .await
 }
 
-#[derive(GrpcService)]
-#[implementation(testutil::TestServer)]
-#[service(testutil::pb::comprehensive::test_server::TestServer)]
-struct NoDescriptorService;
+pub struct NoDescriptorService;
+
+#[resource]
+#[export_grpc(testutil::pb::comprehensive::test_server::TestServer)]
+impl Resource for NoDescriptorService {
+    fn new(
+        _: NoDependencies,
+        _: NoArgs,
+        _: &mut AssemblyRuntime<'_>,
+    ) -> Result<Arc<Self>, std::convert::Infallible> {
+        Ok(Arc::new(Self))
+    }
+}
+
+#[tonic::async_trait]
+impl testutil::pb::comprehensive::test_server::Test for NoDescriptorService {
+    async fn greet(
+        &self,
+        _: tonic::Request<()>,
+    ) -> Result<tonic::Response<testutil::pb::comprehensive::GreetResponse>, tonic::Status> {
+        Ok(tonic::Response::new(
+            testutil::pb::comprehensive::GreetResponse {
+                message: Some(String::from("hello")),
+            },
+        ))
+    }
+}
+
+pub struct NoDescriptorButOverriddenService;
+
+#[resource]
+#[export(dyn comprehensive_grpc::GrpcService)]
+impl Resource for NoDescriptorButOverriddenService {
+    fn new(
+        _: NoDependencies,
+        _: NoArgs,
+        _: &mut AssemblyRuntime<'_>,
+    ) -> Result<Arc<Self>, std::convert::Infallible> {
+        Ok(Arc::new(Self))
+    }
+}
+
+impl comprehensive_grpc::GrpcService for NoDescriptorButOverriddenService {
+    fn add_to_server(
+        self: Arc<Self>,
+        server: &mut comprehensive_grpc::server::GrpcServiceAdder,
+    ) -> Result<(), comprehensive_grpc::ComprehensiveGrpcError> {
+        // Disabling reflection is poorly supported right now, but if you
+        // really want to do it, this is how.
+        server.disable_grpc_reflection();
+        server.add_service(testutil::pb::comprehensive::test_server::TestServer::from_arc(self))
+    }
+}
+
+#[tonic::async_trait]
+impl testutil::pb::comprehensive::test_server::Test for NoDescriptorButOverriddenService {
+    async fn greet(
+        &self,
+        _: tonic::Request<()>,
+    ) -> Result<tonic::Response<testutil::pb::comprehensive::GreetResponse>, tonic::Status> {
+        Ok(tonic::Response::new(
+            testutil::pb::comprehensive::GreetResponse {
+                message: Some(String::from("hello")),
+            },
+        ))
+    }
+}
 
 #[derive(ResourceDependencies)]
 #[allow(dead_code)]
-struct OwnBrokenServer(Arc<NoDescriptorService>);
+struct OwnBrokenServer(Arc<NoDescriptorService>, Arc<GrpcServer>);
 
 #[tokio::test]
 async fn fails_to_configure_without_descriptor() {
@@ -215,26 +282,7 @@ async fn check_no_reflection(channel: tonic::transport::Channel) {
 }
 
 #[derive(ResourceDependencies)]
-struct DisableReflectionDependencies(Arc<GrpcServer>);
-
-struct DisableReflection;
-
-impl Resource for DisableReflection {
-    type Args = NoArgs;
-    type Dependencies = DisableReflectionDependencies;
-    const NAME: &str = "Relies on deterministic init order to disable reflection";
-
-    fn new(
-        d: DisableReflectionDependencies,
-        _: NoArgs,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
-        d.0.disable_grpc_reflection();
-        Ok(Self)
-    }
-}
-
-#[derive(ResourceDependencies)]
-struct NoReflectionServer(Arc<DisableReflection>, Arc<NoDescriptorService>);
+struct NoReflectionServer(Arc<GrpcServer>, Arc<NoDescriptorButOverriddenService>);
 
 #[tokio::test]
 async fn without_reflection() {

@@ -6,9 +6,9 @@
 //!
 //! # Client Usage
 //!
-//! Define a struct containing a [`tonic`] client wrapped around a channel and
-//! worker, and derive [`GrpcClient`] on it. This will become a
-//! [`comprehensive::Resource`] that can be depended upon. Call `.client()`
+//! Define a struct containing a [`tonic`] client wrapped around a channel
+//! and derive [`GrpcClient`] on it. This will become a
+//! [`comprehensive::v1::Resource`] that can be depended upon. Call `.client()`
 //! to get a (cheap) clone of the gRPC client.
 //!
 //! ```
@@ -16,12 +16,11 @@
 //! #     tonic::include_proto!("comprehensive");
 //! # }
 //! use comprehensive_grpc::GrpcClient;
-//! use comprehensive_grpc::client::{Channel, ClientWorker};
+//! use comprehensive_grpc::client::Channel;
 //!
 //! #[derive(GrpcClient)]
 //! struct MyClientResource(
 //!     pb::test_client::TestClient<Channel>,
-//!     ClientWorker
 //! );
 //!
 //! struct OtherResourceThatConsumesClient {

@@ -1,6 +1,6 @@
 [package]
 name = "comprehensive_grpc"
-version = "0.6.0"
+version = "0.6.1"
 edition = "2024"
 repository = "https://github.com/vandry/comprehensive.git"
 homepage = "https://github.com/vandry/comprehensive"
@@ -17,7 +17,7 @@ clap = { version = "4.5", features = ["derive"] }
 clap_builder = { version = "4.5", features = ["string"] }
 comprehensive = { path = "../comprehensive", version = "0.5.1" }
 comprehensive_dns = { path = "../comprehensive_dns", version = "0.1" }
-comprehensive_macros = { path = "../comprehensive_macros", version = "0.4.4" }
+comprehensive_macros = { path = "../comprehensive_macros", version = "0.4.5" }
 futures = "0.3"
 http = "1.1"
 humantime = "2.1"

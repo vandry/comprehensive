@@ -380,7 +380,7 @@ fn client_type(ty: &Type) -> Result<(bool, &Path), Span> {
     Ok((false, path1))
 }
 
-fn derive_struct(
+fn derive_grpc_client_struct(
     vis: &Visibility,
     name: &Ident,
     generics: &Generics,
@@ -438,24 +438,80 @@ fn derive_struct(
             client_type.to_token_stream(),
         )
     };
-    let (builder, get0, get1) = match client_field.ident {
+    let worker_field = fields_it.next();
+    let (builder, get0, maybe_get1) = match client_field.ident {
         None => (
-            quote_spanned! { fields.span() => Self( #producer , worker ) },
+            if worker_field.is_some() {
+                quote_spanned! { fields.span() => Self( #producer , worker ) }
+            } else {
+                quote_spanned! { fields.span() => Self( #producer ) }
+            },
             quote! { self.0 },
-            quote! { self.1 },
+            worker_field.map(|_| quote! { self.1 }),
         ),
         Some(ref client_field_name) => {
-            let worker_field_name = fields_it.next().unwrap().ident.as_ref().unwrap();
-            (
-                quote_spanned! {
-                    fields.span() => Self {
-                        #client_field_name : #producer ,
-                        #worker_field_name : worker,
-                    }
-                },
-                quote! { self. #client_field_name },
-                quote! { self. #worker_field_name },
-            )
+            if let Some(f) = worker_field {
+                let worker_field_name = f.ident.as_ref().unwrap();
+                (
+                    quote_spanned! {
+                        fields.span() => Self {
+                            #client_field_name : #producer ,
+                            #worker_field_name : worker,
+                        }
+                    },
+                    quote! { self. #client_field_name },
+                    Some(quote! { self. #worker_field_name }),
+                )
+            } else {
+                (
+                    quote_spanned! {
+                        fields.span() => Self {
+                            #client_field_name : #producer ,
+                        }
+                    },
+                    quote! { self. #client_field_name },
+                    None,
+                )
+            }
+        }
+    };
+
+    let resource = if let Some(get1) = maybe_get1 {
+        quote! {
+            impl #impl_generics ::comprehensive::Resource for #name #ty_generics #where_clause {
+                type Args = ::comprehensive_grpc::client::GrpcClientArgs<Self>;
+                type Dependencies = ::comprehensive_grpc::client::GRPCClientDependencies;
+                const NAME: &'static str = #name_lit ;
+
+                fn new(d: ::comprehensive_grpc::client::GRPCClientDependencies, a: ::comprehensive_grpc::client::GrpcClientArgs<Self>) -> ::std::result::Result<Self, ::std::boxed::Box<dyn ::std::error::Error>> {
+                    let (param, worker) = ::comprehensive_grpc::client::new(a, #label , #propagate_health , d)?;
+                    Ok( #builder )
+                }
+
+                async fn run(&self) -> ::std::result::Result<(), ::std::boxed::Box<dyn ::std::error::Error>> {
+                    #get1 .go().await;
+                    Ok(())
+                }
+            }
+        }
+    } else {
+        quote! {
+            impl #impl_generics ::comprehensive::v1::Resource for #name #ty_generics #where_clause {
+                type Args = ::comprehensive_grpc::client::GrpcClientArgs<Self>;
+                type Dependencies = ::comprehensive_grpc::client::GRPCClientDependencies;
+                type CreationError = ::std::boxed::Box<dyn ::std::error::Error>;
+                const NAME: &'static str = #name_lit ;
+
+                fn new(
+                    d: ::comprehensive_grpc::client::GRPCClientDependencies,
+                    a: ::comprehensive_grpc::client::GrpcClientArgs<Self>,
+                    api: &mut ::comprehensive::v1::AssemblyRuntime<'_>,
+                ) -> ::std::result::Result<::std::sync::Arc<Self>, ::std::boxed::Box<dyn ::std::error::Error>> {
+                    let (param, worker) = ::comprehensive_grpc::client::new(a, #label , #propagate_health , d)?;
+                    api.set_task(async move { worker.go().await; Ok(()) });
+                    Ok(::std::sync::Arc::new( #builder ))
+                }
+            }
         }
     };
 
@@ -467,21 +523,7 @@ fn derive_struct(
         }
 
         #[automatically_derived]
-        impl #impl_generics ::comprehensive::Resource for #name #ty_generics #where_clause {
-            type Args = ::comprehensive_grpc::client::GrpcClientArgs<Self>;
-            type Dependencies = ::comprehensive_grpc::client::GRPCClientDependencies;
-            const NAME: &'static str = #name_lit ;
-
-            fn new(d: ::comprehensive_grpc::client::GRPCClientDependencies, a: ::comprehensive_grpc::client::GrpcClientArgs<Self>) -> ::std::result::Result<Self, ::std::boxed::Box<dyn ::std::error::Error>> {
-                let (param, worker) = ::comprehensive_grpc::client::new(a, #label , #propagate_health , d)?;
-                Ok( #builder )
-            }
-
-            async fn run(&self) -> ::std::result::Result<(), ::std::boxed::Box<dyn ::std::error::Error>> {
-                #get1 .go().await;
-                Ok(())
-            }
-        }
+        #resource
 
         #[automatically_derived]
         impl #impl_generics #name #ty_generics #where_clause {
@@ -496,9 +538,9 @@ fn derive_struct(
 pub fn derive_grpc_client(item: proc_macro::TokenStream) -> proc_macro::TokenStream {
     let input: DeriveInput = parse_macro_input!(item);
     match input.data {
-        Data::Struct(ref s) if s.fields.len() == 2 => derive_struct(&input.vis, &input.ident, &input.generics, &s.fields, &input.attrs),
+        Data::Struct(ref s) if s.fields.len() <= 2 => derive_grpc_client_struct(&input.vis, &input.ident, &input.generics, &s.fields, &input.attrs),
         _ => quote_spanned! {
-            input.span() => compile_error!("`#[derive(GrpcClient)]` requires a struct with exactly 2 fields");
+            input.span() => compile_error!("`#[derive(GrpcClient)]` requires a struct with exactly 1 field (or 2, for backward compatibility");
         },
     }
     .into()

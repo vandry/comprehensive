@@ -1,6 +1,6 @@
 use comprehensive::{AnyResource, Assembly};
 use comprehensive_grpc::GrpcClient;
-use comprehensive_grpc::client::{Channel, ClientWorker};
+use comprehensive_grpc::client::Channel;
 use futures::FutureExt;
 
 pub mod testutil;
@@ -10,7 +10,7 @@ use testutil::pb::comprehensive::test_client::TestClient;
 
 #[derive(GrpcClient)]
 #[no_propagate_health]
-struct Client(TestClient<Channel>, ClientWorker);
+struct Client(TestClient<Channel>);
 
 impl testutil::EndToEndClient<{ Client::RESOURCE_VARIETY }> for Client {
     fn test_client(&self) -> TestClient<Channel> {

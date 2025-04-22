@@ -1,4 +1,5 @@
-use comprehensive::{Resource, ResourceDependencies};
+use comprehensive::ResourceDependencies;
+use comprehensive::v1::{AssemblyRuntime, Resource, resource};
 use comprehensive_grpc::GrpcClient;
 use std::sync::Arc;
 use std::time::Duration;
@@ -9,15 +10,9 @@ mod pb {
 }
 
 #[derive(GrpcClient)]
-struct Client(
-    pb::test_client::TestClient<comprehensive_grpc::client::Channel>,
-    comprehensive_grpc::client::ClientWorker,
-);
+struct Client(pb::test_client::TestClient<comprehensive_grpc::client::Channel>);
 
-struct GreeterInALoop {
-    client: Arc<Client>,
-    greet_interval: Duration,
-}
+struct GreeterInALoop;
 
 #[derive(clap::Args)]
 struct GreeterInALoopArgs {
@@ -28,27 +23,21 @@ struct GreeterInALoopArgs {
 #[derive(ResourceDependencies)]
 struct GreeterInALoopDependencies(Arc<Client>);
 
+#[resource]
 impl Resource for GreeterInALoop {
-    type Args = GreeterInALoopArgs;
-    type Dependencies = GreeterInALoopDependencies;
-    const NAME: &str = "GreeterInALoop";
-
     fn new(
         d: GreeterInALoopDependencies,
         a: GreeterInALoopArgs,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
-        Ok(Self {
-            client: d.0,
-            greet_interval: a.greet_interval,
-        })
-    }
-
-    async fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let mut client = self.client.client();
-        loop {
-            println!("{:?}", client.greet(tonic::Request::new(())).await);
-            tokio::time::sleep(self.greet_interval).await;
-        }
+        api: &mut AssemblyRuntime<'_>,
+    ) -> Result<Arc<Self>, std::convert::Infallible> {
+        let mut client = d.0.client();
+        api.set_task(async move {
+            loop {
+                println!("{:?}", client.greet(tonic::Request::new(())).await);
+                tokio::time::sleep(a.greet_interval).await;
+            }
+        });
+        Ok(Arc::new(Self))
     }
 }
 

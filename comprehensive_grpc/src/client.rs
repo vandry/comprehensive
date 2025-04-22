@@ -1,17 +1,16 @@
 //! gRPC client support
 //!
-//! To use gRPC clients in Comprehensive, define a struct with exactly 2 fields:
+//! To use gRPC clients in Comprehensive, define a struct with exactly 1 field:
+//! a [`tonic`] gRPC client type, parameterised with [`Channel`].
 //!
-//! 1. A [`tonic`] gRPC client type, parameterised with [`Channel`]
-//!    - This client may be wrapped in an [`Option`].
-//!      - If it is, then the client is considered optional and will
-//!        be [`Some`] only if a URI for it is given on the command line.
-//!      - If it is not, then the client is considered required and
-//!        the program will fail at startup unless a URI for it is given.
-//! 2. A second field with the type [`ClientWorker`].
+//! This field may be wrapped in an [`Option`].
+//!   - If it is, then the client is considered optional and will
+//!     be [`Some`] only if a URI for it is given on the command line.
+//!   - If it is not, then the client is considered required and
+//!     the program will fail at startup unless a URI for it is given.
 //!
 //! The struct may have either named or unnamed fields, it doesn't matter.
-//! Neither field will be accessed directly by user code.
+//! The field will not be accessed directly by user code.
 //!
 //! `#[derive(GrpcClient)]` on the struct.
 //!
@@ -24,12 +23,11 @@
 //! #     tonic::include_proto!("comprehensive");
 //! # }
 //! use comprehensive_grpc::GrpcClient;
-//! use comprehensive_grpc::client::{Channel, ClientWorker};
+//! use comprehensive_grpc::client::Channel;
 //!
 //! #[derive(GrpcClient)]
 //! struct MyClientResource(
 //!     pb::test_client::TestClient<Channel>,
-//!     ClientWorker
 //! );
 //! ```
 
@@ -414,22 +412,69 @@ mod tests {
     use pb::comprehensive::test_client::TestClient;
 
     #[derive(GrpcClient)]
-    struct OptionalTupleStruct(Option<TestClient<Channel>>, ClientWorker);
+    struct OptionalTupleStructV0(Option<TestClient<Channel>>, ClientWorker);
 
     #[derive(GrpcClient)]
     #[no_propagate_health]
-    struct RequiredTupleStruct(TestClient<Channel>, ClientWorker);
+    struct RequiredTupleStructV0(TestClient<Channel>, ClientWorker);
 
     #[derive(GrpcClient)]
-    struct OptionalNamedStruct {
+    struct OptionalNamedStructV0 {
         client: Option<TestClient<Channel>>,
         worker: ClientWorker,
     }
 
     #[derive(GrpcClient)]
-    struct RequiredNamedStruct {
+    struct RequiredNamedStructV0 {
         field_names: TestClient<Channel>,
         dont_matter: ClientWorker,
+    }
+
+    #[derive(ResourceDependencies)]
+    struct TestClientsV0 {
+        optional_tuple_struct: Arc<OptionalTupleStructV0>,
+        required_tuple_struct: Arc<RequiredTupleStructV0>,
+        optional_named_struct: Arc<OptionalNamedStructV0>,
+        required_named_struct: Arc<RequiredNamedStructV0>,
+    }
+
+    #[test]
+    fn create_clients_v0() {
+        let argv: Vec<std::ffi::OsString> = vec![
+            "argv0".into(),
+            "--required-tuple-struct-v-0-uri=http://localhost/".into(),
+            "--required-named-struct-v-0-uri=http://localhost/".into(),
+            "--optional-named-struct-v-0-uri=http://localhost/".into(),
+        ];
+        let _ = tokio_rustls::rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let a = comprehensive::Assembly::<TestClientsV0>::new_from_argv(argv).unwrap();
+
+        let c1: Option<TestClient<Channel>> = a.top.optional_tuple_struct.client();
+        let mut c2: TestClient<Channel> = a.top.required_tuple_struct.client();
+        let c3: Option<TestClient<Channel>> = a.top.optional_named_struct.client();
+        let mut c4: TestClient<Channel> = a.top.required_named_struct.client();
+
+        assert!(c1.is_none());
+        let _ = c2.greet(());
+        let _ = c3.unwrap().greet(());
+        let _ = c4.greet(());
+    }
+
+    #[derive(GrpcClient)]
+    struct OptionalTupleStruct(Option<TestClient<Channel>>);
+
+    #[derive(GrpcClient)]
+    #[no_propagate_health]
+    struct RequiredTupleStruct(TestClient<Channel>);
+
+    #[derive(GrpcClient)]
+    struct OptionalNamedStruct {
+        client: Option<TestClient<Channel>>,
+    }
+
+    #[derive(GrpcClient)]
+    struct RequiredNamedStruct {
+        field_names: TestClient<Channel>,
     }
 
     #[derive(ResourceDependencies)]
@@ -440,8 +485,8 @@ mod tests {
         required_named_struct: Arc<RequiredNamedStruct>,
     }
 
-    #[tokio::test]
-    async fn create_clients() {
+    #[test]
+    fn create_clients_v1() {
         let argv: Vec<std::ffi::OsString> = vec![
             "argv0".into(),
             "--required-tuple-struct-uri=http://localhost/".into(),

@@ -17,8 +17,10 @@
 //! ```
 //! use axum::Router;
 //! use axum::response::IntoResponse;
-//! use comprehensive::{NoArgs, NoDependencies, Resource, ResourceDependencies};
+//! use comprehensive::{NoArgs, NoDependencies, ResourceDependencies};
+//! use comprehensive::v1::{AssemblyRuntime, Resource, resource};
 //! use comprehensive::http::{HttpServer, HttpServingInstance};
+//! use std::sync::Arc;
 //!
 //! async fn demo_page() -> impl axum::response::IntoResponse {
 //!     "hello".into_response()
@@ -28,15 +30,18 @@
 //! #[flag_prefix = "foo-"]
 //! pub struct FooServer(#[router] Router);
 //!
+//! #[resource]
 //! impl Resource for FooServer {
-//!     type Args = NoArgs;
-//!     type Dependencies = NoDependencies;
 //!     const NAME: &str = "Test HTTP server";
 //!
-//!     fn new(_: NoDependencies, _: NoArgs) -> Result<Self, Box<dyn std::error::Error>> {
+//!     fn new(
+//!         _: NoDependencies,
+//!         _: NoArgs,
+//!         _: &mut AssemblyRuntime<'_>,
+//!     ) -> Result<Arc<Self>, std::convert::Infallible> {
 //!         let app = Router::new()
 //!             .route("/fooz", axum::routing::get(demo_page));
-//!         Ok(Self(app))
+//!         Ok(Arc::new(Self(app)))
 //!     }
 //! }
 //!
@@ -48,24 +53,23 @@
 //! let assembly = comprehensive::Assembly::<JustAServer>::new().unwrap();
 //! ```
 
-use atomic_take::AtomicTake;
 use axum::Router;
 #[cfg(feature = "tls")]
-use axum_server::tls_rustls::{RustlsAcceptor, RustlsConfig};
+use axum_server::tls_rustls::RustlsConfig;
 use futures::future::Either;
 use futures::pin_mut;
 use std::marker::PhantomData;
 use std::net::IpAddr;
 use std::sync::Arc;
-use tokio::sync::Notify;
 #[cfg(feature = "tls")]
 use tokio_rustls::rustls;
 
-use crate::{NoArgs, NoDependencies, Resource, ResourceDependencies, ShutdownNotify};
+use crate::{NoArgs, NoDependencies, ResourceDependencies};
+use crate::v1::{AssemblyRuntime, Resource, StopSignal, resource};
 
-async fn run_in_task<'a, A>(
+async fn run_in_task<A>(
     b: axum_server::Server<A>,
-    term_signal: &'a ShutdownNotify<'a>,
+    term: StopSignal,
     router: Router,
 ) -> Result<(), Box<dyn std::error::Error>>
 where
@@ -74,7 +78,6 @@ where
     A::Service: axum_server::service::SendService<http::Request<hyper::body::Incoming>> + Send,
     A::Future: Send,
 {
-    let term = term_signal.subscribe();
     let handle = axum_server::Handle::new();
     let handle_for_task = handle.clone();
     let make_service = router.into_make_service();
@@ -97,19 +100,21 @@ where
 ///
 /// ```
 /// use axum::Router;
-/// use comprehensive::{NoArgs, NoDependencies, Resource};
+/// use comprehensive::{NoArgs, NoDependencies};
 /// use comprehensive::http::HttpServingInstance;
+/// use comprehensive::v1::{AssemblyRuntime, Resource, resource};
 ///
 /// #[derive(HttpServingInstance)]
 /// #[flag_prefix = "foo-"]
 /// pub struct FooServer(#[router] Router);
+/// # #[resource]
 /// # impl Resource for FooServer {
-/// #     type Args = NoArgs;
-/// #     type Dependencies = NoDependencies;
 /// #     const NAME: &str = "Test HTTP server";
 /// #
-/// #     fn new(_: NoDependencies, _: NoArgs) -> Result<Self, Box<dyn std::error::Error>> {
-/// #         Ok(Self(Router::new()))
+/// #     fn new(
+/// #         _: NoDependencies, _: NoArgs, _: &mut AssemblyRuntime<'_>,
+/// #     ) -> Result<std::sync::Arc<Self>, std::convert::Infallible> {
+/// #         Ok(std::sync::Arc::new(Self(Router::new())))
 /// #     }
 /// # }
 /// ```
@@ -139,28 +144,20 @@ pub use comprehensive_macros::HttpServingInstance;
 
 struct Conveyor<T> {
     data: std::sync::Mutex<Option<T>>,
-    available: Notify,
 }
 
 impl<T> Conveyor<T> {
     fn new() -> Self {
         Self {
             data: std::sync::Mutex::new(None),
-            available: Notify::new(),
         }
     }
 
     fn put(&self, data: T) {
         *(self.data.lock().unwrap()) = Some(data);
-        self.available.notify_waiters();
     }
 
-    async fn get(&self) -> T {
-        let notified = self.available.notified();
-        if let Some(data) = self.data.lock().unwrap().take() {
-            return data;
-        }
-        notified.await;
+    fn get(&self) -> T {
         self.data
             .lock()
             .unwrap()
@@ -198,48 +195,43 @@ mod insecure_server {
     where
         I: HttpServingInstance,
     {
-        server: AtomicTake<axum_server::Server>,
         pub(super) conf: Option<Conveyor<Router>>,
         _i: PhantomData<I>,
     }
 
+    #[resource]
     impl<I: HttpServingInstance> Resource for InsecureHttpServer<I> {
-        type Args = InsecureHttpServerArgs<I>;
-        type Dependencies = NoDependencies;
         const NAME: &str = "Plaintext HTTP server";
 
         fn new(
             _: NoDependencies,
             args: InsecureHttpServerArgs<I>,
-        ) -> Result<Self, Box<dyn std::error::Error>> {
+            api: &mut AssemblyRuntime<'_>,
+        ) -> Result<Arc<Self>, std::convert::Infallible> {
             Ok(match args.http_port {
                 Some(port) => {
                     let addr = (args.http_bind_addr, port).into();
+                    let server = axum_server::bind(addr);
                     log::info!("{}: Insecure HTTP server listening on {}", I::NAME, addr);
-                    Self {
-                        server: AtomicTake::new(axum_server::bind(addr)),
+                    let shared = Arc::new(Self {
                         conf: Some(Conveyor::new()),
                         _i: PhantomData,
-                    }
+                    });
+                    let task_shared = Arc::clone(&shared);
+                    let stop = api.self_stop();
+                    api.set_task(async move {
+                        let s = task_shared.conf.as_ref().unwrap().get();
+                        drop(task_shared);
+                        run_in_task(server, stop, s).await?;
+                        Ok(())
+                    });
+                    shared
                 }
-                None => Self {
-                    server: AtomicTake::empty(),
+                None => Arc::new(Self {
                     conf: None,
                     _i: PhantomData,
-                },
+                }),
             })
-        }
-
-        async fn run_with_termination_signal<'a>(
-            &'a self,
-            term: &'a ShutdownNotify<'a>,
-        ) -> Result<(), Box<dyn std::error::Error>> {
-            let Some(server) = self.server.take() else {
-                return Ok(());
-            };
-            let s = self.conf.as_ref().unwrap().get().await;
-            run_in_task(server, term, s).await?;
-            Ok(())
         }
     }
 }
@@ -284,26 +276,24 @@ mod secure_server {
     where
         I: HttpServingInstance,
     {
-        server: AtomicTake<axum_server::Server<RustlsAcceptor>>,
         pub(super) conf: Option<Conveyor<Router>>,
         _i: PhantomData<I>,
     }
 
+    #[resource]
     impl<I: HttpServingInstance> Resource for SecureHttpServer<I> {
-        type Args = SecureHttpServerArgs<I>;
-        type Dependencies = SecureHttpServerDependencies;
         const NAME: &str = "HTTPS server";
 
         fn new(
             d: SecureHttpServerDependencies,
             args: SecureHttpServerArgs<I>,
-        ) -> Result<Self, Box<dyn std::error::Error>> {
+            api: &mut AssemblyRuntime<'_>,
+        ) -> Result<Arc<Self>, crate::ComprehensiveError> {
             let Some(port) = args.https_port else {
-                return Ok(Self {
-                    server: AtomicTake::empty(),
+                return Ok(Arc::new(Self {
                     conf: None,
                     _i: PhantomData,
-                });
+                }));
             };
             let addr = (args.https_bind_addr, port).into();
             let mut sc = rustls::ServerConfig::builder()
@@ -311,24 +301,21 @@ mod secure_server {
                 .with_cert_resolver(d.tls.cert_resolver()?);
             sc.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
             let config = RustlsConfig::from_config(Arc::new(sc));
+            let server = axum_server::bind_rustls(addr, config);
             log::info!("{}: Secure HTTP server listening on {}", I::NAME, addr);
-            Ok(Self {
-                server: AtomicTake::new(axum_server::bind_rustls(addr, config)),
+            let shared = Arc::new(Self {
                 conf: Some(Conveyor::new()),
                 _i: PhantomData,
-            })
-        }
-
-        async fn run_with_termination_signal<'a>(
-            &'a self,
-            term: &'a ShutdownNotify<'a>,
-        ) -> Result<(), Box<dyn std::error::Error>> {
-            let Some(server) = self.server.take() else {
-                return Ok(());
-            };
-            let s = self.conf.as_ref().unwrap().get().await;
-            run_in_task(server, term, s).await?;
-            Ok(())
+            });
+            let task_shared = Arc::clone(&shared);
+            let stop = api.self_stop();
+            api.set_task(async move {
+                let s = task_shared.conf.as_ref().unwrap().get();
+                drop(task_shared);
+                run_in_task(server, stop, s).await?;
+                Ok(())
+            });
+            Ok(shared)
         }
     }
 }
@@ -363,32 +350,55 @@ pub struct HttpServer<I>
 where
     I: HttpServingInstance,
 {
-    deps: HttpServerDependencies<I>,
+    _instance: PhantomData<I>,
 }
 
+#[resource]
 impl<I: HttpServingInstance> Resource for HttpServer<I> {
-    type Args = NoArgs;
-    type Dependencies = HttpServerDependencies<I>;
     const NAME: &str = "HTTP server common";
 
-    fn new(d: HttpServerDependencies<I>, _: NoArgs) -> Result<Self, Box<dyn std::error::Error>> {
-        Ok(Self { deps: d })
+    fn new(
+        d: HttpServerDependencies<I>,
+        _: NoArgs,
+        api: &mut AssemblyRuntime<'_>,
+    ) -> Result<Arc<Self>, std::convert::Infallible> {
+        api.set_task(ConfigureServers { deps: d });
+        Ok(Arc::new(Self { _instance: PhantomData }))
     }
+}
 
-    async fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
+struct ConfigureServers<I: HttpServingInstance> {
+    deps: HttpServerDependencies<I>
+}
+
+struct NoTask;
+
+impl Future for NoTask {
+    type Output = Result<(), Box<dyn std::error::Error>>;
+
+    fn poll(self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>) -> std::task::Poll<Self::Output> {
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+impl<I: HttpServingInstance> IntoFuture for ConfigureServers<I> {
+    type IntoFuture = NoTask;
+    type Output = Result<(), Box<dyn std::error::Error>>;
+
+    fn into_future(self) -> Self::IntoFuture {
         #[cfg(not(feature = "tls"))]
         if self.deps.http.conf.is_none() {
             log::warn!(
                 "{}: No insecure HTTP listener, and secure HTTP is not available because feature \"tls\" is not built.",
                 I::NAME
             );
-            return Ok(());
+            return NoTask;
         }
 
         #[cfg(feature = "tls")]
         if self.deps.http.conf.is_none() && self.deps.https.conf.is_none() {
             log::warn!("{}: No insecure or secure HTTP listener.", I::NAME);
-            return Ok(());
+            return NoTask;
         }
 
         let router = self.deps.instance.get_router();
@@ -407,7 +417,7 @@ impl<I: HttpServingInstance> Resource for HttpServer<I> {
             }
         }
 
-        Ok(())
+        NoTask
     }
 }
 
@@ -428,20 +438,26 @@ mod tests {
     #[flag_prefix = "foo-"]
     pub struct FooServer(#[router] Router);
 
+    #[resource]
     impl Resource for FooServer {
-        type Args = NoArgs;
-        type Dependencies = NoDependencies;
         const NAME: &str = "Test HTTP server";
 
-        fn new(_: NoDependencies, _: NoArgs) -> Result<Self, Box<dyn std::error::Error>> {
+        fn new(
+            _: NoDependencies,
+            _: NoArgs,
+            _: &mut AssemblyRuntime<'_>,
+        ) -> Result<Arc<Self>, std::convert::Infallible> {
             let app = Router::new().route("/fooz", axum::routing::get(demo_page));
-            Ok(Self(app))
+            Ok(Arc::new(Self(app)))
         }
     }
 
     #[derive(ResourceDependencies)]
     struct JustAServer {
-        server: Arc<HttpServer<FooServer>>,
+        _server: Arc<HttpServer<FooServer>>,
+        http: Arc<insecure_server::InsecureHttpServer<FooServer>>,
+        #[cfg(feature = "tls")]
+        https: Arc<secure_server::SecureHttpServer<FooServer>>,
     }
 
     fn test_args(
@@ -468,9 +484,9 @@ mod tests {
         let argv = vec!["cmd"];
         let assembly = comprehensive::Assembly::<JustAServer>::new_from_argv(argv).unwrap();
 
-        assert!(assembly.top.server.deps.http.conf.is_none());
+        assert!(assembly.top.http.conf.is_none());
         #[cfg(feature = "tls")]
-        assert!(assembly.top.server.deps.https.conf.is_none());
+        assert!(assembly.top.https.conf.is_none());
 
         assert!(
             assembly
@@ -486,9 +502,9 @@ mod tests {
         let argv = test_args(Some(port), None);
         let assembly = comprehensive::Assembly::<JustAServer>::new_from_argv(argv).unwrap();
 
-        assert!(assembly.top.server.deps.http.conf.is_some());
+        assert!(assembly.top.http.conf.is_some());
         #[cfg(feature = "tls")]
-        assert!(assembly.top.server.deps.https.conf.is_none());
+        assert!(assembly.top.https.conf.is_none());
 
         let (tx, rx) = tokio::sync::oneshot::channel();
         let j = tokio::spawn(async move {
@@ -524,8 +540,8 @@ mod tests {
         let argv = test_args(None, Some(port));
         let assembly = comprehensive::Assembly::<JustAServer>::new_from_argv(argv).unwrap();
 
-        assert!(assembly.top.server.deps.http.conf.is_none());
-        assert!(assembly.top.server.deps.https.conf.is_some());
+        assert!(assembly.top.http.conf.is_none());
+        assert!(assembly.top.https.conf.is_some());
 
         let (tx, rx) = tokio::sync::oneshot::channel();
         let j = tokio::spawn(async move {
@@ -560,8 +576,8 @@ mod tests {
         let argv = test_args(Some(port_http), Some(port_https));
         let assembly = comprehensive::Assembly::<JustAServer>::new_from_argv(argv).unwrap();
 
-        assert!(assembly.top.server.deps.http.conf.is_some());
-        assert!(assembly.top.server.deps.https.conf.is_some());
+        assert!(assembly.top.http.conf.is_some());
+        assert!(assembly.top.https.conf.is_some());
 
         let (tx, rx) = tokio::sync::oneshot::channel();
         let j = tokio::spawn(async move {
@@ -597,13 +613,16 @@ mod tests {
     #[flag_prefix = "bar-"]
     pub struct BarServer(#[router] Router);
 
+    #[resource]
     impl Resource for BarServer {
-        type Args = NoArgs;
-        type Dependencies = NoDependencies;
         const NAME: &str = "Second Test HTTP server";
 
-        fn new(_: NoDependencies, _: NoArgs) -> Result<Self, Box<dyn std::error::Error>> {
-            Ok(Self(Router::new()))
+        fn new(
+            _: NoDependencies,
+            _: NoArgs,
+            _: &mut AssemblyRuntime<'_>
+        ) -> Result<Arc<Self>, std::convert::Infallible> {
+            Ok(Arc::new(Self(Router::new())))
         }
     }
 

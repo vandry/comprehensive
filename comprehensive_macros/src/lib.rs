@@ -310,7 +310,7 @@ fn derive_h_s_i(
             compile_error!("exactly 1 struct field must be annotated with #[router]");
         });
     }
-    let router_member = router_members.get(0).unwrap();
+    let router_member = router_members.first().unwrap();
 
     let http_port_flag_name = format!("{}http-port", flag_prefix.value());
     let http_port_flag_name_lit = LitStr::new(&http_port_flag_name, flag_prefix.span());

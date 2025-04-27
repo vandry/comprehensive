@@ -15,7 +15,6 @@ rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
 arc-swap = { version = "1.7", optional = true }
-atomic-take = "1.1"
 axum = "0.7"
 axum-server = "0.7"
 boxcar = "0.2"
@@ -43,6 +42,7 @@ tls = ["axum-server/tls-rustls", "dep:arc-swap", "dep:tokio-rustls", "dep:rustls
 unreloadable_tls = []
 
 [dev-dependencies]
+atomic-take = "1.1"
 rand = "0.8"
 regex = "1.11"
 reqwest = "0.12"

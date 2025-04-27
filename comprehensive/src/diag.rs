@@ -10,7 +10,8 @@ use std::sync::Arc;
 
 use crate::health::HealthReporter;
 use crate::http::HttpServingInstance;
-use crate::{Resource, ResourceDependencies};
+use crate::ResourceDependencies;
+use crate::v1::{AssemblyRuntime, Resource, resource};
 
 async fn serve_metrics_page() -> impl axum::response::IntoResponse {
     let encoder = prometheus::TextEncoder::new();
@@ -56,12 +57,15 @@ pub struct DiagInstanceDependencies(Arc<HealthReporter>);
 #[flag_prefix = "diag-"]
 pub struct DiagInstance(#[router] Router);
 
+#[resource]
 impl Resource for DiagInstance {
-    type Args = Args;
-    type Dependencies = DiagInstanceDependencies;
     const NAME: &str = "Diagnostics HTTP server";
 
-    fn new(d: DiagInstanceDependencies, args: Args) -> Result<Self, Box<dyn std::error::Error>> {
+    fn new(
+        d: DiagInstanceDependencies,
+        args: Args,
+        _: &mut AssemblyRuntime<'_>,
+    ) -> Result<Arc<Self>, std::convert::Infallible> {
         let mut app = Router::new();
         if !args.metrics_path.is_empty() {
             app = app.route(&args.metrics_path, axum::routing::get(serve_metrics_page));
@@ -69,7 +73,7 @@ impl Resource for DiagInstance {
         if !args.health_path.is_empty() {
             app = app.route(&args.health_path, axum::routing::get(serve_health_page));
         }
-        Ok(Self(app.with_state(d.0)))
+        Ok(Arc::new(Self(app.with_state(d.0))))
     }
 }
 

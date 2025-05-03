@@ -5,13 +5,13 @@
 use axum::Router;
 use axum::extract::State;
 use axum::response::IntoResponse;
+use comprehensive::ResourceDependencies;
+use comprehensive::health::HealthReporter;
+use comprehensive::v1::{AssemblyRuntime, Resource, resource};
 use prometheus::Encoder;
 use std::sync::Arc;
 
-use crate::health::HealthReporter;
-use crate::http::HttpServingInstance;
-use crate::ResourceDependencies;
-use crate::v1::{AssemblyRuntime, Resource, resource};
+use crate::server::HttpServingInstance;
 
 async fn serve_metrics_page() -> impl axum::response::IntoResponse {
     let encoder = prometheus::TextEncoder::new();
@@ -92,7 +92,7 @@ impl Resource for DiagInstance {
 /// | `--diag-https_bind_addr` | `::`       | Binding IP address for HTTPS. Used only if `--https_port` is set. |
 /// | `--metrics_path`         | `/metrics` | HTTP and/or HTTPS path where metrics are served. Set to empty to disable. |
 /// | `--health_path`          | `/healthz` | HTTP and/or HTTPS path where health status is served. Set to empty to disable. |
-pub type HttpServer = crate::http::HttpServer<DiagInstance>;
+pub type HttpServer = crate::server::HttpServer<DiagInstance>;
 
 #[cfg(test)]
 mod tests {

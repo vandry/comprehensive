@@ -324,7 +324,7 @@ fn derive_h_s_i(
     let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
     Ok(quote! {
         #[automatically_derived]
-        impl #impl_generics ::comprehensive::http::HttpServingInstance for #name #ty_generics #where_clause {
+        impl #impl_generics ::comprehensive_http::HttpServingInstance for #name #ty_generics #where_clause {
             const HTTP_PORT_FLAG_NAME: &str = #http_port_flag_name_lit ;
             const HTTP_BIND_ADDR_FLAG_NAME: &str = #http_bind_addr_flag_name_lit ;
             const HTTPS_PORT_FLAG_NAME: &str = #https_port_flag_name_lit ;

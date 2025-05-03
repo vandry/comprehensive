@@ -1,6 +1,6 @@
 [package]
 name = "comprehensive_s3"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 repository = "https://github.com/vandry/comprehensive.git"
 homepage = "https://github.com/vandry/comprehensive"
@@ -13,7 +13,7 @@ rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
-comprehensive = { path = "../comprehensive", version = "0.5" }
+comprehensive = { path = "../comprehensive", version = "0.6" }
 const_format = "0.2"
 futures = "0.3"
 gensym = "0.1"

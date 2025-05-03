@@ -4,6 +4,7 @@ members = [
   "comprehensive",
   "comprehensive_dns",
   "comprehensive_grpc",
+  "comprehensive_http",
   "comprehensive_macros",
   "comprehensive_s3",
   "examples",

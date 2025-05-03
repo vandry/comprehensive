@@ -9,7 +9,7 @@
 //! each parameterised with a different [`HttpServingInstance`]. This is
 //! expected to be used to have an internal server for metrics and
 //! diagnostics and a different one for public serving. See
-//! [`comprehensive::diag::HttpServer`] for the packaged instance of the
+//! [`comprehensive_http::diag::HttpServer`] for the packaged instance of the
 //! former.
 //!
 //! # Usage
@@ -19,7 +19,7 @@
 //! use axum::response::IntoResponse;
 //! use comprehensive::{NoArgs, NoDependencies, ResourceDependencies};
 //! use comprehensive::v1::{AssemblyRuntime, Resource, resource};
-//! use comprehensive::http::{HttpServer, HttpServingInstance};
+//! use comprehensive_http::{HttpServer, HttpServingInstance};
 //! use std::sync::Arc;
 //!
 //! async fn demo_page() -> impl axum::response::IntoResponse {
@@ -50,12 +50,16 @@
 //!     server: std::sync::Arc<HttpServer<FooServer>>,
 //! }
 //!
+//! #[cfg(feature = "tls")]
+//! let _ = tokio_rustls::rustls::crypto::aws_lc_rs::default_provider().install_default();
 //! let assembly = comprehensive::Assembly::<JustAServer>::new().unwrap();
 //! ```
 
 use axum::Router;
 #[cfg(feature = "tls")]
 use axum_server::tls_rustls::RustlsConfig;
+use comprehensive::v1::{AssemblyRuntime, Resource, StopSignal, resource};
+use comprehensive::{NoArgs, NoDependencies, ResourceDependencies};
 use futures::future::Either;
 use futures::pin_mut;
 use std::marker::PhantomData;
@@ -63,9 +67,6 @@ use std::net::IpAddr;
 use std::sync::Arc;
 #[cfg(feature = "tls")]
 use tokio_rustls::rustls;
-
-use crate::{NoArgs, NoDependencies, ResourceDependencies};
-use crate::v1::{AssemblyRuntime, Resource, StopSignal, resource};
 
 async fn run_in_task<A>(
     b: axum_server::Server<A>,
@@ -101,8 +102,8 @@ where
 /// ```
 /// use axum::Router;
 /// use comprehensive::{NoArgs, NoDependencies};
-/// use comprehensive::http::HttpServingInstance;
 /// use comprehensive::v1::{AssemblyRuntime, Resource, resource};
+/// use comprehensive_http::HttpServingInstance;
 ///
 /// #[derive(HttpServingInstance)]
 /// #[flag_prefix = "foo-"]
@@ -241,7 +242,7 @@ mod secure_server {
     use super::*;
 
     #[cfg(not(test))]
-    type TlsConfig = crate::tls::TlsConfig;
+    type TlsConfig = comprehensive::tls::TlsConfig;
     #[cfg(test)]
     type TlsConfig = crate::testutil::tls::MockTlsConfig;
 
@@ -288,7 +289,7 @@ mod secure_server {
             d: SecureHttpServerDependencies,
             args: SecureHttpServerArgs<I>,
             api: &mut AssemblyRuntime<'_>,
-        ) -> Result<Arc<Self>, crate::ComprehensiveError> {
+        ) -> Result<Arc<Self>, comprehensive::ComprehensiveError> {
             let Some(port) = args.https_port else {
                 return Ok(Arc::new(Self {
                     conf: None,
@@ -363,12 +364,14 @@ impl<I: HttpServingInstance> Resource for HttpServer<I> {
         api: &mut AssemblyRuntime<'_>,
     ) -> Result<Arc<Self>, std::convert::Infallible> {
         api.set_task(ConfigureServers { deps: d });
-        Ok(Arc::new(Self { _instance: PhantomData }))
+        Ok(Arc::new(Self {
+            _instance: PhantomData,
+        }))
     }
 }
 
 struct ConfigureServers<I: HttpServingInstance> {
-    deps: HttpServerDependencies<I>
+    deps: HttpServerDependencies<I>,
 }
 
 struct NoTask;
@@ -376,7 +379,10 @@ struct NoTask;
 impl Future for NoTask {
     type Output = Result<(), Box<dyn std::error::Error>>;
 
-    fn poll(self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>) -> std::task::Poll<Self::Output> {
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
         std::task::Poll::Ready(Ok(()))
     }
 }
@@ -552,7 +558,7 @@ mod tests {
         let addr = testutil::localhost(port);
         testutil::wait_until_serving(&addr).await;
 
-        let cacert = reqwest::Certificate::from_pem(crate::tls::testdata::CACERT).expect("cacert");
+        let cacert = reqwest::Certificate::from_pem(crate::tls_testdata::CACERT).expect("cacert");
         let client = reqwest::ClientBuilder::new()
             .add_root_certificate(cacert)
             .resolve("user1", addr.clone())
@@ -590,7 +596,7 @@ mod tests {
         testutil::wait_until_serving(&addr_http).await;
         testutil::wait_until_serving(&addr_https).await;
 
-        let cacert = reqwest::Certificate::from_pem(crate::tls::testdata::CACERT).expect("cacert");
+        let cacert = reqwest::Certificate::from_pem(crate::tls_testdata::CACERT).expect("cacert");
         let client = reqwest::ClientBuilder::new()
             .add_root_certificate(cacert)
             .resolve("user1", addr_https.clone())
@@ -620,7 +626,7 @@ mod tests {
         fn new(
             _: NoDependencies,
             _: NoArgs,
-            _: &mut AssemblyRuntime<'_>
+            _: &mut AssemblyRuntime<'_>,
         ) -> Result<Arc<Self>, std::convert::Infallible> {
             Ok(Arc::new(Self(Router::new())))
         }

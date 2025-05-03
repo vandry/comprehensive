@@ -49,7 +49,7 @@ struct TopDependencies {
     // Including this causes the gRPC server to run.
     _test_service: Arc<TestService>,
     // Serves metrics!
-    _diag: Arc<comprehensive::diag::HttpServer>,
+    _diag: Arc<comprehensive_http::diag::HttpServer>,
 }
 
 #[tokio::main]

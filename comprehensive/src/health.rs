@@ -113,7 +113,9 @@ struct Signal {
 /// resources.
 ///
 /// 2 components of [`comprehensive`] that currently consume and externalise
-/// the aggregated health signal are [`comprehensive::http::HttpServer`] and
+/// the aggregated health signal are
+/// [`comprehensive_http::HttpServer`](https://docs.rs/comprehensive_http/latest/comprehensive_http/diag/struct.HttpServer.html)
+/// and
 /// [`comprehensive_grpc::GrpcServer`](https://docs.rs/comprehensive_grpc/latest/comprehensive_grpc/struct.GrpcServer.html).
 pub struct HealthReporter {
     signals: boxcar::Vec<Signal>,

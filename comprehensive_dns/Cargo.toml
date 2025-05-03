@@ -1,6 +1,6 @@
 [package]
 name = "comprehensive_dns"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 repository = "https://github.com/vandry/comprehensive.git"
 homepage = "https://github.com/vandry/comprehensive"
@@ -12,5 +12,5 @@ all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
-comprehensive = { path = "../comprehensive", version = "0.5" }
+comprehensive = { path = "../comprehensive", version = "0.6" }
 trust-dns-resolver = "0.23"

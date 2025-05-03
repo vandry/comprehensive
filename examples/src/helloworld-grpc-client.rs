@@ -46,7 +46,7 @@ struct TopDependencies {
     // Including this causes the greeter-in-a-loop to run.
     _greeter: Arc<GreeterInALoop>,
     // Serves metrics!
-    _diag: Arc<comprehensive::diag::HttpServer>,
+    _diag: Arc<comprehensive_http::diag::HttpServer>,
 }
 
 #[tokio::main]

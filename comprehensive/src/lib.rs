@@ -52,9 +52,7 @@
 use tokio_rustls::rustls;
 
 pub mod assembly;
-pub mod diag;
 pub mod health;
-pub mod http;
 pub mod v0;
 pub mod v1;
 

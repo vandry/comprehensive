@@ -388,6 +388,7 @@ mod tests {
 
     #[test]
     fn first_load() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let (tlsc, tempdir) = TlsConfig::for_tests(true).expect("creating test TLS");
         let resolver = tlsc.cert_resolver().expect("get resolver");
 
@@ -401,6 +402,7 @@ mod tests {
 
     #[test]
     fn reload_success() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let (tlsc, tempdir) = TlsConfig::for_tests(true).expect("creating test TLS");
         let resolver = tlsc.cert_resolver().expect("get resolver");
         let p = tempdir.as_ref().unwrap().path();
@@ -418,6 +420,7 @@ mod tests {
 
     #[test]
     fn reload_fail() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let (tlsc, tempdir) = TlsConfig::for_tests(true).expect("creating test TLS");
         let resolver = tlsc.cert_resolver().expect("get resolver");
         let p = tempdir.as_ref().unwrap().path();

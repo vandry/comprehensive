@@ -26,7 +26,7 @@ impl testutil::EndToEndClient<{ SampleClient::RESOURCE_VARIETY }> for SampleClie
 
 #[derive(ResourceDependencies)]
 struct CheckHealthAndMetricsTest {
-    _diag: Arc<comprehensive::diag::HttpServer>,
+    _diag: Arc<comprehensive_http::diag::HttpServer>,
     tester: Arc<testutil::EndToEndTester<SampleClient, { SampleClient::RESOURCE_VARIETY }>>,
 }
 

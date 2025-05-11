@@ -36,6 +36,7 @@ use clap::{Arg, ArgMatches, Args, Command, FromArgMatches, value_parser};
 use comprehensive::ResourceDependencies;
 use comprehensive::health::HealthReporter;
 use comprehensive_dns::DNSResolver;
+use comprehensive_warm_channels::WarmChannelsDiag;
 use futures::{Stream, StreamExt, TryStreamExt};
 use http::Uri;
 use humantime::{format_duration, parse_duration};
@@ -339,6 +340,7 @@ pub struct GRPCClientDependencies {
     #[cfg(feature = "tls")]
     tls_config: Arc<comprehensive::tls::TlsConfig>,
     health: Arc<HealthReporter>,
+    _include_me: Arc<WarmChannelsDiag>,
 }
 
 fn resolve<'a, R, RR>(

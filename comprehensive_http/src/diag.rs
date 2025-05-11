@@ -1,6 +1,10 @@
 //! HTTP server meant to serve diagnostics for a [`comprehensive`] server.
 //!
-//! Currently this serves only Prometheus metrics.
+//! This collects all other resources in the assembly that implement and
+//! expose [`comprehensive_traits::http_diag::HttpDiagHandler`] and serves
+//! them on a common HTTP server.
+//!
+//! [`comprehensive_traits::http_diag::HttpDiagHandler`]: https://docs.rs/comprehensive_traits/latest/comprehensive_traits/http_diag/trait.HttpDiagHandler.html
 
 use axum::Router;
 use axum::extract::State;
@@ -8,6 +12,7 @@ use axum::response::IntoResponse;
 use comprehensive::ResourceDependencies;
 use comprehensive::health::HealthReporter;
 use comprehensive::v1::{AssemblyRuntime, Resource, resource};
+use comprehensive_traits::http_diag::{HttpDiagHandler, HttpDiagHandlerInstaller};
 use prometheus::Encoder;
 use std::sync::Arc;
 
@@ -50,12 +55,24 @@ pub struct Args {
 
 #[doc(hidden)]
 #[derive(ResourceDependencies)]
-pub struct DiagInstanceDependencies(Arc<HealthReporter>);
+pub struct DiagInstanceDependencies {
+    health: Arc<HealthReporter>,
+    handlers: Vec<Arc<dyn HttpDiagHandler>>,
+}
 
 #[doc(hidden)]
 #[derive(HttpServingInstance)]
 #[flag_prefix = "diag-"]
 pub struct DiagInstance(#[router] Router);
+
+struct Installer(Option<Router<Arc<HealthReporter>>>);
+
+impl HttpDiagHandlerInstaller for Installer {
+    fn nest_service(&mut self, path: &str, service: comprehensive_traits::http_diag::Service) {
+        let app = self.0.take().unwrap().nest_service(path, service);
+        self.0 = Some(app);
+    }
+}
 
 #[resource]
 impl Resource for DiagInstance {
@@ -73,7 +90,12 @@ impl Resource for DiagInstance {
         if !args.health_path.is_empty() {
             app = app.route(&args.health_path, axum::routing::get(serve_health_page));
         }
-        Ok(Arc::new(Self(app.with_state(d.0))))
+        let mut installer = Installer(Some(app));
+        for handler in d.handlers {
+            handler.install_handlers(&mut installer);
+        }
+        let Installer(app) = installer;
+        Ok(Arc::new(Self(app.unwrap().with_state(d.health))))
     }
 }
 

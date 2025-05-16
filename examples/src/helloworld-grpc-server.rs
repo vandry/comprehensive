@@ -1,5 +1,6 @@
 use comprehensive::v1::{AssemblyRuntime, Resource, resource};
 use comprehensive::{NoDependencies, ResourceDependencies};
+use std::marker::PhantomData;
 use std::sync::Arc;
 
 // Generated protobufs for gRPC
@@ -47,7 +48,7 @@ struct TopDependencies {
     // Request a server (HTTPS or HTTP or both) to run.
     _server: Arc<comprehensive_grpc::server::GrpcServer>,
     // Including this causes the gRPC server to run.
-    _test_service: Arc<TestService>,
+    _test_service: PhantomData<TestService>,
     // Serves metrics!
     _diag: Arc<comprehensive_http::diag::HttpServer>,
 }

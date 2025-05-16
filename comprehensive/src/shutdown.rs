@@ -31,11 +31,16 @@ impl ShutdownSignalEntry {
             children: FixedBitSet::with_capacity(s),
         }
     }
+
+    fn is_present(&self) -> bool {
+        !self.children.is_empty()
+    }
 }
 
 pub(crate) struct ShutdownSignalHeader {
     quit_cursor: AtomicUsize,
     task_quit_waker: TryLock<Option<Waker>>,
+    n_nodes: usize,
 }
 
 type ShutdownSignalInner = SliceWithHeader<ShutdownSignalHeader, ShutdownSignalEntry>;
@@ -168,6 +173,7 @@ impl ShutdownSignal {
             ShutdownSignalHeader {
                 quit_cursor: AtomicUsize::default(),
                 task_quit_waker: TryLock::new(None),
+                n_nodes: l,
             },
             AddOne::new(it).map(|inert| ShutdownSignalEntry::new(l, inert)),
         ))
@@ -191,6 +197,10 @@ impl ShutdownSignal {
             .enumerate()
             .flat_map(|(i_from, row)| row.children.ones().map(move |i_to| (i_from, i_to)))
     }
+
+    pub(crate) fn nodes_len(&self) -> usize {
+        self.0.header.n_nodes
+    }
 }
 
 impl ShutdownSignalMut<'_> {
@@ -200,32 +210,65 @@ impl ShutdownSignalMut<'_> {
             .insert(child);
         *self.0.slice[child].refcount.get_mut() += 1
     }
+
+    pub(crate) fn remove_unreferenced(&mut self) {
+        let l = self.0.slice.len() - 1;
+        for i in 0..l {
+            if *self.0.slice[i].refcount.get_mut() == 1 {
+                self.unreference(i);
+            }
+        }
+        self.0.header.n_nodes = self
+            .0
+            .slice
+            .iter()
+            .take(l)
+            .filter(|e| e.is_present())
+            .count();
+    }
+
+    fn unreference(&mut self, i: usize) {
+        let e = &mut self.0.slice[i];
+        let refcount = e.refcount.get_mut();
+        *refcount -= 1;
+        if *refcount == 0 {
+            for j in std::mem::take(&mut e.children).into_ones() {
+                self.unreference(j);
+            }
+        }
+    }
 }
 
 pub(crate) struct ShutdownSignalIterator(Arc<ShutdownSignalInner>, usize);
 
 impl Iterator for ShutdownSignalIterator {
-    type Item = (TaskRunningSentinel, ShutdownSignalParticipantCreator);
+    type Item = Option<(TaskRunningSentinel, ShutdownSignalParticipantCreator)>;
 
     fn next(&mut self) -> Option<Self::Item> {
         let i = self.1;
         if i < self.0.slice.len() {
             self.1 += 1;
-            Some((
-                TaskRunningSentinel::new(&self.0, i),
-                if self.0.slice[i].wakers.is_some() {
-                    ShutdownSignalParticipantCreator(
-                        Some(ShutdownSignalParticipant {
-                            matrix: Some(Arc::clone(&self.0)),
-                            row: i,
-                            waker_slot: 0,
-                        }),
-                        false,
-                    )
-                } else {
-                    ShutdownSignalParticipantCreator(None, true)
-                },
-            ))
+            // .is_present() wrongly returns false in the case of an empty assembly,
+            // so special-case that.
+            if self.0.slice[i].is_present() || self.0.slice.len() == 1 {
+                Some(Some((
+                    TaskRunningSentinel::new(&self.0, i),
+                    if self.0.slice[i].wakers.is_some() {
+                        ShutdownSignalParticipantCreator(
+                            Some(ShutdownSignalParticipant {
+                                matrix: Some(Arc::clone(&self.0)),
+                                row: i,
+                                waker_slot: 0,
+                            }),
+                            false,
+                        )
+                    } else {
+                        ShutdownSignalParticipantCreator(None, true)
+                    },
+                )))
+            } else {
+                Some(None)
+            }
         } else {
             None
         }
@@ -428,8 +471,7 @@ pub(crate) struct TaskQuits(Arc<ShutdownSignalInner>, usize);
 
 impl TaskQuits {
     pub(crate) fn len(&self) -> usize {
-        let l = self.0.slice.len() - self.1;
-        if l > 0 { l - 1 } else { 0 }
+        self.0.header.n_nodes.saturating_sub(self.1)
     }
 }
 
@@ -437,8 +479,8 @@ impl Stream for TaskQuits {
     type Item = usize;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<usize>> {
-        if self.1 >= self.0.slice.len() - 1 {
-            self.1 = self.0.slice.len();
+        if self.1 >= self.0.header.n_nodes {
+            self.1 = usize::MAX;
             return Poll::Ready(None);
         }
         if self.0.header.quit_cursor.load(Ordering::Acquire) > self.1 {
@@ -470,6 +512,6 @@ impl Stream for TaskQuits {
 
 impl futures::stream::FusedStream for TaskQuits {
     fn is_terminated(&self) -> bool {
-        self.1 >= self.0.slice.len()
+        self.1 == usize::MAX
     }
 }

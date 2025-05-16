@@ -16,22 +16,55 @@ use syn::{
 enum DependencyType<'a> {
     Concrete(&'a Type),
     Trait(&'a Type),
+    Weak(&'a Type),
 }
 
-fn find_dependency_type(ty: &Type) -> Result<DependencyType<'_>, Span> {
-    // We are looking for either Arc<T> or Vec<Arc<dyn Tr>>.
+enum DependencyLabel {
+    Arc,
+    Vec,
+    PhantomData,
+}
+
+impl DependencyLabel {
+    fn expect_arc_inside(&self) -> bool {
+        match *self {
+            Self::Arc => false,
+            Self::PhantomData => false,
+            Self::Vec => true,
+        }
+    }
+
+    fn into_dependency_type(self, ty: &Type) -> Result<DependencyType<'_>, Span> {
+        let (expect_trait, result) = match self {
+            Self::Arc => (false, DependencyType::Concrete(ty)),
+            Self::Vec => (true, DependencyType::Trait(ty)),
+            Self::PhantomData => (false, DependencyType::Weak(ty)),
+        };
+        if expect_trait == matches!(ty, Type::TraitObject(_)) {
+            Ok(result)
+        } else {
+            Err(ty.span())
+        }
+    }
+}
+
+fn find_path_with_1_generic_type(ty: &Type) -> Result<(DependencyLabel, &Type), Span> {
     let Type::Path(path) = ty else {
         return Err(ty.span());
     };
-    // a = <T> or <Arc<dyn Tr>>
-    let a = &path
-        .path
-        .segments
-        .last()
-        .ok_or_else(|| path.span())?
-        .arguments;
-    let PathArguments::AngleBracketed(generics) = a else {
-        return Err(a.span());
+    let last_segment = path.path.segments.last().ok_or_else(|| path.span())?;
+    let dep_type = if last_segment.ident == "Arc" {
+        DependencyLabel::Arc
+    } else if last_segment.ident == "Vec" {
+        DependencyLabel::Vec
+    } else if last_segment.ident == "PhantomData" {
+        DependencyLabel::PhantomData
+    } else {
+        return Err(path.span());
+    };
+    // a = <T> or <Arc<dyn Tr>> or <Arc<T>>
+    let PathArguments::AngleBracketed(ref generics) = last_segment.arguments else {
+        return Err(last_segment.arguments.span());
     };
     if generics.args.len() != 1 {
         return Err(generics.span());
@@ -40,31 +73,23 @@ fn find_dependency_type(ty: &Type) -> Result<DependencyType<'_>, Span> {
     let GenericArgument::Type(ty) = generic else {
         return Err(generic.span());
     };
-    // ty = T or Arc<dyn Tr>
-    let Type::Path(path) = ty else {
-        return Ok(DependencyType::Concrete(ty));
-    };
-    Ok(path
-        .path
-        .segments
-        .last()
-        .and_then(|last| match last.arguments {
-            PathArguments::AngleBracketed(ref generics) => {
-                if generics.args.len() == 1 {
-                    match generics.args.first().unwrap() {
-                        GenericArgument::Type(ty) => match ty {
-                            Type::TraitObject(_) => Some(ty),
-                            _ => None,
-                        },
-                        _ => None,
-                    }
-                } else {
-                    None
-                }
-            }
-            _ => None,
-        })
-        .map_or(DependencyType::Concrete(ty), DependencyType::Trait))
+    Ok((dep_type, ty))
+}
+
+fn find_dependency_type(orig_ty: &Type) -> Result<DependencyType<'_>, Span> {
+    // We accept:
+    // Arc<T>
+    // Vec<Arc<dyn Tr>>
+    // PhantomData<Arc<T>>
+    let (dep_type, mut ty) = find_path_with_1_generic_type(orig_ty)?;
+    if dep_type.expect_arc_inside() {
+        let (inner_dep_type, inner_ty) = find_path_with_1_generic_type(ty)?;
+        if !matches!(inner_dep_type, DependencyLabel::Arc) {
+            return Err(orig_ty.span());
+        }
+        ty = inner_ty;
+    }
+    dep_type.into_dependency_type(ty)
 }
 
 fn derive_r_d_struct(name: &Ident, generics: &Generics, fields: &Fields) -> TokenStream {
@@ -79,7 +104,7 @@ fn derive_r_d_struct(name: &Ident, generics: &Generics, fields: &Fields) -> Toke
     .map(|f| match find_dependency_type(&f.ty) {
         Ok(dty) => Ok(dty),
         Err(span) => Err(quote_spanned! {
-            span => compile_error!("ResourceDependencies type must be Arc<T>");
+            span => compile_error!("each field of a ResourceDependencies struct must have a type matching one of: Arc<T>, Vec<Arc<dyn Tr>>, PhantomData<T>");
         }),
     })
     .collect::<Vec<_>>();
@@ -90,6 +115,9 @@ fn derive_r_d_struct(name: &Ident, generics: &Generics, fields: &Fields) -> Toke
         },
         Ok(DependencyType::Trait(ty)) => quote! {
             cx.require_trait::< #ty >();
+        },
+        Ok(DependencyType::Weak(ty)) => quote! {
+            ::comprehensive::assembly::Registrar::< #ty >::register_without_dependency(cx);
         },
         Err(ts) => ts.clone(),
     });
@@ -104,6 +132,12 @@ fn derive_r_d_struct(name: &Ident, generics: &Generics, fields: &Fields) -> Toke
             let temp = format_ident!("dep_{}", i);
             quote! {
                 let #temp = cx.produce_trait::< #ty >();
+            }
+        }
+        Ok(DependencyType::Weak(_)) => {
+            let temp = format_ident!("dep_{}", i);
+            quote! {
+                let #temp = ::std::marker::PhantomData;
             }
         }
         Err(ts) => ts.clone(),
@@ -146,6 +180,44 @@ fn derive_r_d_struct(name: &Ident, generics: &Generics, fields: &Fields) -> Toke
     }
 }
 
+/// This macro should be used to derive the
+/// [`ResourceDependencies`](https://docs.rs/comprehensive/latest/comprehensive/assembly/trait.ResourceDependencies.html)
+/// trait for expressing dependencies between resources.
+///
+/// It takes a struct as input. The types of the fields of the struct should all
+/// match one of:
+///
+/// - [`Arc<T>`](std::sync::Arc) where T is a Resource. That resource will be a
+///   required dependency.
+/// - [`Vec<Arc<dyn T>>`](Vec) where T is a trait that might be implemented by
+///   some resources. All of the resources that exist in the graph and
+///   implement that trait and declare that they do so in their
+///   [`Resource`](https://docs.rs/comprehensive/latest/comprehensive/v1/trait.Resource.html)
+///   definition (using
+///   [`v1::resource`](https://docs.rs/comprehensive/latest/comprehensive/v1/attr.resource.html))
+///   will be collected here.
+///
+///   Note that in order to be selected for this, a Resource has to exist
+///   somewhere in the graph already, which means that somewhere it must
+///   be declared as a dependency under its concrete name. For this, a
+///   common expected pattern is that the Assembly's top-level dependencies
+///   request it under its concrete type but otherwise do not make any use
+///   of it, enabling one or more resources elsewhere in the graph to
+///   discover it under its trait interface.
+/// - [`PhantomData<T>`](std::marker::PhantomData) where T is a Resource.
+///   The resource
+///   will be made available to the assembly, but no dependency on it is
+///   introduced in the graph. The resource will be actually included in
+///   the assembly only if something depends on it in some other way.
+///
+///   This is only useful if another resource depends upon `T` via a trait
+///   that it exposes. In that case, the
+///   [`PhantomData`](std::marker::PhantomData) dependency serves to import
+///   `T` so that it can be discovered.
+///
+/// See
+/// [`ResourceDependencies`](https://docs.rs/comprehensive/latest/comprehensive/assembly/trait.ResourceDependencies.html)
+/// for usage information.
 #[proc_macro_derive(ResourceDependencies)]
 pub fn derive_resource_dependencies(item: proc_macro::TokenStream) -> proc_macro::TokenStream {
     let input: DeriveInput = parse_macro_input!(item);
@@ -219,7 +291,7 @@ fn derive_grpc_service_internal(
 }
 
 /// This macro is obsolete after GrpcService was converted to expect
-/// [`comprehensive::v1::Resource`].
+/// [`Resource`](https://docs.rs/comprehensive/latest/comprehensive/v1/trait.Resource.html).
 #[proc_macro_derive(GrpcService, attributes(implementation, service, descriptor))]
 pub fn derive_grpc_service(item: proc_macro::TokenStream) -> proc_macro::TokenStream {
     let input: DeriveInput = parse_macro_input!(item);

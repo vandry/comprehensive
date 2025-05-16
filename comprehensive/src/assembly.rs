@@ -71,6 +71,7 @@ trait NodeTrait: Any {
         keepalive: TaskRunningSentinel,
     ) -> Result<(), Box<dyn Error>>;
     fn task(self: Box<Self>) -> Option<ResourceFut>;
+    fn created(&self) -> bool;
 }
 
 impl<T: sealed::ResourceBase<U>, const U: usize> NodeTrait for Node<T, U> {
@@ -103,9 +104,13 @@ impl<T: sealed::ResourceBase<U>, const U: usize> NodeTrait for Node<T, U> {
     }
 
     fn task(mut self: Box<Self>) -> Option<ResourceFut> {
-        Some(<T as sealed::ResourceBase<U>>::task(
-            self.production.take().unwrap(),
-        ))
+        self.production
+            .take()
+            .map(|p| <T as sealed::ResourceBase<U>>::task(p))
+    }
+
+    fn created(&self) -> bool {
+        self.production.get().is_some()
     }
 }
 
@@ -160,6 +165,10 @@ impl TraitGraphNode {
     fn task(self) -> Option<ResourceFut> {
         None
     }
+
+    fn created(&self) -> bool {
+        false
+    }
 }
 
 enum GraphNode {
@@ -183,6 +192,7 @@ impl GraphNode {
                 keepalive: TaskRunningSentinel,
             ) -> Result<(), Box<dyn Error>>;
             fn task(self) -> Option<ResourceFut>;
+            fn created(&self) -> bool;
         }
     }
 
@@ -221,6 +231,35 @@ impl RegisterContext<'_> {
             parent: self.parent,
             child: *i,
         });
+    }
+
+    fn internal_register<T, const U: usize, const DEP: bool>(&mut self)
+    where
+        T: sealed::ResourceBase<U>,
+    {
+        let me = TypeId::of::<T>();
+        let next_i = self.type_map.len();
+        let (i, prune) = match self.type_map.entry(me) {
+            Entry::Vacant(e) => {
+                e.insert(next_i);
+                (next_i, false)
+            }
+            Entry::Occupied(e) => (*e.get(), true),
+        };
+        if DEP {
+            self.relationships.push(NodeRelationship {
+                parent: self.parent,
+                child: i,
+            });
+        }
+        if prune {
+            return;
+        }
+        self.nodes
+            .push(GraphNode::Resource(Box::new(Node::<T, U>::default())));
+        let parent = self.parent.replace(i);
+        <T as sealed::ResourceBase<U>>::register_recursive(self);
+        self.parent = parent;
     }
 }
 
@@ -314,27 +353,14 @@ impl<T> Registrar<T> {
     where
         T: sealed::ResourceBase<U>,
     {
-        let me = TypeId::of::<T>();
-        let next_i = cx.type_map.len();
-        let (i, prune) = match cx.type_map.entry(me) {
-            Entry::Vacant(e) => {
-                e.insert(next_i);
-                (next_i, false)
-            }
-            Entry::Occupied(e) => (*e.get(), true),
-        };
-        cx.relationships.push(NodeRelationship {
-            parent: cx.parent,
-            child: i,
-        });
-        if prune {
-            return;
-        }
-        cx.nodes
-            .push(GraphNode::Resource(Box::new(Node::<T, U>::default())));
-        let parent = cx.parent.replace(i);
-        <T as sealed::ResourceBase<U>>::register_recursive(cx);
-        cx.parent = parent;
+        cx.internal_register::<T, U, true>()
+    }
+
+    pub fn register_without_dependency<const U: usize>(cx: &mut RegisterContext<'_>)
+    where
+        T: sealed::ResourceBase<U>,
+    {
+        cx.internal_register::<T, U, false>()
     }
 
     pub fn produce<const U: usize>(cx: &mut ProduceContext<'_>) -> Result<Arc<T>, Box<dyn Error>>
@@ -363,24 +389,7 @@ impl<T> Registrar<T> {
 ///
 /// This must be implemented on a struct containing zero or more fields
 /// representing dependencies requested. On that structure, the trait
-/// should be derived.
-///
-/// The types of the fields of the struct should be one of:
-///
-/// - [`Arc<T>`] where T is a Resource. That resource will be a required
-///   dependency.
-/// - [`Vec<Arc<dyn T>>`] where T is a trait that might be implemented by
-///   some resources. All of the resources that exist in the graph and
-///   implement that trait and declare that they do so in their [`Resource`]
-///   definition (using [`v1::resource`]) will be collected here.
-///
-///   Note that in order to be selected for this, a Resource has to exist
-///   somewhere in the graph already, which means that somewhere it must
-///   be declared as a dependency under its concrete name. For this, a
-///   common expected pattern is that the Assembly's top-level dependencies
-///   request it under its concrete type but otherwise do not make any use
-///   of it, enabling one or more resources elsewhere in the graph to
-///   discover it under its trait interface.
+/// should be [derived](macro@ResourceDependencies).
 ///
 /// ```
 /// use comprehensive::{NoArgs, NoDependencies, ResourceDependencies};
@@ -546,6 +555,7 @@ impl std::error::Error for CycleError {}
 fn build_order(
     ts: TopologicalSort<usize>,
     expect_len: usize,
+    root_id: usize,
 ) -> Result<Vec<usize>, impl Iterator<Item = usize>> {
     if expect_len == 0 {
         return Ok(Vec::new());
@@ -553,7 +563,7 @@ fn build_order(
     let mut build_order = ts.collect::<Vec<_>>();
     if build_order.len() == expect_len + 1 {
         // The last node in the build order should be the root.
-        if build_order.pop().expect("always has size > 0") != expect_len {
+        if build_order.pop().expect("always has size > 0") != root_id {
             panic!("Dependency graph was built wrong: root was not sorted last");
         }
         Ok(build_order)
@@ -607,17 +617,16 @@ where
 
         let mut shutdown_notify = ShutdownSignal::new(nodes.iter().map(|gn| gn.is_inert()));
         let mut shutdown_notify_edit = shutdown_notify.get_mut().unwrap();
-        for NodeRelationship { parent, child } in &relationships {
-            shutdown_notify_edit.add_parent(*child, *parent);
+        for NodeRelationship { parent, child } in relationships {
+            shutdown_notify_edit.add_parent(child, parent);
         }
-        let topo_sort = relationships
-            .into_iter()
-            .map(|NodeRelationship { parent, child }| {
-                topological_sort::DependencyLink::from((parent.unwrap_or(nodes.len()), child))
-            })
+        shutdown_notify_edit.remove_unreferenced();
+        let topo_sort = shutdown_notify
+            .edges()
+            .map(topological_sort::DependencyLink::from)
             .collect::<TopologicalSort<_>>();
 
-        let build_order = build_order(topo_sort, nodes.len())
+        let build_order = build_order(topo_sort, shutdown_notify.nodes_len(), nodes.len())
             .map_err(|e| CycleError::new(e.into_iter().map(|i| nodes[i].name())))?;
 
         Ok(AssemblySetup {
@@ -670,11 +679,11 @@ where
             trait_productions: std::iter::repeat_n((), n_traits).map(|_| None).collect(),
         };
         let (task_quits, participants_iter) = shutdown_notify.into_monitors();
-        let mut participants = participants_iter.map(Some).collect::<Vec<_>>();
+        let mut participants = participants_iter.collect::<Vec<_>>();
         for i in build_order {
             let (notifier, participant_creator) = participants[i]
                 .take()
-                .expect("same index appears twice in build order");
+                .expect("same index appears twice or deleted index in build order");
             nodes[i].make(&mut cx, &mut arg_matches, participant_creator, notifier)?;
         }
         let top = T::produce(&mut cx)?;
@@ -691,7 +700,10 @@ where
             panic!("graph construction bug: something depends on the root");
         };
 
-        let names = nodes.iter().map(|n| Some(n.name())).collect();
+        let names = nodes
+            .iter()
+            .map(|n| if n.created() { Some(n.name()) } else { None })
+            .collect();
         let tasks = nodes.into_iter().filter_map(|n| n.task()).collect();
 
         Ok(Self {
@@ -733,7 +745,7 @@ where
         } = self;
         log::info!(
             "Comprehensive starting with {} resources: {}",
-            names.len(),
+            names.iter().filter(|n| n.is_some()).count(),
             active_list(&names)
         );
 
@@ -877,6 +889,7 @@ mod tests {
 
     use atomic_take::AtomicTake;
     use regex::Regex;
+    use std::marker::PhantomData;
     use std::ops::Deref;
     use std::pin::pin;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -1747,5 +1760,66 @@ mod tests {
             panic!("Should have detected a cycle");
         };
         let _ = e.downcast::<CycleError>().expect("CycleError");
+    }
+
+    #[derive(ResourceDependencies)]
+    struct PhantomIncludeNothingConsumes {
+        _unused: PhantomData<ProvidesDyn>,
+    }
+
+    #[test]
+    fn phantom_include_nothing_consumes_graph() {
+        let mut output = Vec::new();
+        Assembly::<PhantomIncludeNothingConsumes>::write_graph(&mut output);
+        let digraph = String::from_utf8(output).unwrap();
+        let mut names = HashMap::new();
+        let edges = fix_graph_for_comparison(&digraph, &mut names);
+        assert_eq!(edges, vec![],);
+    }
+
+    #[test]
+    fn phantom_include_nothing_consumes_run() {
+        let assembly = Assembly::<PhantomIncludeNothingConsumes>::new_from_argv(EMPTY).unwrap();
+        assert_eq!(assembly.names.len(), 2);
+        assert!(assembly.names[0].is_none());
+        assert!(assembly.names[1].is_none());
+        assert!(assembly.tasks.is_empty());
+        let mut r = pin!(assembly.run_with_termination_signal(futures::stream::pending()));
+        let mut e = TestExecutor::default();
+        assert!(e.poll(&mut r).is_ready());
+    }
+
+    #[derive(ResourceDependencies)]
+    struct PhantomIncludeSomethingConsumes {
+        _unused1: PhantomData<ProvidesDyn>,
+        _unused2: Arc<RequiresDyn>,
+    }
+
+    #[test]
+    fn phantom_include_something_consumes() {
+        let mut output = Vec::new();
+        Assembly::<PhantomIncludeSomethingConsumes>::write_graph(&mut output);
+        let digraph = String::from_utf8(output).unwrap();
+        let mut names = HashMap::new();
+        let edges = fix_graph_for_comparison(&digraph, &mut names);
+        assert_eq!(
+            edges,
+            vec![
+                ("ProvidesDyn", "CleanShutdown"),
+                (
+                    "RequiresDyn",
+                    "dyn comprehensive::assembly::tests::NobodyImplements"
+                ),
+                (
+                    "RequiresDyn",
+                    "dyn comprehensive::assembly::tests::TestTrait"
+                ),
+                (
+                    "dyn comprehensive::assembly::tests::TestTrait",
+                    "ProvidesDyn"
+                ),
+                ("top", "RequiresDyn"),
+            ],
+        );
     }
 }

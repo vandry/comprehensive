@@ -15,7 +15,7 @@ rustdoc-args = ["--cfg", "docsrs"]
 atomic-take = "1.1"
 clap = { version = "4.5", features = ["derive"] }
 clap_builder = { version = "4.5", features = ["string"] }
-comprehensive = { path = "../comprehensive", version = "0.6" }
+comprehensive = { path = "../comprehensive", version = "0.6.1" }
 comprehensive_dns = { path = "../comprehensive_dns", version = "0.1" }
 comprehensive_macros = { path = "../comprehensive_macros", version = "0.4.5" }
 comprehensive_warm_channels = { path = "../comprehensive_warm_channels", version = "0.1" }

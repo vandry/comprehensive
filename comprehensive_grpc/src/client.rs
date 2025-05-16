@@ -340,7 +340,7 @@ pub struct GRPCClientDependencies {
     #[cfg(feature = "tls")]
     tls_config: Arc<comprehensive::tls::TlsConfig>,
     health: Arc<HealthReporter>,
-    _include_me: Arc<WarmChannelsDiag>,
+    _include_me: PhantomData<WarmChannelsDiag>,
 }
 
 fn resolve<'a, R, RR>(

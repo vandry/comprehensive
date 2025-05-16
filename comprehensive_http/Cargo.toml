@@ -1,6 +1,6 @@
 [package]
 name = "comprehensive_http"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 repository = "https://github.com/vandry/comprehensive.git"
 homepage = "https://github.com/vandry/comprehensive"
@@ -16,9 +16,10 @@ rustdoc-args = ["--cfg", "docsrs"]
 axum = "0.7"
 axum-server = "0.7"
 clap = { version = "4.5", features = ["derive"] }
-comprehensive = { path = "../comprehensive", version = "0.6" }
+comprehensive = { path = "../comprehensive", version = "0.7" }
 comprehensive_macros = { path = "../comprehensive_macros", version = "0.4.6" }
-comprehensive_traits = { path = "../comprehensive_traits", version = "0.1", features = ["http_diag"] }
+comprehensive_tls = { path = "../comprehensive_tls", version = "0.1", optional = true }
+comprehensive_traits = { path = "../comprehensive_traits", version = "0.1.1", features = ["http_diag"] }
 futures = "0.3"
 http = "1.1"
 hyper = "1.4"
@@ -28,7 +29,7 @@ tokio = { version = "1.40", features = ["macros", "rt-multi-thread", "signal"] }
 tokio-rustls = { version = "0.26", optional = true }
 
 [features]
-tls = ["axum-server/tls-rustls", "comprehensive/tls", "dep:tokio-rustls"]
+tls = ["axum-server/tls-rustls", "dep:comprehensive_tls", "dep:tokio-rustls"]
 
 [dev-dependencies]
 rand = "0.8"

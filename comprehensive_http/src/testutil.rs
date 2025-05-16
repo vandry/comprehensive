@@ -70,7 +70,7 @@ pub(crate) mod tls {
     }
 
     impl MockTlsConfig {
-        pub fn cert_resolver(&self) -> Result<Arc<Resolver>, comprehensive::ComprehensiveError> {
+        pub fn cert_resolver(&self) -> Result<Arc<Resolver>, comprehensive_tls::ComprehensiveTlsError> {
             Ok(Arc::new(Resolver))
         }
     }

@@ -1,6 +1,6 @@
 [package]
 name = "comprehensive"
-version = "0.6.1"
+version = "0.7.0"
 edition = "2024"
 rust-version = "1.86"
 repository = "https://github.com/vandry/comprehensive.git"
@@ -14,7 +14,6 @@ all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
-arc-swap = { version = "1.7", optional = true }
 boxcar = "0.2"
 clap = { version = "4.5", features = ["derive"] }
 comprehensive_macros = { path = "../comprehensive_macros", version = "0.4.7" }
@@ -28,17 +27,11 @@ prometheus = "0.13"
 rustls-pemfile = { version = "2.1", optional = true }
 slice-dst = "1.6.0"
 tokio = { version = "1.40", features = ["macros", "rt-multi-thread", "signal"] }
-tokio-rustls = { version = "0.26", optional = true }
 tokio-stream = { version = "0.1", features = ["signal"] }
 topological-sort = "0.2.2"
 try-lock = "0.2"
 
-[features]
-tls = ["dep:arc-swap", "dep:tokio-rustls", "dep:rustls-pemfile"]
-unreloadable_tls = []
-
 [dev-dependencies]
 atomic-take = "1.1"
 regex = "1.11"
-tempfile = "3"
 tokio-stream = "0.1"

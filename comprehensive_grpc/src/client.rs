@@ -338,7 +338,7 @@ impl<I: InstanceDescriptor> FromArgMatches for GrpcClientArgs<I> {
 pub struct GRPCClientDependencies {
     resolver: Arc<DNSResolver>,
     #[cfg(feature = "tls")]
-    tls_config: Arc<comprehensive::tls::TlsConfig>,
+    tls_config: Arc<comprehensive_tls::TlsConfig>,
     health: Arc<HealthReporter>,
     _include_me: PhantomData<WarmChannelsDiag>,
 }

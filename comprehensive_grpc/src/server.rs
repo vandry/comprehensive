@@ -277,7 +277,7 @@ mod secure_server {
 
     #[derive(ResourceDependencies)]
     pub(super) struct SecureGrpcServerDependencies {
-        tls: Arc<comprehensive::tls::TlsConfig>,
+        tls: Arc<comprehensive_tls::TlsConfig>,
         services: Vec<Arc<dyn GrpcService>>,
         health: Arc<HealthReporter>,
     }

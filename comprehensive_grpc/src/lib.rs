@@ -173,9 +173,10 @@ fn tonic_prometheus_layer_use_default_registry() {
 /// Error type returned by various Comprehensive gRPC functions
 #[derive(Debug, Error)]
 pub enum ComprehensiveGrpcError {
-    /// An error from [`comprehensive`].
+    /// An error from [`comprehensive_tls`].
+    #[cfg(feature = "tls")]
     #[error("{0}")]
-    ComprehensiveError(#[from] comprehensive::ComprehensiveError),
+    ComprehensiveTlsError(#[from] comprehensive_tls::ComprehensiveTlsError),
     /// An error from [`tonic`].
     #[error("{0}")]
     TonicTransportError(#[from] tonic::transport::Error),

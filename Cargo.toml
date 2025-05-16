@@ -7,6 +7,7 @@ members = [
   "comprehensive_http",
   "comprehensive_macros",
   "comprehensive_s3",
+  "comprehensive_tls",
   "comprehensive_traits",
   "comprehensive_warm_channels",
   "examples",

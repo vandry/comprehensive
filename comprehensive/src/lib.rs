@@ -36,20 +36,10 @@
 //! - [Hello World gRPC server]
 //! - [Hello World gRPC client]
 //!
-//! # Feature Flags
-//!
-//! - `tls`: Enables secure versions of each protocol (currently gRPC and HTTP).
-//!   Requires [rustls](https://crates.io/crates/rustls).
-//!
-//! Most features, such as HTTP and Prometheus metrics, are always available.
-//!
 //! [Hello World gRPC server]: https://github.com/vandry/comprehensive/blob/master/examples/src/helloworld-grpc-server.rs
 //! [Hello World gRPC client]: https://github.com/vandry/comprehensive/blob/master/examples/src/helloworld-grpc-client.rs
 
 #![warn(missing_docs)]
-
-#[cfg(feature = "tls")]
-use tokio_rustls::rustls;
 
 pub mod assembly;
 pub mod health;
@@ -64,9 +54,6 @@ pub use v0::{Resource, ShutdownNotify};
 // This is necessary for using the macros defined in comprehensive_macros
 // within this crate.
 extern crate self as comprehensive;
-
-#[cfg(feature = "tls")]
-pub mod tls;
 
 #[cfg(test)]
 mod testutil;
@@ -103,27 +90,12 @@ pub trait AnyResource<const T: usize>: assembly::sealed::ResourceBase<T> {
 pub enum ComprehensiveError {
     /// Wrapper for std::io::Error
     IOError(std::io::Error),
-    /// Wrapper for rustls::Error
-    #[cfg(feature = "tls")]
-    TLSError(rustls::Error),
-    /// Indicates an attempt to configure one of the secure servers
-    /// (gRPCs or HTTPS) without supplying the necessary command line
-    /// flags for the private key and certificate.
-    #[cfg(feature = "tls")]
-    NoTlsFlags,
 }
 
 impl std::fmt::Display for ComprehensiveError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match *self {
             Self::IOError(ref e) => write!(f, "{}", e),
-            #[cfg(feature = "tls")]
-            Self::TLSError(ref e) => write!(f, "{}", e),
-            #[cfg(feature = "tls")]
-            Self::NoTlsFlags => write!(
-                f,
-                "cannot create secure server: --key_path and --cert_path not given"
-            ),
         }
     }
 }
@@ -133,12 +105,5 @@ impl std::error::Error for ComprehensiveError {}
 impl From<std::io::Error> for ComprehensiveError {
     fn from(e: std::io::Error) -> Self {
         Self::IOError(e)
-    }
-}
-
-#[cfg(feature = "tls")]
-impl From<rustls::Error> for ComprehensiveError {
-    fn from(e: rustls::Error) -> Self {
-        Self::TLSError(e)
     }
 }

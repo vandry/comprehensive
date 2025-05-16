@@ -5,7 +5,7 @@
 //! ```
 //! #[derive(comprehensive::ResourceDependencies)]
 //! struct ServerDependencies {
-//!     tls: std::sync::Arc<comprehensive::tls::TlsConfig>,
+//!     tls: std::sync::Arc<comprehensive_tls::TlsConfig>,
 //! }
 //!
 //! # struct Server;
@@ -26,6 +26,7 @@
 //! ```
 
 use arc_swap::ArcSwap;
+use comprehensive::v0::Resource;
 use rustls::RootCertStore;
 use rustls::client::{ClientConfig, ResolvesClientCert};
 use rustls::crypto::CryptoProvider;
@@ -37,15 +38,29 @@ use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
+use thiserror::Error;
 use tokio_rustls::rustls;
-
-use super::ComprehensiveError;
-use super::Resource;
 
 #[cfg(test)]
 pub(crate) mod testdata;
 
 const RELOAD_INTERVAL: std::time::Duration = std::time::Duration::new(900, 0);
+
+/// Error type returned by comprehensive_tls functions
+#[derive(Debug, Error)]
+pub enum ComprehensiveTlsError {
+    /// Wrapper for std::io::Error
+    #[error("{0}")]
+    IOError(#[from] std::io::Error),
+    /// Wrapper for rustls::Error
+    #[error("{0}")]
+    TLSError(#[from] rustls::Error),
+    /// Indicates an attempt to configure one of the secure servers
+    /// (gRPCs or HTTPS) without supplying the necessary command line
+    /// flags for the private key and certificate.
+    #[error("cannot create secure server: --key_path and --cert_path not given")]
+    NoTlsFlags,
+}
 
 /// Command line arguments for the [`TlsConfig`] [`Resource`]. These are
 /// all pathnames to files on disk.
@@ -132,7 +147,7 @@ fn sentinel_mismatch(old: &Option<(u64, SystemTime)>, path: &Path) -> bool {
 }
 
 impl ReloadableKeyAndCertLoader {
-    fn load(&mut self) -> Result<(CertifiedKey, Vec<u8>, Vec<u8>), ComprehensiveError> {
+    fn load(&mut self) -> Result<(CertifiedKey, Vec<u8>, Vec<u8>), ComprehensiveTlsError> {
         let f = load_files(&self.key_path, &self.cert_path)?;
         let private_key = self.provider.key_provider.load_private_key(f.key)?;
         let certified_key = CertifiedKey::new(f.cert, private_key);
@@ -186,7 +201,7 @@ struct ReloadableKeyAndCert {
 }
 
 impl ReloadableKeyAndCert {
-    fn new(key_path: PathBuf, cert_path: PathBuf) -> Result<Self, ComprehensiveError> {
+    fn new(key_path: PathBuf, cert_path: PathBuf) -> Result<Self, ComprehensiveTlsError> {
         let mut loader = ReloadableKeyAndCertLoader {
             provider: CryptoProvider::get_default().expect("default CryptoProvider"),
             key_path,
@@ -253,10 +268,13 @@ pub struct TlsConfig {
 
 impl Resource for TlsConfig {
     type Args = Args;
-    type Dependencies = crate::NoDependencies;
+    type Dependencies = comprehensive::NoDependencies;
     const NAME: &str = "TLS certificate store";
 
-    fn new(_: crate::NoDependencies, args: Args) -> Result<Self, Box<dyn std::error::Error>> {
+    fn new(
+        _: comprehensive::NoDependencies,
+        args: Args,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let inner = if let (Some(key_path), Some(cert_path)) = (args.key_path, args.cert_path) {
             Some(ReloadableKeyAndCert::new(key_path, cert_path)?)
         } else {
@@ -331,10 +349,12 @@ impl TlsConfig {
     /// [`rustls::server::ResolvesServerCert`] trait. This can be
     /// configured into HTTPS etc... servers. The object will make
     /// use of the valid key and certificate most recently read from disk.
-    pub fn cert_resolver(&self) -> Result<Arc<ReloadableKeyAndCertResolver>, ComprehensiveError> {
+    pub fn cert_resolver(
+        &self,
+    ) -> Result<Arc<ReloadableKeyAndCertResolver>, ComprehensiveTlsError> {
         let inner = self.inner.lock().unwrap();
         match inner.as_ref() {
-            None => Err(ComprehensiveError::NoTlsFlags),
+            None => Err(ComprehensiveTlsError::NoTlsFlags),
             Some(inner) => Ok(Arc::clone(&inner.resolver)),
         }
     }
@@ -350,10 +370,10 @@ impl TlsConfig {
     /// unfortunately so it should only be used for `tonic`, which
     /// currently cannot consume a [`rustls::server::ResolvesServerCert`].
     #[cfg(feature = "unreloadable_tls")]
-    pub fn snapshot(&self) -> Result<TlsDataSnapshot, ComprehensiveError> {
+    pub fn snapshot(&self) -> Result<TlsDataSnapshot, ComprehensiveTlsError> {
         let inner = self.inner.lock().unwrap();
         match inner.as_ref() {
-            None => Err(ComprehensiveError::NoTlsFlags),
+            None => Err(ComprehensiveTlsError::NoTlsFlags),
             Some(inner) => Ok(TlsDataSnapshot {
                 key: inner.pem_key_and_cert[0].clone(),
                 cert: inner.pem_key_and_cert[1].clone(),
@@ -375,9 +395,12 @@ impl TlsConfig {
                 cert_path: Some(d.cert_path().into()),
                 cacert: Some(cacert_path),
             };
-            Ok((Self::new(crate::NoDependencies, args)?, Some(d.dir)))
+            Ok((Self::new(comprehensive::NoDependencies, args)?, Some(d.dir)))
         } else {
-            Ok((Self::new(crate::NoDependencies, Args::default())?, None))
+            Ok((
+                Self::new(comprehensive::NoDependencies, Args::default())?,
+                None,
+            ))
         }
     }
 }

@@ -242,7 +242,7 @@ mod secure_server {
     use super::*;
 
     #[cfg(not(test))]
-    type TlsConfig = comprehensive::tls::TlsConfig;
+    type TlsConfig = comprehensive_tls::TlsConfig;
     #[cfg(test)]
     type TlsConfig = crate::testutil::tls::MockTlsConfig;
 
@@ -289,7 +289,7 @@ mod secure_server {
             d: SecureHttpServerDependencies,
             args: SecureHttpServerArgs<I>,
             api: &mut AssemblyRuntime<'_>,
-        ) -> Result<Arc<Self>, comprehensive::ComprehensiveError> {
+        ) -> Result<Arc<Self>, comprehensive_tls::ComprehensiveTlsError> {
             let Some(port) = args.https_port else {
                 return Ok(Arc::new(Self {
                     conf: None,

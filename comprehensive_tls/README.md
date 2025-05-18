@@ -5,22 +5,27 @@ Comprenehsive [`Resource`] for loading a TLS key and certificate.
 Usage:
 
 ```rust
-#[derive(comprehensive::ResourceDependencies)]
+use comprehensive::ResourceDependencies;
+use comprehensive::v1::{AssemblyRuntime, Resource, resource};
+use std::sync::Arc;
+
+#[derive(ResourceDependencies)]
 struct ServerDependencies {
-    tls: std::sync::Arc<comprehensive_tls::TlsConfig>,
+    tls: Arc<comprehensive_tls::TlsConfig>,
 }
 
-impl comprehensive::Resource for Server {
-    type Args = comprehensive::NoArgs;
-    type Dependencies = ServerDependencies;
-    const NAME: &str = "Very secure!";
-
-    fn new(d: ServerDependencies, _: comprehensive::NoArgs) -> Result<Self, Box<dyn std::error::Error>> {
+#[resource]
+impl Resource for Server {
+    fn new(
+        d: ServerDependencies,
+        _: comprehensive::NoArgs,
+        _: &mut AssemblyRuntime<'_>,
+    ) -> Result<Arc<Self>, Box<dyn std::error::Error>> {
         let _ = rustls::ServerConfig::builder()
             .with_no_client_auth()
             .with_cert_resolver(d.tls.cert_resolver()?);
         // ...more setup...
-        Ok(Self)
+        Ok(Arc::new(Self))
     }
 }
 ```

@@ -25,4 +25,6 @@ tokio-rustls = "0.26"
 unreloadable_tls = []
 
 [dev-dependencies]
+futures = "0.3"
 tempfile = "3"
+tokio-test = "0.4"

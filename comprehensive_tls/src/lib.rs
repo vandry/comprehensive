@@ -3,30 +3,35 @@
 //! Usage:
 //!
 //! ```
-//! #[derive(comprehensive::ResourceDependencies)]
+//! use comprehensive::ResourceDependencies;
+//! use comprehensive::v1::{AssemblyRuntime, Resource, resource};
+//! use std::sync::Arc;
+//!
+//! #[derive(ResourceDependencies)]
 //! struct ServerDependencies {
-//!     tls: std::sync::Arc<comprehensive_tls::TlsConfig>,
+//!     tls: Arc<comprehensive_tls::TlsConfig>,
 //! }
 //!
 //! # struct Server;
 //! # use tokio_rustls::rustls;
-//! impl comprehensive::Resource for Server {
-//!     type Args = comprehensive::NoArgs;
-//!     type Dependencies = ServerDependencies;
-//!     const NAME: &str = "Very secure!";
-//!
-//!     fn new(d: ServerDependencies, _: comprehensive::NoArgs) -> Result<Self, Box<dyn std::error::Error>> {
+//! #[resource]
+//! impl Resource for Server {
+//!     fn new(
+//!         d: ServerDependencies,
+//!         _: comprehensive::NoArgs,
+//!         _: &mut AssemblyRuntime<'_>,
+//!     ) -> Result<Arc<Self>, Box<dyn std::error::Error>> {
 //!         let _ = rustls::ServerConfig::builder()
 //!             .with_no_client_auth()
 //!             .with_cert_resolver(d.tls.cert_resolver()?);
 //!         // ...more setup...
-//!         Ok(Self)
+//!         Ok(Arc::new(Self))
 //!     }
 //! }
 //! ```
 
 use arc_swap::ArcSwap;
-use comprehensive::v0::Resource;
+use comprehensive::v1::{AssemblyRuntime, Resource, resource};
 use rustls::RootCertStore;
 use rustls::client::{ClientConfig, ResolvesClientCert};
 use rustls::crypto::CryptoProvider;
@@ -161,6 +166,28 @@ impl ReloadableKeyAndCertLoader {
         sentinel_mismatch(&self.key_meta, &self.key_path)
             || sentinel_mismatch(&self.cert_meta, &self.cert_path)
     }
+
+    fn maybe_reload(&mut self, resolver: &ReloadableKeyAndCertResolver) {
+        if self.needs_reload() {
+            match self.load() {
+                Ok((certified_key, _, _)) => {
+                    // We throw away the key&cert bytes data here since we only
+                    // have it in the first place for tonic's benefit and tonic
+                    // has no way to take a reload anyway.
+                    resolver.0.store(certified_key.into());
+                    log::info!("Reloaded changed TLS key and/or cert.");
+                }
+                Err(e) => {
+                    log::warn!(
+                        "Could not reload TLS key and cert from {} and {}: {}",
+                        self.key_path.display(),
+                        self.cert_path.display(),
+                        e
+                    );
+                }
+            }
+        }
+    }
 }
 
 /// Certificate resolver for configuring into HTTPS etc... servers.
@@ -194,55 +221,24 @@ impl ResolvesClientCert for ReloadableKeyAndCertResolver {
 }
 
 struct ReloadableKeyAndCert {
-    loader: ReloadableKeyAndCertLoader,
     resolver: Arc<ReloadableKeyAndCertResolver>,
     #[cfg(feature = "unreloadable_tls")]
     pem_key_and_cert: [Vec<u8>; 2],
 }
 
 impl ReloadableKeyAndCert {
-    fn new(key_path: PathBuf, cert_path: PathBuf) -> Result<Self, ComprehensiveTlsError> {
-        let mut loader = ReloadableKeyAndCertLoader {
-            provider: CryptoProvider::get_default().expect("default CryptoProvider"),
-            key_path,
-            key_meta: None,
-            cert_path,
-            cert_meta: None,
-        };
+    fn new(loader: &mut ReloadableKeyAndCertLoader) -> Result<Self, ComprehensiveTlsError> {
         #[cfg(feature = "unreloadable_tls")]
         let (certified_key, key_pem, cert_pem) = loader.load()?;
         #[cfg(not(feature = "unreloadable_tls"))]
         let (certified_key, _, _) = loader.load()?;
         Ok(Self {
-            loader,
             resolver: Arc::new(ReloadableKeyAndCertResolver(ArcSwap::from_pointee(
                 certified_key,
             ))),
             #[cfg(feature = "unreloadable_tls")]
             pem_key_and_cert: [key_pem, cert_pem],
         })
-    }
-
-    fn maybe_reload(&mut self) {
-        if self.loader.needs_reload() {
-            match self.loader.load() {
-                Ok((certified_key, _, _)) => {
-                    // We throw away the key&cert bytes data here since we only
-                    // have it in the first place for tonic's benefit and tonic
-                    // has no way to take a reload anyway.
-                    self.resolver.0.store(certified_key.into());
-                    log::info!("Reloaded changed TLS key and/or cert.");
-                }
-                Err(e) => {
-                    log::warn!(
-                        "Could not reload TLS key and cert from {} and {}: {}",
-                        self.loader.key_path.display(),
-                        self.loader.cert_path.display(),
-                        e
-                    );
-                }
-            }
-        }
     }
 }
 
@@ -260,23 +256,38 @@ impl ReloadableKeyAndCert {
 /// for now only consumers who use the [`TlsConfig::cert_resolver`]
 /// interface can take advantage of that.
 pub struct TlsConfig {
-    inner: std::sync::Mutex<Option<ReloadableKeyAndCert>>,
+    inner: Option<ReloadableKeyAndCert>,
     client_config: Arc<ClientConfig>,
     #[allow(dead_code)]
     cacert: Option<Vec<u8>>,
 }
 
+#[resource]
 impl Resource for TlsConfig {
-    type Args = Args;
-    type Dependencies = comprehensive::NoDependencies;
     const NAME: &str = "TLS certificate store";
 
     fn new(
         _: comprehensive::NoDependencies,
         args: Args,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
+        api: &mut AssemblyRuntime<'_>,
+    ) -> Result<Arc<Self>, ComprehensiveTlsError> {
         let inner = if let (Some(key_path), Some(cert_path)) = (args.key_path, args.cert_path) {
-            Some(ReloadableKeyAndCert::new(key_path, cert_path)?)
+            let mut loader = ReloadableKeyAndCertLoader {
+                provider: CryptoProvider::get_default().expect("default CryptoProvider"),
+                key_path,
+                key_meta: None,
+                cert_path,
+                cert_meta: None,
+            };
+            let result = ReloadableKeyAndCert::new(&mut loader)?;
+            let resolver_for_updating = Arc::clone(&result.resolver);
+            api.set_task(async move {
+                loop {
+                    tokio::time::sleep(RELOAD_INTERVAL).await;
+                    loader.maybe_reload(&resolver_for_updating);
+                }
+            });
+            Some(result)
         } else {
             None
         };
@@ -311,23 +322,11 @@ impl Resource for TlsConfig {
             }
             None => client_config.with_no_client_auth(),
         };
-        Ok(Self {
-            inner: std::sync::Mutex::new(inner),
+        Ok(Arc::new(Self {
+            inner,
             client_config: Arc::new(client_config),
             cacert: raw_roots,
-        })
-    }
-
-    async fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let inner = self.inner.lock().unwrap().take();
-        match inner {
-            None => (),
-            Some(mut inner) => loop {
-                tokio::time::sleep(RELOAD_INTERVAL).await;
-                inner.maybe_reload();
-            },
-        };
-        Ok(())
+        }))
     }
 }
 
@@ -352,8 +351,7 @@ impl TlsConfig {
     pub fn cert_resolver(
         &self,
     ) -> Result<Arc<ReloadableKeyAndCertResolver>, ComprehensiveTlsError> {
-        let inner = self.inner.lock().unwrap();
-        match inner.as_ref() {
+        match self.inner.as_ref() {
             None => Err(ComprehensiveTlsError::NoTlsFlags),
             Some(inner) => Ok(Arc::clone(&inner.resolver)),
         }
@@ -371,8 +369,7 @@ impl TlsConfig {
     /// currently cannot consume a [`rustls::server::ResolvesServerCert`].
     #[cfg(feature = "unreloadable_tls")]
     pub fn snapshot(&self) -> Result<TlsDataSnapshot, ComprehensiveTlsError> {
-        let inner = self.inner.lock().unwrap();
-        match inner.as_ref() {
+        match self.inner.as_ref() {
             None => Err(ComprehensiveTlsError::NoTlsFlags),
             Some(inner) => Ok(TlsDataSnapshot {
                 key: inner.pem_key_and_cert[0].clone(),
@@ -381,39 +378,50 @@ impl TlsConfig {
             }),
         }
     }
-
-    #[cfg(test)]
-    pub(crate) fn for_tests(
-        active: bool,
-    ) -> Result<(Self, Option<tempfile::TempDir>), Box<dyn std::error::Error>> {
-        if active {
-            let d = testdata::CertAndKeyFiles::user1()?;
-            let cacert_path = d.dir.path().join("cacert");
-            std::fs::write(&cacert_path, testdata::CACERT)?;
-            let args = Args {
-                key_path: Some(d.key_path().into()),
-                cert_path: Some(d.cert_path().into()),
-                cacert: Some(cacert_path),
-            };
-            Ok((Self::new(comprehensive::NoDependencies, args)?, Some(d.dir)))
-        } else {
-            Ok((
-                Self::new(comprehensive::NoDependencies, Args::default())?,
-                None,
-            ))
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    use comprehensive::{Assembly, ResourceDependencies};
+    use futures::poll;
+    use std::pin::pin;
+
+    #[derive(ResourceDependencies)]
+    struct TopDependencies(Arc<TlsConfig>);
+
+    fn test_assembly(
+        active: bool,
+    ) -> Result<(Assembly<TopDependencies>, Option<tempfile::TempDir>), Box<dyn std::error::Error>>
+    {
+        let (argv, dir): (Vec<std::ffi::OsString>, _) = if active {
+            let d = testdata::CertAndKeyFiles::user1()?;
+            let cacert_path = d.dir.path().join("cacert");
+            std::fs::write(&cacert_path, testdata::CACERT)?;
+            (
+                vec![
+                    "cmd".into(),
+                    "--key-path".into(),
+                    d.key_path().into(),
+                    "--cert-path".into(),
+                    d.cert_path().into(),
+                    "--cacert".into(),
+                    cacert_path.into(),
+                ],
+                Some(d.dir),
+            )
+        } else {
+            (vec!["cmd".into()], None)
+        };
+        Ok((Assembly::<TopDependencies>::new_from_argv(argv)?, dir))
+    }
+
     #[test]
     fn first_load() {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-        let (tlsc, tempdir) = TlsConfig::for_tests(true).expect("creating test TLS");
-        let resolver = tlsc.cert_resolver().expect("get resolver");
+        let (a, tempdir) = test_assembly(true).expect("creating test TLS");
+        let resolver = a.top.0.cert_resolver().expect("get resolver");
 
         let got = resolver.real_resolve().expect("resolve");
         let want = rustls_pemfile::certs(&mut Cursor::new(&testdata::USER1_CERT))
@@ -423,15 +431,19 @@ mod tests {
         std::mem::drop(tempdir);
     }
 
-    #[test]
-    fn reload_success() {
+    #[tokio::test(start_paused = true)]
+    async fn reload_success() {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-        let (tlsc, tempdir) = TlsConfig::for_tests(true).expect("creating test TLS");
-        let resolver = tlsc.cert_resolver().expect("get resolver");
+        let (a, tempdir) = test_assembly(true).expect("creating test TLS");
+        let resolver = a.top.0.cert_resolver().expect("get resolver");
         let p = tempdir.as_ref().unwrap().path();
         std::fs::write(p.join("key"), testdata::USER2_KEY).expect("rewrite key");
         std::fs::write(p.join("cert"), testdata::USER2_CERT).expect("rewrite cert");
-        tlsc.inner.lock().unwrap().as_mut().unwrap().maybe_reload();
+
+        let mut r = pin!(a.run_with_termination_signal(futures::stream::pending()));
+        assert!(poll!(&mut r).is_pending());
+        let _ = futures::future::select(&mut r, pin!(tokio::time::advance(RELOAD_INTERVAL))).await;
+        assert!(poll!(&mut r).is_pending());
 
         let got = resolver.real_resolve().expect("resolve");
         let want = rustls_pemfile::certs(&mut Cursor::new(&testdata::USER2_CERT))
@@ -441,15 +453,19 @@ mod tests {
         std::mem::drop(tempdir);
     }
 
-    #[test]
-    fn reload_fail() {
+    #[tokio::test(start_paused = true)]
+    async fn reload_fail() {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-        let (tlsc, tempdir) = TlsConfig::for_tests(true).expect("creating test TLS");
-        let resolver = tlsc.cert_resolver().expect("get resolver");
+        let (a, tempdir) = test_assembly(true).expect("creating test TLS");
+        let resolver = a.top.0.cert_resolver().expect("get resolver");
         let p = tempdir.as_ref().unwrap().path();
         std::fs::write(p.join("key"), "not valid").expect("rewrite key");
         std::fs::write(p.join("cert"), "not valid").expect("rewrite cert");
-        tlsc.inner.lock().unwrap().as_mut().unwrap().maybe_reload();
+
+        let mut r = pin!(a.run_with_termination_signal(futures::stream::pending()));
+        assert!(poll!(&mut r).is_pending());
+        let _ = futures::future::select(&mut r, pin!(tokio::time::advance(RELOAD_INTERVAL))).await;
+        assert!(poll!(&mut r).is_pending());
 
         let got = resolver.real_resolve().expect("resolve");
         let want = rustls_pemfile::certs(&mut Cursor::new(&testdata::USER1_CERT))

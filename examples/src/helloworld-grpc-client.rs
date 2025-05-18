@@ -52,8 +52,6 @@ struct TopDependencies {
 #[tokio::main]
 pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
-    // Required if TLS is needed.
-    let _ = tokio_rustls::rustls::crypto::aws_lc_rs::default_provider().install_default();
 
     // Will send gRPC greetings at regular intervals using a gRPC client
     // with or without TLS depending on flags, and also serve HTTP and/or

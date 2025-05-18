@@ -34,7 +34,7 @@ use arc_swap::ArcSwap;
 use comprehensive::v1::{AssemblyRuntime, Resource, resource};
 use rustls::RootCertStore;
 use rustls::client::{ClientConfig, ResolvesClientCert};
-use rustls::crypto::CryptoProvider;
+use rustls::crypto::{CryptoProvider, KeyProvider};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
@@ -93,7 +93,7 @@ pub struct Args {
 
 #[derive(Debug)]
 struct ReloadableKeyAndCertLoader {
-    provider: &'static Arc<CryptoProvider>,
+    provider: Option<&'static dyn KeyProvider>,
     key_path: PathBuf,
     key_meta: Option<(u64, SystemTime)>,
     cert_path: PathBuf,
@@ -154,7 +154,10 @@ fn sentinel_mismatch(old: &Option<(u64, SystemTime)>, path: &Path) -> bool {
 impl ReloadableKeyAndCertLoader {
     fn load(&mut self) -> Result<(CertifiedKey, Vec<u8>, Vec<u8>), ComprehensiveTlsError> {
         let f = load_files(&self.key_path, &self.cert_path)?;
-        let private_key = self.provider.key_provider.load_private_key(f.key)?;
+        let private_key = match self.provider {
+            Some(p) => p.load_private_key(f.key)?,
+            None => rustls::crypto::aws_lc_rs::sign::any_supported_type(&f.key)?,
+        };
         let certified_key = CertifiedKey::new(f.cert, private_key);
         certified_key.keys_match()?;
         self.key_meta = f.key_sentinel;
@@ -271,9 +274,10 @@ impl Resource for TlsConfig {
         args: Args,
         api: &mut AssemblyRuntime<'_>,
     ) -> Result<Arc<Self>, ComprehensiveTlsError> {
+        let crypto_provider = CryptoProvider::get_default();
         let inner = if let (Some(key_path), Some(cert_path)) = (args.key_path, args.cert_path) {
             let mut loader = ReloadableKeyAndCertLoader {
-                provider: CryptoProvider::get_default().expect("default CryptoProvider"),
+                provider: crypto_provider.map(|p| p.key_provider),
                 key_path,
                 key_meta: None,
                 cert_path,
@@ -314,7 +318,13 @@ impl Resource for TlsConfig {
             None
         };
         let roots = Arc::new(roots);
-        let client_config = ClientConfig::builder().with_root_certificates(roots);
+        let provider = match crypto_provider {
+            Some(p) => Arc::clone(p),
+            None => Arc::new(rustls::crypto::aws_lc_rs::default_provider()),
+        };
+        let client_config = ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()?
+            .with_root_certificates(roots);
         let client_config = match inner {
             Some(ref inner) => {
                 let resolver = Arc::clone(&inner.resolver);
@@ -419,7 +429,6 @@ mod tests {
 
     #[test]
     fn first_load() {
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let (a, tempdir) = test_assembly(true).expect("creating test TLS");
         let resolver = a.top.0.cert_resolver().expect("get resolver");
 
@@ -433,7 +442,6 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn reload_success() {
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let (a, tempdir) = test_assembly(true).expect("creating test TLS");
         let resolver = a.top.0.cert_resolver().expect("get resolver");
         let p = tempdir.as_ref().unwrap().path();
@@ -455,7 +463,6 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn reload_fail() {
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let (a, tempdir) = test_assembly(true).expect("creating test TLS");
         let resolver = a.top.0.cert_resolver().expect("get resolver");
         let p = tempdir.as_ref().unwrap().path();

@@ -4,8 +4,6 @@
 //! also implements the [`GrpcService`] trait using the [`resource`] macro:
 //!
 //! ```
-//! # #[cfg(feature = "tls")]
-//! # let _ = tokio_rustls::rustls::crypto::aws_lc_rs::default_provider().install_default();
 //! # mod pb {
 //! #     tonic::include_proto!("comprehensive");
 //! #     pub const FILE_DESCRIPTOR_SET: &[u8] = tonic::include_file_descriptor_set!("fdset");

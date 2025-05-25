@@ -44,9 +44,8 @@ use tokio::sync::{Notify, futures::Notified};
 use crate::ResourceDependencies;
 use crate::assembly::sealed::ResourceBase;
 use crate::assembly::{ProduceContext, RegisterContext};
-use crate::shutdown::{
-    ShutdownSignalParticipant, ShutdownSignalParticipantCreator, TaskRunningSentinel,
-};
+use crate::drop_stream::Sentinel;
+use crate::shutdown::{ShutdownSignalParticipant, ShutdownSignalParticipantCreator};
 
 /// Passed to resources to offer resources a chance to react to a termination
 /// request signal. Interested resources should call [`ShutdownNotify::subscribe`].
@@ -144,7 +143,7 @@ pin_project! {
 pin_project! {
     struct NotifyInner<F> {
         #[pin] fut: F,
-        task_running: TaskRunningSentinel,
+        task_running: Sentinel,
         name: &'static str,
     }
 }
@@ -161,7 +160,7 @@ impl<F> NotifyHelper<F> {
         fut: F,
         notify: Arc<Notify>,
         sub: ShutdownSignalParticipant,
-        task_running: TaskRunningSentinel,
+        task_running: Sentinel,
         name: &'static str,
     ) -> Self {
         Self {
@@ -214,7 +213,7 @@ where
 
 impl<T: Resource> ResourceBase<{ crate::ResourceVariety::V0 as usize }> for T {
     const NAME: &str = T::NAME;
-    type Production = (Arc<T>, ShutdownSignalParticipant, TaskRunningSentinel);
+    type Production = (Arc<T>, ShutdownSignalParticipant, Sentinel);
 
     fn register_recursive(cx: &mut RegisterContext<'_>) {
         T::Dependencies::register(cx);
@@ -228,7 +227,8 @@ impl<T: Resource> ResourceBase<{ crate::ResourceVariety::V0 as usize }> for T {
         cx: &mut ProduceContext<'_>,
         arg_matches: &mut clap::ArgMatches,
         stoppers: ShutdownSignalParticipantCreator,
-        task_running: TaskRunningSentinel,
+        task_running: Sentinel,
+        _: crate::assembly::sealed::DependencyTest,
     ) -> Result<Self::Production, Box<dyn Error>> {
         let deps = T::Dependencies::produce(cx)?;
         let args = T::Args::from_arg_matches(arg_matches)?;

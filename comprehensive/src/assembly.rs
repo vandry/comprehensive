@@ -41,9 +41,9 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use topological_sort::TopologicalSort;
 
-use crate::shutdown::{
-    ShutdownSignal, ShutdownSignalForwarder, ShutdownSignalParticipantCreator, TaskRunningSentinel,
-};
+use crate::drop_stream::Sentinel;
+use crate::matrix::DepMatrix;
+use crate::shutdown::{ShutdownSignal, ShutdownSignalForwarder, ShutdownSignalParticipantCreator};
 
 pub(crate) type ResourceFut = Pin<Box<dyn Future<Output = Result<(), Box<dyn Error>>> + Send>>;
 
@@ -68,7 +68,8 @@ trait NodeTrait: Any {
         cx: &mut ProduceContext<'_>,
         arg_matches: &mut ArgMatches,
         stoppers: ShutdownSignalParticipantCreator,
-        keepalive: TaskRunningSentinel,
+        keepalive: Sentinel,
+        dependency_test: sealed::DependencyTest,
     ) -> Result<(), Box<dyn Error>>;
     fn task(self: Box<Self>) -> Option<ResourceFut>;
     fn created(&self) -> bool;
@@ -92,13 +93,15 @@ impl<T: sealed::ResourceBase<U>, const U: usize> NodeTrait for Node<T, U> {
         cx: &mut ProduceContext<'_>,
         arg_matches: &mut ArgMatches,
         stoppers: ShutdownSignalParticipantCreator,
-        keepalive: TaskRunningSentinel,
+        keepalive: Sentinel,
+        dependency_test: sealed::DependencyTest,
     ) -> Result<(), Box<dyn Error>> {
         let _ = self.production.set(<T as sealed::ResourceBase<U>>::make(
             cx,
             arg_matches,
             stoppers,
             keepalive,
+            dependency_test,
         )?);
         Ok(())
     }
@@ -157,7 +160,8 @@ impl TraitGraphNode {
         _: &mut ProduceContext<'_>,
         _: &mut ArgMatches,
         _: ShutdownSignalParticipantCreator,
-        _: TaskRunningSentinel,
+        _: Sentinel,
+        _: sealed::DependencyTest,
     ) -> Result<(), Box<dyn Error>> {
         Ok(())
     }
@@ -189,7 +193,8 @@ impl GraphNode {
                 cx: &mut ProduceContext<'_>,
                 arg_matches: &mut ArgMatches,
                 stoppers: ShutdownSignalParticipantCreator,
-                keepalive: TaskRunningSentinel,
+                keepalive: Sentinel,
+                dependency_test: sealed::DependencyTest,
             ) -> Result<(), Box<dyn Error>>;
             fn task(self) -> Option<ResourceFut>;
             fn created(&self) -> bool;
@@ -270,11 +275,16 @@ pub struct ProduceContext<'a> {
     type_map: HashMap<TypeId, usize>,
     nodes: &'a Vec<GraphNode>,
     trait_productions: Box<[Option<TraitProduction>]>,
+    dep_matrix: &'a DepMatrix,
 }
 
 impl ProduceContext<'_> {
-    pub(crate) fn get_trait_i<T: Any + ?Sized>(&self) -> Option<usize> {
-        self.type_map.get(&TypeId::of::<T>()).copied()
+    pub(crate) fn get_trait_i<T: Any + ?Sized>(&self, i: sealed::DependencyTest) -> Option<usize> {
+        self.type_map
+            .get(&TypeId::of::<T>())
+            // Only if this resource has previously declared it exports this trait.
+            .filter(|ti| self.dep_matrix.get_bit(**ti, i.0))
+            .copied()
     }
 
     pub(crate) fn provide_as_trait<T: Any + ?Sized>(&mut self, i: usize, shared: Arc<T>) {
@@ -301,7 +311,7 @@ impl ProduceContext<'_> {
 pub(crate) mod sealed {
     use super::{
         Any, Arc, ArgMatches, Error, HashMap, NodeRelationship, ProduceContext, RegisterContext,
-        ResourceFut, ShutdownSignalParticipantCreator, TaskRunningSentinel, TypeId,
+        ResourceFut, Sentinel, ShutdownSignalParticipantCreator, TypeId,
     };
 
     pub struct TraitRegisterContext<'a> {
@@ -334,11 +344,15 @@ pub(crate) mod sealed {
             cx: &mut ProduceContext<'_>,
             arg_matches: &mut ArgMatches,
             stoppers: ShutdownSignalParticipantCreator,
-            keepalive: TaskRunningSentinel,
+            keepalive: Sentinel,
+            dependency_test: DependencyTest,
         ) -> Result<Self::Production, Box<dyn Error>>;
         fn shared(re: &Self::Production) -> Arc<Self>;
         fn task(re: Self::Production) -> ResourceFut;
     }
+
+    #[derive(Clone, Copy)]
+    pub struct DependencyTest(pub(super) usize);
 }
 
 /// Opaque type used in the implementation of the [`ResourceDependencies`]
@@ -456,7 +470,8 @@ pub struct Assembly<T> {
     shutdown_notify: ShutdownSignalForwarder,
     tasks: FuturesUnordered<ResourceFut>,
     names: Box<[Option<&'static str>]>,
-    task_quits: crate::shutdown::TaskQuits,
+    task_quits: crate::drop_stream::DropStream,
+    dep_matrix: DepMatrix,
     /// The constructed instances of the top-level (root) dependencies.
     /// Access to this is freqently not required as these resources
     /// will work autonomously once included in the graph.
@@ -483,15 +498,19 @@ fn active_list(names: &[Option<&'static str>]) -> String {
 pin_project! {
     struct TerminationSignal<T> {
         #[pin] signal_stream: Option<T>,
-        shutdown_notify: Option<ShutdownSignalForwarder>,
+        shutdown_notify: Option<(ShutdownSignalForwarder, DepMatrix)>,
     }
 }
 
 impl<T> TerminationSignal<T> {
-    fn new(signal_stream: T, shutdown_notify: ShutdownSignalForwarder) -> Self {
+    fn new(
+        signal_stream: T,
+        shutdown_notify: ShutdownSignalForwarder,
+        dep_matrix: DepMatrix,
+    ) -> Self {
         Self {
             signal_stream: Some(signal_stream),
-            shutdown_notify: Some(shutdown_notify),
+            shutdown_notify: Some((shutdown_notify, dep_matrix)),
         }
     }
 }
@@ -505,9 +524,9 @@ impl<T: Stream> Future for TerminationSignal<T> {
             if let Some(s) = this.signal_stream.as_mut().as_pin_mut() {
                 let _ = ready!(s.poll_next(cx));
                 match this.shutdown_notify.take() {
-                    Some(n) => {
+                    Some((n, dep_matrix)) => {
                         log::warn!("SIGTERM received; shutting down");
-                        n.propagate();
+                        n.propagate_with_dep_matrix(dep_matrix);
                         continue;
                     }
                     None => {
@@ -557,11 +576,11 @@ fn build_order(
     expect_len: usize,
     root_id: usize,
 ) -> Result<Vec<usize>, impl Iterator<Item = usize>> {
-    if expect_len == 0 {
+    if expect_len == 1 {
         return Ok(Vec::new());
     }
     let mut build_order = ts.collect::<Vec<_>>();
-    if build_order.len() == expect_len + 1 {
+    if build_order.len() == expect_len {
         // The last node in the build order should be the root.
         if build_order.pop().expect("always has size > 0") != root_id {
             panic!("Dependency graph was built wrong: root was not sorted last");
@@ -583,7 +602,7 @@ struct AssemblySetup {
     nodes: Vec<GraphNode>,
     type_map: HashMap<TypeId, usize>,
     build_order: Vec<usize>,
-    shutdown_notify: ShutdownSignal,
+    dep_matrix: DepMatrix,
     n_traits: usize,
 }
 
@@ -615,25 +634,25 @@ where
             }
         }
 
-        let mut shutdown_notify = ShutdownSignal::new(nodes.iter().map(|gn| gn.is_inert()));
-        let mut shutdown_notify_edit = shutdown_notify.get_mut().unwrap();
+        let root_id = nodes.len();
+        let mut dep_matrix = DepMatrix::new(root_id + 1, root_id);
         for NodeRelationship { parent, child } in relationships {
-            shutdown_notify_edit.add_parent(child, parent);
+            dep_matrix.set_bit(parent.unwrap_or(root_id), child);
         }
-        shutdown_notify_edit.remove_unreferenced();
-        let topo_sort = shutdown_notify
+        dep_matrix.with_incref(root_id, |m| m.remove_unreferenced());
+        let topo_sort = dep_matrix
             .edges()
             .map(topological_sort::DependencyLink::from)
             .collect::<TopologicalSort<_>>();
 
-        let build_order = build_order(topo_sort, shutdown_notify.nodes_len(), nodes.len())
+        let build_order = build_order(topo_sort, dep_matrix.n_live_rows(), root_id)
             .map_err(|e| CycleError::new(e.into_iter().map(|i| nodes[i].name())))?;
 
         Ok(AssemblySetup {
             nodes,
             type_map,
             build_order,
-            shutdown_notify,
+            dep_matrix,
             n_traits,
         })
     }
@@ -656,7 +675,7 @@ where
             nodes,
             type_map,
             build_order,
-            shutdown_notify,
+            dep_matrix,
             n_traits,
         } = Self::setup()?;
 
@@ -677,17 +696,28 @@ where
             type_map,
             nodes: &nodes,
             trait_productions: std::iter::repeat_n((), n_traits).map(|_| None).collect(),
+            dep_matrix: &dep_matrix,
         };
-        let (task_quits, participants_iter) = shutdown_notify.into_monitors();
+        let participants_iter =
+            ShutdownSignal::new(nodes.iter().map(|gn| gn.is_inert()), &dep_matrix);
+        let mut task_quits_gen = crate::drop_stream::Builder::new(nodes.len());
         let mut participants = participants_iter.collect::<Vec<_>>();
         for i in build_order {
-            let (notifier, participant_creator) = participants[i]
+            let participant_creator = participants[i]
                 .take()
                 .expect("same index appears twice or deleted index in build order");
-            nodes[i].make(&mut cx, &mut arg_matches, participant_creator, notifier)?;
+            let notifier = task_quits_gen.make_sentinel(i).expect("task notifier");
+            nodes[i].make(
+                &mut cx,
+                &mut arg_matches,
+                participant_creator,
+                notifier,
+                sealed::DependencyTest(i),
+            )?;
         }
+        let task_quits = task_quits_gen.into_stream();
         let top = T::produce(&mut cx)?;
-        let (_, root_participant_iter) = participants
+        let root_participant_iter = participants
             .last_mut()
             .unwrap()
             .take()
@@ -712,6 +742,7 @@ where
             top,
             shutdown_notify,
             task_quits,
+            dep_matrix,
         })
     }
 
@@ -742,6 +773,7 @@ where
             mut names,
             mut task_quits,
             top: _,
+            dep_matrix,
         } = self;
         log::info!(
             "Comprehensive starting with {} resources: {}",
@@ -780,10 +812,10 @@ where
         // Blocking loop for the rest of time.
         log::info!(
             "After startup, {} resources are running: {}",
-            task_quits.len(),
+            names.iter().filter(|n| n.is_some()).count(),
             active_list(&names)
         );
-        let mut term = TerminationSignal::new(termination_signal, shutdown_notify);
+        let mut term = TerminationSignal::new(termination_signal, shutdown_notify, dep_matrix);
         loop {
             futures::select! {
                 task_result = tasks.next() => {
@@ -827,7 +859,7 @@ where
             nodes,
             type_map: _,
             build_order: _,
-            shutdown_notify,
+            dep_matrix,
             n_traits: _,
         } = Self::setup().unwrap();
 
@@ -841,7 +873,7 @@ where
             };
             writeln!(w, "  \"i-{}\" [label={:?}{}]", i, n.name(), shape).unwrap();
         }
-        for (from_i, to_i) in shutdown_notify.edges() {
+        for (from_i, to_i) in dep_matrix.edges() {
             let parent_label;
             let parent = if from_i == node_count {
                 "top"
@@ -935,7 +967,7 @@ mod tests {
             #[pin] stopper: Option<ShutdownSignalParticipant>,
             #[pin] block: Option<tokio::sync::oneshot::Receiver<()>>,
             forwarder: Option<ShutdownSignalForwarder>,
-            up: Option<TaskRunningSentinel>,
+            up: Option<Sentinel>,
         }
     }
 
@@ -972,11 +1004,7 @@ mod tests {
 
     impl<T: TestResource> sealed::ResourceBase<{ crate::ResourceVariety::Test as usize }> for T {
         const NAME: &str = T::NAME;
-        type Production = (
-            Arc<Self>,
-            Option<ShutdownSignalParticipant>,
-            TaskRunningSentinel,
-        );
+        type Production = (Arc<Self>, Option<ShutdownSignalParticipant>, Sentinel);
 
         fn register_recursive(cx: &mut RegisterContext<'_>) {
             T::Dependencies::register(cx);
@@ -1003,7 +1031,8 @@ mod tests {
             cx: &mut ProduceContext<'_>,
             arg_matches: &mut ArgMatches,
             stoppers: ShutdownSignalParticipantCreator,
-            up: TaskRunningSentinel,
+            up: Sentinel,
+            _: sealed::DependencyTest,
         ) -> Result<Self::Production, Box<dyn Error>> {
             if arg_matches
                 .get_one::<bool>("count")
@@ -1032,11 +1061,7 @@ mod tests {
         }
 
         fn task(
-            p: (
-                Arc<T>,
-                Option<ShutdownSignalParticipant>,
-                TaskRunningSentinel,
-            ),
+            p: (Arc<T>, Option<ShutdownSignalParticipant>, Sentinel),
         ) -> Pin<Box<dyn Future<Output = Result<(), Box<dyn Error>>> + Send>> {
             match p.1 {
                 Some(stopper) => Box::pin(ReportTask {
@@ -1350,7 +1375,7 @@ mod tests {
     pin_project! {
         struct RunUntilSignaledTask {
             #[pin] test_signals_we_are_done: tokio::sync::oneshot::Receiver<()>,
-            notifier: Option<TaskRunningSentinel>,
+            notifier: Option<Sentinel>,
         }
     }
 
@@ -1378,7 +1403,8 @@ mod tests {
             _: &mut ProduceContext<'_>,
             _: &mut ArgMatches,
             _: ShutdownSignalParticipantCreator,
-            notifier: TaskRunningSentinel,
+            notifier: Sentinel,
+            _: sealed::DependencyTest,
         ) -> Result<RunUntilSignaledProduction, Box<dyn Error>> {
             let (tx, rx) = tokio::sync::oneshot::channel();
             Ok(RunUntilSignaledProduction {
@@ -1438,13 +1464,14 @@ mod tests {
 
     impl sealed::ResourceBase<{ crate::ResourceVariety::Test as usize }> for CleanShutdown {
         const NAME: &str = "CleanShutdown";
-        type Production = (Arc<Self>, ShutdownSignalParticipant, TaskRunningSentinel);
+        type Production = (Arc<Self>, ShutdownSignalParticipant, Sentinel);
 
         fn make(
             _: &mut ProduceContext<'_>,
             _: &mut ArgMatches,
             term_signals: ShutdownSignalParticipantCreator,
-            up: TaskRunningSentinel,
+            up: Sentinel,
+            _: sealed::DependencyTest,
         ) -> Result<Self::Production, Box<dyn Error>> {
             Ok((
                 Arc::new(CleanShutdown::default()),
@@ -1510,7 +1537,8 @@ mod tests {
             cx: &mut ProduceContext<'_>,
             _: &mut ArgMatches,
             stoppers: ShutdownSignalParticipantCreator,
-            _: TaskRunningSentinel,
+            _: Sentinel,
+            _: sealed::DependencyTest,
         ) -> Result<Self::Production, Box<dyn Error>> {
             let deps = RequiresDynDependencies::produce(cx)?;
             assert!(deps.0.len() == 2);
@@ -1555,18 +1583,19 @@ mod tests {
             cx: &mut ProduceContext<'_>,
             _: &mut ArgMatches,
             stoppers: ShutdownSignalParticipantCreator,
-            _: TaskRunningSentinel,
+            _: Sentinel,
+            dt: sealed::DependencyTest,
         ) -> Result<Self::Production, Box<dyn Error>> {
             let _ = CleanShutdownTop::produce(cx)?;
             let shared = Arc::new(ProvidesDyn);
 
-            if let Some(i) = cx.get_trait_i::<dyn TestTrait>() {
+            if let Some(i) = cx.get_trait_i::<dyn TestTrait>(dt) {
                 let shared2 = Arc::clone(&shared);
                 let alias: Arc<dyn TestTrait> = shared2;
                 cx.provide_as_trait(i, alias);
             }
 
-            if let Some(i) = cx.get_trait_i::<dyn NobodyInterested>() {
+            if let Some(i) = cx.get_trait_i::<dyn NobodyInterested>(dt) {
                 let shared2 = Arc::clone(&shared);
                 let alias: Arc<dyn NobodyInterested> = shared2;
                 cx.provide_as_trait(i, alias);
@@ -1605,10 +1634,11 @@ mod tests {
             cx: &mut ProduceContext<'_>,
             _: &mut ArgMatches,
             _: ShutdownSignalParticipantCreator,
-            _: TaskRunningSentinel,
+            _: Sentinel,
+            dt: sealed::DependencyTest,
         ) -> Result<Self::Production, Box<dyn Error>> {
             let shared = Arc::new(AlsoProvidesDyn);
-            if let Some(i) = cx.get_trait_i::<dyn TestTrait>() {
+            if let Some(i) = cx.get_trait_i::<dyn TestTrait>(dt) {
                 let shared2 = Arc::clone(&shared);
                 let alias: Arc<dyn TestTrait> = shared2;
                 cx.provide_as_trait(i, alias);
@@ -1707,7 +1737,8 @@ mod tests {
             _: &mut ProduceContext<'_>,
             _: &mut ArgMatches,
             _: ShutdownSignalParticipantCreator,
-            _: TaskRunningSentinel,
+            _: Sentinel,
+            _: sealed::DependencyTest,
         ) -> Result<(), Box<dyn Error>> {
             unreachable!();
         }
@@ -1737,7 +1768,8 @@ mod tests {
             _: &mut ProduceContext<'_>,
             _: &mut ArgMatches,
             _: ShutdownSignalParticipantCreator,
-            _: TaskRunningSentinel,
+            _: Sentinel,
+            _: sealed::DependencyTest,
         ) -> Result<(), Box<dyn Error>> {
             unreachable!();
         }

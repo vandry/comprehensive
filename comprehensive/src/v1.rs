@@ -25,11 +25,10 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use crate::ResourceDependencies;
-use crate::assembly::sealed::{ResourceBase, TraitRegisterContext};
+use crate::assembly::sealed::{DependencyTest, ResourceBase, TraitRegisterContext};
 use crate::assembly::{ProduceContext, RegisterContext, ResourceFut};
-use crate::shutdown::{
-    ShutdownSignalParticipant, ShutdownSignalParticipantCreator, TaskRunningSentinel,
-};
+use crate::drop_stream::Sentinel;
+use crate::shutdown::{ShutdownSignalParticipant, ShutdownSignalParticipantCreator};
 
 /// [`Future`] returned by [`AssemblyRuntime::self_stop`] which resolves when
 /// the [`Assembly`] has received a shutdown signal and the sequence of
@@ -123,7 +122,7 @@ impl AssemblyRuntime<'_> {
 pub struct TraitInstallerProduce<'a, 'b, 'c, R> {
     cx: &'a mut ProduceContext<'c>,
     shared: &'b Arc<R>,
-    resource: &'b TaskRunningSentinel,
+    dependency_test: DependencyTest,
 }
 
 #[doc(hidden)]
@@ -141,12 +140,10 @@ impl<R> TraitInstaller<'_, '_, '_, R> {
         match self {
             Self::Register(cx) => cx.register_as_trait::<T>(),
             Self::Produce(installer) => {
-                if let Some(trait_i) = installer.cx.get_trait_i::<T>() {
-                    if installer.resource.is_dependent_of(trait_i) {
-                        installer
-                            .cx
-                            .provide_as_trait(trait_i, factory(installer.shared));
-                    }
+                if let Some(trait_i) = installer.cx.get_trait_i::<T>(installer.dependency_test) {
+                    installer
+                        .cx
+                        .provide_as_trait(trait_i, factory(installer.shared));
                 }
             }
         }
@@ -280,7 +277,7 @@ pub use comprehensive_macros::v1resource as resource;
 pin_project! {
     struct TaskInner<F> {
         #[pin] fut: F,
-        keepalive: TaskRunningSentinel,
+        keepalive: Sentinel,
     }
 }
 
@@ -299,7 +296,7 @@ pin_project! {
 }
 
 impl<F> AutoStopTask<F> {
-    fn new<T>(task: T, stopper: ShutdownSignalParticipant, keepalive: TaskRunningSentinel) -> Self
+    fn new<T>(task: T, stopper: ShutdownSignalParticipant, keepalive: Sentinel) -> Self
     where
         T: IntoFuture<IntoFuture = F>,
     {
@@ -342,7 +339,7 @@ where
 }
 
 impl<F> SelfStopTask<F> {
-    fn new<T>(task: T, stopper: ShutdownSignalParticipant, keepalive: TaskRunningSentinel) -> Self
+    fn new<T>(task: T, stopper: ShutdownSignalParticipant, keepalive: Sentinel) -> Self
     where
         T: IntoFuture<IntoFuture = F>,
     {
@@ -389,7 +386,7 @@ trait Task: Send {
     fn into_task(
         self: Box<Self>,
         stopper: ShutdownSignalParticipant,
-        keepalive: TaskRunningSentinel,
+        keepalive: Sentinel,
         auto_stop: bool,
     ) -> ResourceFut;
 }
@@ -404,7 +401,7 @@ where
     fn into_task(
         self: Box<Self>,
         stopper: ShutdownSignalParticipant,
-        keepalive: TaskRunningSentinel,
+        keepalive: Sentinel,
         auto_stop: bool,
     ) -> ResourceFut {
         if auto_stop {
@@ -420,7 +417,7 @@ mod private {
         pub(super) shared: std::sync::Arc<T>,
         pub(super) task: Option<Box<dyn super::Task>>,
         pub(super) stopper: super::ShutdownSignalParticipant,
-        pub(super) keepalive: super::TaskRunningSentinel,
+        pub(super) keepalive: super::Sentinel,
         pub(super) auto_stop: bool,
     }
 }
@@ -446,7 +443,8 @@ impl<T: Resource> ResourceBase<{ crate::ResourceVariety::V1 as usize }> for T {
         cx: &mut ProduceContext<'_>,
         arg_matches: &mut clap::ArgMatches,
         mut stoppers: ShutdownSignalParticipantCreator,
-        keepalive: TaskRunningSentinel,
+        keepalive: Sentinel,
+        dependency_test: DependencyTest,
     ) -> Result<Self::Production, Box<dyn Error>> {
         let deps = T::Dependencies::produce(cx)?;
         let args = T::Args::from_arg_matches(arg_matches)?;
@@ -458,7 +456,7 @@ impl<T: Resource> ResourceBase<{ crate::ResourceVariety::V1 as usize }> for T {
         let mut installer = TraitInstaller::Produce(TraitInstallerProduce {
             cx,
             shared: &shared,
-            resource: &keepalive,
+            dependency_test,
         });
         T::provide_as_trait(&mut installer);
         Ok(private::ResourceProduction {

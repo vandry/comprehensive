@@ -46,6 +46,8 @@ pub mod health;
 pub mod v0;
 pub mod v1;
 
+mod drop_stream;
+mod matrix;
 mod shutdown;
 
 pub use assembly::{Assembly, NoArgs, NoDependencies, ResourceDependencies};

@@ -56,6 +56,20 @@ impl DepMatrix {
         }
     }
 
+    pub(crate) fn completely_unref(&mut self, row: usize) -> impl Iterator<Item = usize> + use<> {
+        if std::mem::take(self.0.slice[row].refcount.get_mut()) != 0 {
+            Either::Left(std::mem::take(&mut self.0.slice[row].children).into_ones())
+        } else {
+            Either::Right(std::iter::empty())
+        }
+    }
+
+    pub(crate) fn decref(&mut self, row: usize) -> bool {
+        let refcount = self.0.slice[row].refcount.get_mut();
+        *refcount -= 1;
+        *refcount == 1
+    }
+
     pub(crate) fn is_row_live(&self, row: usize) -> bool {
         self.0.slice[row].is_present()
     }
@@ -65,11 +79,12 @@ impl DepMatrix {
     }
 
     pub(crate) fn edges(&self) -> impl Iterator<Item = (usize, usize)> {
-        self.0
-            .slice
-            .iter()
-            .enumerate()
-            .flat_map(|(row, e)| e.children.ones().map(move |column| (row, column)))
+        self.0.slice.iter().enumerate().flat_map(|(row, e)| {
+            e.children
+                .ones()
+                .filter(|column| self.0.slice[*column].is_present())
+                .map(move |column| (row, column))
+        })
     }
 
     pub(crate) fn n_live_rows(&self) -> usize {
@@ -110,5 +125,13 @@ impl DepMatrix {
                 self.unreference(j);
             }
         }
+    }
+
+    pub fn count_row(&self, row: usize) -> usize {
+        self.0.slice[row].children.count_ones(..)
+    }
+
+    pub fn iter_row(&self, row: usize) -> impl Iterator<Item = usize> {
+        self.0.slice[row].children.ones()
     }
 }

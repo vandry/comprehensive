@@ -37,6 +37,7 @@ use std::collections::hash_map::Entry;
 use std::error::Error;
 use std::future::Future;
 use std::pin::Pin;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use topological_sort::TopologicalSort;
@@ -47,8 +48,95 @@ use crate::shutdown::{ShutdownSignal, ShutdownSignalForwarder, ShutdownSignalPar
 
 pub(crate) type ResourceFut = Pin<Box<dyn Future<Output = Result<(), Box<dyn Error>>> + Send>>;
 
+#[derive(Debug)]
+enum ResourceInstantiationErrorUnderlying {
+    Leaf(Box<dyn Error>),
+    FailedDependencies(Vec<Rc<ResourceInstantiationError>>),
+}
+
+#[derive(Debug)]
+struct ResourceInstantiationError {
+    node_name: Option<&'static str>,
+    underlying: ResourceInstantiationErrorUnderlying,
+}
+
+impl std::fmt::Display for ResourceInstantiationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Some required Resources could not be created:")?;
+        self.fmt_problems(f, &mut Vec::new())
+    }
+}
+
+impl std::error::Error for ResourceInstantiationError {}
+
+impl ResourceInstantiationError {
+    fn new(
+        e: Box<dyn Error>,
+        cx: &mut ProduceContext<'_>,
+        node_name: Option<&'static str>,
+    ) -> Self {
+        Self {
+            node_name,
+            underlying: match e.downcast::<ErrorIsInProduceContext>() {
+                Ok(_) => ResourceInstantiationErrorUnderlying::FailedDependencies(std::mem::take(
+                    &mut cx.make_errors,
+                )),
+                Err(e) => ResourceInstantiationErrorUnderlying::Leaf(e),
+            },
+        }
+    }
+
+    fn new_from_list(
+        e: impl Iterator<Item = Rc<ResourceInstantiationError>>,
+        node_name: Option<&'static str>,
+    ) -> Self {
+        Self {
+            node_name,
+            underlying: ResourceInstantiationErrorUnderlying::FailedDependencies(e.collect()),
+        }
+    }
+
+    fn fmt_problems(
+        &self,
+        f: &mut std::fmt::Formatter<'_>,
+        chain: &mut Vec<&'static str>,
+    ) -> std::fmt::Result {
+        match self.underlying {
+            ResourceInstantiationErrorUnderlying::Leaf(ref e) => {
+                write!(f, "\n  ")?;
+                if let Some(name) = self.node_name {
+                    write!(f, "{}", name)?;
+                }
+                if !chain.is_empty() {
+                    for (i, n) in chain.iter().enumerate() {
+                        if i == 0 {
+                            write!(f, " (required by {}", n)?;
+                        } else {
+                            write!(f, " which is required by {}", n)?;
+                        }
+                    }
+                    write!(f, ")")?;
+                }
+                write!(f, ": {}", e)?;
+            }
+            ResourceInstantiationErrorUnderlying::FailedDependencies(ref v) => {
+                if let Some(name) = self.node_name {
+                    chain.push(name);
+                }
+                for e in v {
+                    e.fmt_problems(f, chain)?;
+                }
+                if self.node_name.is_some() {
+                    chain.pop();
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 struct Node<T: sealed::ResourceBase<U>, const U: usize> {
-    production: OnceCell<T::Production>,
+    production: OnceCell<Result<T::Production, Rc<ResourceInstantiationError>>>,
 }
 
 impl<T: sealed::ResourceBase<U>, const U: usize> Default for Node<T, U> {
@@ -68,11 +156,12 @@ trait NodeTrait: Any {
         cx: &mut ProduceContext<'_>,
         arg_matches: &mut ArgMatches,
         stoppers: ShutdownSignalParticipantCreator,
-        keepalive: Sentinel,
+        keepalive: MakeSentinel<'_>,
         dependency_test: sealed::DependencyTest,
-    ) -> Result<(), Box<dyn Error>>;
+    );
     fn task(self: Box<Self>) -> Option<ResourceFut>;
     fn created(&self) -> bool;
+    fn error(&self) -> Option<&Rc<ResourceInstantiationError>>;
 }
 
 impl<T: sealed::ResourceBase<U>, const U: usize> NodeTrait for Node<T, U> {
@@ -93,27 +182,34 @@ impl<T: sealed::ResourceBase<U>, const U: usize> NodeTrait for Node<T, U> {
         cx: &mut ProduceContext<'_>,
         arg_matches: &mut ArgMatches,
         stoppers: ShutdownSignalParticipantCreator,
-        keepalive: Sentinel,
+        keepalive: MakeSentinel<'_>,
         dependency_test: sealed::DependencyTest,
-    ) -> Result<(), Box<dyn Error>> {
-        let _ = self.production.set(<T as sealed::ResourceBase<U>>::make(
-            cx,
-            arg_matches,
-            stoppers,
-            keepalive,
-            dependency_test,
-        )?);
-        Ok(())
+    ) {
+        let _ = self.production.set(
+            <T as sealed::ResourceBase<U>>::make(
+                cx,
+                arg_matches,
+                stoppers,
+                keepalive.make(),
+                dependency_test,
+            )
+            .map_err(|e| Rc::new(ResourceInstantiationError::new(e, cx, Some(T::NAME)))),
+        );
+        cx.make_errors.clear();
     }
 
     fn task(mut self: Box<Self>) -> Option<ResourceFut> {
         self.production
             .take()
-            .map(|p| <T as sealed::ResourceBase<U>>::task(p))
+            .and_then(|p| p.ok().map(|p| <T as sealed::ResourceBase<U>>::task(p)))
     }
 
     fn created(&self) -> bool {
-        self.production.get().is_some()
+        matches!(self.production.get(), Some(Ok(_)))
+    }
+
+    fn error(&self) -> Option<&Rc<ResourceInstantiationError>> {
+        self.production.get().and_then(|p| p.as_ref().err())
     }
 }
 
@@ -136,11 +232,8 @@ impl TraitProduction {
             .push(item);
     }
 
-    fn to_vec<T: Any + ?Sized>(&self) -> Vec<Arc<T>> {
-        self.0
-            .downcast_ref::<Vec<Arc<T>>>()
-            .expect("bad downcast")
-            .clone()
+    fn vec<T: Any + ?Sized>(&self) -> &Vec<Arc<T>> {
+        self.0.downcast_ref::<Vec<Arc<T>>>().expect("bad downcast")
     }
 }
 
@@ -160,10 +253,9 @@ impl TraitGraphNode {
         _: &mut ProduceContext<'_>,
         _: &mut ArgMatches,
         _: ShutdownSignalParticipantCreator,
-        _: Sentinel,
+        _: MakeSentinel<'_>,
         _: sealed::DependencyTest,
-    ) -> Result<(), Box<dyn Error>> {
-        Ok(())
+    ) {
     }
 
     fn task(self) -> Option<ResourceFut> {
@@ -172,6 +264,10 @@ impl TraitGraphNode {
 
     fn created(&self) -> bool {
         false
+    }
+
+    fn error(&self) -> Option<&Rc<ResourceInstantiationError>> {
+        None
     }
 }
 
@@ -193,11 +289,12 @@ impl GraphNode {
                 cx: &mut ProduceContext<'_>,
                 arg_matches: &mut ArgMatches,
                 stoppers: ShutdownSignalParticipantCreator,
-                keepalive: Sentinel,
+                keepalive: MakeSentinel<'_>,
                 dependency_test: sealed::DependencyTest,
-            ) -> Result<(), Box<dyn Error>>;
+            );
             fn task(self) -> Option<ResourceFut>;
             fn created(&self) -> bool;
+            fn error(&self) -> Option<&Rc<ResourceInstantiationError>>;
         }
     }
 
@@ -276,6 +373,7 @@ pub struct ProduceContext<'a> {
     nodes: &'a Vec<GraphNode>,
     trait_productions: Box<[Option<TraitProduction>]>,
     dep_matrix: &'a DepMatrix,
+    make_errors: Vec<Rc<ResourceInstantiationError>>,
 }
 
 impl ProduceContext<'_> {
@@ -300,11 +398,34 @@ impl ProduceContext<'_> {
             if let GraphNode::Trait(TraitGraphNode(_, prod_i)) = self.nodes[*i] {
                 return self.trait_productions[prod_i]
                     .as_ref()
-                    .map(|v| v.to_vec())
+                    .map(|v| v.vec())
+                    .cloned()
                     .unwrap_or_default();
             }
         }
         Vec::new()
+    }
+
+    pub fn produce_trait_fallible<T: Any + ?Sized>(
+        &self,
+    ) -> Result<Vec<Arc<T>>, impl std::error::Error + 'static> {
+        if let Some(i) = self.type_map.get(&TypeId::of::<T>()) {
+            if let GraphNode::Trait(TraitGraphNode(_, prod_i)) = self.nodes[*i] {
+                let maybe_v = self.trait_productions[prod_i].as_ref().map(|v| v.vec());
+                let expect_count = self.dep_matrix.count_row(*i);
+                let have_count = maybe_v.map(|v| v.len()).unwrap_or_default();
+                if expect_count != have_count {
+                    return Err(ResourceInstantiationError::new_from_list(
+                        self.dep_matrix
+                            .iter_row(*i)
+                            .filter_map(|j| self.nodes[j].error().cloned()),
+                        Some(self.nodes[*i].name()),
+                    ));
+                }
+                return Ok(maybe_v.cloned().unwrap_or_default());
+            }
+        }
+        Ok(Vec::new())
     }
 }
 
@@ -362,6 +483,17 @@ pub struct Registrar<T> {
     _never_constructed: T,
 }
 
+#[derive(Debug)]
+struct ErrorIsInProduceContext;
+
+impl std::fmt::Display for ErrorIsInProduceContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ErrorIsInProduceContext")
+    }
+}
+
+impl std::error::Error for ErrorIsInProduceContext {}
+
 impl<T> Registrar<T> {
     pub fn register<const U: usize>(cx: &mut RegisterContext<'_>)
     where
@@ -392,7 +524,16 @@ impl<T> Registrar<T> {
                 .expect("bad downcast")
                 .production
                 .get()
-                .unwrap(),
+                .unwrap()
+                .as_ref()
+                .map_err(|e| {
+                    // Move the error into an accumulator so we can collect all
+                    // the errors associated with producing the current set of
+                    // dependencies, then return a marker error that will
+                    // later signal us to return all the errors in bulk.
+                    cx.make_errors.push(Rc::clone(e));
+                    ErrorIsInProduceContext
+                })?,
         ))
     }
 }
@@ -606,6 +747,33 @@ struct AssemblySetup {
     n_traits: usize,
 }
 
+struct ConsumeReady<'a, T>(&'a mut T);
+
+impl<T> Iterator for ConsumeReady<'_, T>
+where
+    T: Stream + futures::stream::FusedStream + Unpin,
+{
+    type Item = T::Item;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self
+            .0
+            .poll_next_unpin(&mut Context::from_waker(std::task::Waker::noop()))
+        {
+            Poll::Ready(x) => x,
+            Poll::Pending => None,
+        }
+    }
+}
+
+struct MakeSentinel<'a>(&'a mut crate::drop_stream::Builder, usize);
+
+impl MakeSentinel<'_> {
+    fn make(self) -> Sentinel {
+        self.0.make_sentinel(self.1).expect("take notifier")
+    }
+}
+
 impl<T> Assembly<T>
 where
     T: ResourceDependencies,
@@ -675,7 +843,7 @@ where
             nodes,
             type_map,
             build_order,
-            dep_matrix,
+            mut dep_matrix,
             n_traits,
         } = Self::setup()?;
 
@@ -697,6 +865,7 @@ where
             nodes: &nodes,
             trait_productions: std::iter::repeat_n((), n_traits).map(|_| None).collect(),
             dep_matrix: &dep_matrix,
+            make_errors: Vec::new(),
         };
         let participants_iter =
             ShutdownSignal::new(nodes.iter().map(|gn| gn.is_inert()), &dep_matrix);
@@ -706,17 +875,17 @@ where
             let participant_creator = participants[i]
                 .take()
                 .expect("same index appears twice or deleted index in build order");
-            let notifier = task_quits_gen.make_sentinel(i).expect("task notifier");
             nodes[i].make(
                 &mut cx,
                 &mut arg_matches,
                 participant_creator,
-                notifier,
+                MakeSentinel(&mut task_quits_gen, i),
                 sealed::DependencyTest(i),
-            )?;
+            );
         }
-        let task_quits = task_quits_gen.into_stream();
-        let top = T::produce(&mut cx)?;
+        let mut task_quits = task_quits_gen.into_stream();
+        let top =
+            T::produce(&mut cx).map_err(|e| ResourceInstantiationError::new(e, &mut cx, None))?;
         let root_participant_iter = participants
             .last_mut()
             .unwrap()
@@ -729,6 +898,17 @@ where
         else {
             panic!("graph construction bug: something depends on the root");
         };
+
+        for failed_i in ConsumeReady(&mut task_quits) {
+            if let Some(e) = nodes[failed_i].error() {
+                log::warn!(
+                    "Optional resource {} failed to initialise: {}",
+                    nodes[failed_i].name(),
+                    e
+                );
+            }
+            shutdown_notify.completely_unref(failed_i, &mut dep_matrix);
+        }
 
         let names = nodes
             .iter()
@@ -1011,7 +1191,7 @@ mod tests {
         }
 
         fn augment_args(c: clap::Command) -> clap::Command {
-            if T::NAME == "Mid" {
+            if T::NAME == "Mid" || T::NAME == "FailsToCreate" {
                 c.arg(
                     clap::Arg::new("count")
                         .long("count")
@@ -1280,6 +1460,213 @@ mod tests {
         );
     }
 
+    #[derive(Debug)]
+    struct FailsToCreate;
+
+    #[derive(ResourceDependencies)]
+    struct FailsToCreateDependencies(Arc<Leaf1>);
+
+    impl TestResource for FailsToCreate {
+        type Dependencies = FailsToCreateDependencies;
+        const NAME: &str = "FailsToCreate";
+
+        fn new(d: FailsToCreateDependencies) -> Result<Self, Box<dyn std::error::Error>> {
+            let _ = d.0;
+            Err("init problem 1".into())
+        }
+    }
+
+    #[derive(Debug)]
+    struct AlsoFailsToCreate;
+
+    impl TestResource for AlsoFailsToCreate {
+        type Dependencies = NoDependencies;
+        const NAME: &str = "AlsoFailsToCreate";
+
+        fn new(_: NoDependencies) -> Result<Self, Box<dyn std::error::Error>> {
+            Err("init problem 2".into())
+        }
+    }
+
+    #[derive(Debug)]
+    struct DependsOnFailsToCreate;
+
+    #[derive(ResourceDependencies)]
+    struct DependsOnFailsToCreateDependencies {
+        _d0: Arc<FailsToCreate>,
+        _d1: Arc<AlsoFailsToCreate>,
+    }
+
+    impl TestResource for DependsOnFailsToCreate {
+        type Dependencies = DependsOnFailsToCreateDependencies;
+        const NAME: &str = "DependsOnFailsToCreate";
+
+        fn new(_: DependsOnFailsToCreateDependencies) -> Result<Self, Box<dyn std::error::Error>> {
+            Ok(Self)
+        }
+    }
+
+    #[derive(ResourceDependencies)]
+    struct DependsOnFailsToCreateTop {
+        _d0: Arc<DependsOnFailsToCreate>,
+    }
+
+    #[test]
+    fn depends_on_fails_to_create() {
+        let Err(e) = Assembly::<DependsOnFailsToCreateTop>::new_from_argv(EMPTY) else {
+            panic!("Should have failed to create");
+        };
+        let make_error = e
+            .downcast::<ResourceInstantiationError>()
+            .expect("ResourceInstantiationError");
+        let ResourceInstantiationError {
+            node_name: None,
+            underlying: ResourceInstantiationErrorUnderlying::FailedDependencies(v),
+        } = *make_error
+        else {
+            panic!("unexpected error: {:?}", make_error);
+        };
+        assert_eq!(v.len(), 1, "expect 2 error: {:?}", v);
+        let ResourceInstantiationError {
+            node_name: Some(n),
+            underlying: ResourceInstantiationErrorUnderlying::FailedDependencies(ref d),
+        } = *v[0]
+        else {
+            panic!("unexpected error: {:?}", v[0]);
+        };
+        assert_eq!(n, "DependsOnFailsToCreate");
+        assert_eq!(d.len(), 2, "expect 2 error: {:?}", d);
+        let ResourceInstantiationError {
+            node_name: Some(n1),
+            underlying: ResourceInstantiationErrorUnderlying::Leaf(ref l1),
+        } = *d[0]
+        else {
+            panic!("unexpected error: {:?}", d[0]);
+        };
+        assert_eq!(n1, "FailsToCreate");
+        assert_eq!(l1.to_string(), "init problem 1");
+        let ResourceInstantiationError {
+            node_name: Some(n2),
+            underlying: ResourceInstantiationErrorUnderlying::Leaf(ref l2),
+        } = *d[1]
+        else {
+            panic!("unexpected error: {:?}", d[1]);
+        };
+        assert_eq!(n2, "AlsoFailsToCreate");
+        assert_eq!(l2.to_string(), "init problem 2");
+    }
+
+    #[derive(Debug)]
+    struct HalfDependsOnFailsToCreate;
+
+    #[derive(ResourceDependencies)]
+    struct HalfDependsOnFailsToCreateDependencies {
+        _d0: Arc<FailsToCreate>,
+        _d1: Option<Arc<AlsoFailsToCreate>>,
+    }
+
+    impl TestResource for HalfDependsOnFailsToCreate {
+        type Dependencies = HalfDependsOnFailsToCreateDependencies;
+        const NAME: &str = "HalfDependsOnFailsToCreate";
+
+        fn new(
+            _: HalfDependsOnFailsToCreateDependencies,
+        ) -> Result<Self, Box<dyn std::error::Error>> {
+            Ok(Self)
+        }
+    }
+
+    #[derive(ResourceDependencies)]
+    struct HalfDependsOnFailsToCreateTop {
+        _d0: Arc<HalfDependsOnFailsToCreate>,
+    }
+
+    #[test]
+    fn half_depends_on_fails_to_create() {
+        let Err(e) = Assembly::<HalfDependsOnFailsToCreateTop>::new_from_argv(EMPTY) else {
+            panic!("Should have failed to create");
+        };
+        let make_error = e
+            .downcast::<ResourceInstantiationError>()
+            .expect("ResourceInstantiationError");
+        let ResourceInstantiationError {
+            node_name: None,
+            underlying: ResourceInstantiationErrorUnderlying::FailedDependencies(v),
+        } = *make_error
+        else {
+            panic!("unexpected error: {:?}", make_error);
+        };
+        assert_eq!(v.len(), 1, "expect 2 error: {:?}", v);
+        let ResourceInstantiationError {
+            node_name: Some(n),
+            underlying: ResourceInstantiationErrorUnderlying::FailedDependencies(ref d),
+        } = *v[0]
+        else {
+            panic!("unexpected error: {:?}", v[0]);
+        };
+        assert_eq!(n, "HalfDependsOnFailsToCreate");
+        assert_eq!(d.len(), 1, "expect 1 error: {:?}", d);
+        let ResourceInstantiationError {
+            node_name: Some(n1),
+            underlying: ResourceInstantiationErrorUnderlying::Leaf(ref l1),
+        } = *d[0]
+        else {
+            panic!("unexpected error: {:?}", d[0]);
+        };
+        assert_eq!(n1, "FailsToCreate");
+        assert_eq!(l1.to_string(), "init problem 1");
+    }
+
+    #[derive(Debug)]
+    struct DependsOptionallyOnFailsToCreate;
+
+    #[derive(ResourceDependencies)]
+    struct DependsOptionallyOnFailsToCreateDependencies {
+        _d0: Option<Arc<FailsToCreate>>,
+        _d1: Option<Arc<AlsoFailsToCreate>>,
+    }
+
+    impl TestResource for DependsOptionallyOnFailsToCreate {
+        type Dependencies = DependsOptionallyOnFailsToCreateDependencies;
+        const NAME: &str = "DependsOptionallyOnFailsToCreate";
+
+        fn new(
+            _: DependsOptionallyOnFailsToCreateDependencies,
+        ) -> Result<Self, Box<dyn std::error::Error>> {
+            Ok(Self)
+        }
+    }
+
+    #[derive(ResourceDependencies)]
+    struct DependsOptionallyOnFailsToCreateTop {
+        _d0: Arc<DependsOptionallyOnFailsToCreate>,
+    }
+
+    #[test]
+    fn depends_optionally_on_fails_to_create() {
+        let a = Assembly::<DependsOptionallyOnFailsToCreateTop>::new_from_argv(EMPTY).unwrap();
+        let edges = a
+            .dep_matrix
+            .edges()
+            .map(|(i, j)| (a.names.get(i), a.names.get(j)))
+            .collect::<Vec<_>>();
+        assert_eq!(edges.len(), 1);
+        let Some((None, Some(Some(x)))) = edges.into_iter().next() else {
+            panic!("wrong edge");
+        };
+        assert_eq!(*x, "DependsOptionallyOnFailsToCreate");
+        let mut r = pin!(a.run_with_termination_signal(futures::stream::pending()));
+        let mut e = TestExecutor::default();
+        match e.poll(&mut r) {
+            Poll::Ready(Err(e)) => {
+                assert_eq!(e.to_string(), "no good");
+            }
+            x => {
+                panic!("run fail: {:?}", x);
+            }
+        }
+    }
+
     #[test]
     fn run_assembly() {
         let mut r = pin!(
@@ -1523,11 +1910,11 @@ mod tests {
     #[derive(ResourceDependencies)]
     struct RequiresDynDependencies(Vec<Arc<dyn TestTrait>>, Vec<Arc<dyn NobodyImplements>>);
 
-    struct RequiresDyn;
+    struct RequiresDyn(usize, usize);
 
     impl sealed::ResourceBase<{ crate::ResourceVariety::Test as usize }> for RequiresDyn {
         const NAME: &str = "RequiresDyn";
-        type Production = (Arc<Self>, ShutdownSignalParticipant);
+        type Production = (Arc<Self>, ShutdownSignalParticipant, Sentinel);
 
         fn register_recursive(cx: &mut RegisterContext<'_>) {
             RequiresDynDependencies::register(cx);
@@ -1537,13 +1924,60 @@ mod tests {
             cx: &mut ProduceContext<'_>,
             _: &mut ArgMatches,
             stoppers: ShutdownSignalParticipantCreator,
-            _: Sentinel,
+            up: Sentinel,
             _: sealed::DependencyTest,
         ) -> Result<Self::Production, Box<dyn Error>> {
             let deps = RequiresDynDependencies::produce(cx)?;
-            assert!(deps.0.len() == 2);
-            assert!(deps.1.len() == 0);
-            Ok((Arc::new(RequiresDyn), stoppers.into_inner().unwrap()))
+            Ok((
+                Arc::new(RequiresDyn(deps.0.len(), deps.1.len())),
+                stoppers.into_inner().unwrap(),
+                up,
+            ))
+        }
+
+        fn shared(p: &Self::Production) -> Arc<Self> {
+            Arc::clone(&p.0)
+        }
+
+        fn task(
+            p: Self::Production,
+        ) -> Pin<Box<dyn Future<Output = Result<(), Box<dyn Error>>> + Send>> {
+            Box::pin(async move {
+                p.1.await.propagate();
+                Ok(())
+            })
+        }
+    }
+
+    #[derive(ResourceDependencies)]
+    struct RequiresDynMayFailDependencies(
+        #[may_fail] Vec<Arc<dyn TestTrait>>,
+        #[may_fail] Vec<Arc<dyn NobodyImplements>>,
+    );
+
+    struct RequiresDynMayFail(usize, usize);
+
+    impl sealed::ResourceBase<{ crate::ResourceVariety::Test as usize }> for RequiresDynMayFail {
+        const NAME: &str = "RequiresDynMayFail";
+        type Production = (Arc<Self>, ShutdownSignalParticipant, Sentinel);
+
+        fn register_recursive(cx: &mut RegisterContext<'_>) {
+            RequiresDynMayFailDependencies::register(cx);
+        }
+
+        fn make(
+            cx: &mut ProduceContext<'_>,
+            _: &mut ArgMatches,
+            stoppers: ShutdownSignalParticipantCreator,
+            up: Sentinel,
+            _: sealed::DependencyTest,
+        ) -> Result<Self::Production, Box<dyn Error>> {
+            let deps = RequiresDynMayFailDependencies::produce(cx)?;
+            Ok((
+                Arc::new(RequiresDynMayFail(deps.0.len(), deps.1.len())),
+                stoppers.into_inner().unwrap(),
+                up,
+            ))
         }
 
         fn shared(p: &Self::Production) -> Arc<Self> {
@@ -1568,7 +2002,7 @@ mod tests {
 
     impl sealed::ResourceBase<{ crate::ResourceVariety::Test as usize }> for ProvidesDyn {
         const NAME: &str = "ProvidesDyn";
-        type Production = (Arc<Self>, ShutdownSignalParticipant);
+        type Production = (Arc<Self>, ShutdownSignalParticipant, Sentinel);
 
         fn register_as_traits(mut cx: sealed::TraitRegisterContext<'_>) {
             cx.register_as_trait::<dyn TestTrait>();
@@ -1583,7 +2017,7 @@ mod tests {
             cx: &mut ProduceContext<'_>,
             _: &mut ArgMatches,
             stoppers: ShutdownSignalParticipantCreator,
-            _: Sentinel,
+            up: Sentinel,
             dt: sealed::DependencyTest,
         ) -> Result<Self::Production, Box<dyn Error>> {
             let _ = CleanShutdownTop::produce(cx)?;
@@ -1601,7 +2035,7 @@ mod tests {
                 cx.provide_as_trait(i, alias);
             }
 
-            Ok((shared, stoppers.into_inner().unwrap()))
+            Ok((shared, stoppers.into_inner().unwrap(), up))
         }
 
         fn shared(p: &Self::Production) -> Arc<Self> {
@@ -1624,7 +2058,7 @@ mod tests {
 
     impl sealed::ResourceBase<{ crate::ResourceVariety::Test as usize }> for AlsoProvidesDyn {
         const NAME: &str = "AlsoProvidesDyn";
-        type Production = Arc<Self>;
+        type Production = (Arc<Self>, Sentinel);
 
         fn register_as_traits(mut cx: sealed::TraitRegisterContext<'_>) {
             cx.register_as_trait::<dyn TestTrait>();
@@ -1634,7 +2068,7 @@ mod tests {
             cx: &mut ProduceContext<'_>,
             _: &mut ArgMatches,
             _: ShutdownSignalParticipantCreator,
-            _: Sentinel,
+            up: Sentinel,
             dt: sealed::DependencyTest,
         ) -> Result<Self::Production, Box<dyn Error>> {
             let shared = Arc::new(AlsoProvidesDyn);
@@ -1643,15 +2077,48 @@ mod tests {
                 let alias: Arc<dyn TestTrait> = shared2;
                 cx.provide_as_trait(i, alias);
             }
-            Ok(shared)
+            Ok((shared, up))
         }
 
-        fn shared(p: &Arc<Self>) -> Arc<Self> {
-            Arc::clone(&p)
+        fn shared(p: &Self::Production) -> Arc<Self> {
+            Arc::clone(&p.0)
         }
 
-        fn task(_: Arc<Self>) -> Pin<Box<dyn Future<Output = Result<(), Box<dyn Error>>> + Send>> {
+        fn task(
+            _: Self::Production,
+        ) -> Pin<Box<dyn Future<Output = Result<(), Box<dyn Error>>> + Send>> {
             Box::pin(async { Ok(()) })
+        }
+    }
+
+    struct ProvidesDynButFails;
+
+    impl TestTrait for ProvidesDynButFails {}
+
+    impl sealed::ResourceBase<{ crate::ResourceVariety::Test as usize }> for ProvidesDynButFails {
+        const NAME: &str = "ProvidesDynButFails";
+        type Production = ();
+
+        fn register_as_traits(mut cx: sealed::TraitRegisterContext<'_>) {
+            cx.register_as_trait::<dyn TestTrait>();
+        }
+
+        fn make(
+            _: &mut ProduceContext<'_>,
+            _: &mut ArgMatches,
+            _: ShutdownSignalParticipantCreator,
+            _: Sentinel,
+            _: sealed::DependencyTest,
+        ) -> Result<Self::Production, Box<dyn Error>> {
+            Err("ProvidesDynButFails".into())
+        }
+
+        fn shared(_: &()) -> Arc<Self> {
+            unreachable!();
+        }
+
+        fn task(_: ()) -> Pin<Box<dyn Future<Output = Result<(), Box<dyn Error>>> + Send>> {
+            unreachable!();
         }
     }
 
@@ -1661,7 +2128,9 @@ mod tests {
     #[test]
     fn dyn_resource() {
         let assembly = Assembly::<RequiresDynTop>::new_from_argv(EMPTY).unwrap();
-        let _ = Arc::clone(&assembly.top.0);
+        let requires_dyn = Arc::clone(&assembly.top.0);
+        assert_eq!(requires_dyn.0, 2);
+        assert_eq!(requires_dyn.1, 0);
         let _ = Arc::clone(&assembly.top.1);
         let _ = Arc::clone(&assembly.top.2);
         let (tx, rx) = tokio::sync::mpsc::channel(1);
@@ -1706,6 +2175,34 @@ mod tests {
                 ("top", "RequiresDyn"),
             ]
         );
+    }
+
+    #[derive(ResourceDependencies)]
+    struct RequiresFailingDynTop {
+        _d0: Arc<RequiresDyn>,
+        _d1: PhantomData<ProvidesDyn>,
+        _d2: PhantomData<ProvidesDynButFails>,
+    }
+
+    #[test]
+    fn dyn_fail_resource() {
+        let a = Assembly::<RequiresFailingDynTop>::new_from_argv(EMPTY);
+        assert!(a.is_err());
+    }
+
+    #[derive(ResourceDependencies)]
+    struct RequiresFailingDynMayFailTop {
+        d0: Arc<RequiresDynMayFail>,
+        _d1: PhantomData<ProvidesDyn>,
+        _d2: PhantomData<ProvidesDynButFails>,
+    }
+
+    #[test]
+    fn dyn_fail_may_failresource() {
+        let a = Assembly::<RequiresFailingDynMayFailTop>::new_from_argv(EMPTY).unwrap();
+        let requires_dyn = a.top.d0;
+        assert_eq!(requires_dyn.0, 1);
+        assert_eq!(requires_dyn.1, 0);
     }
 
     struct Ant;

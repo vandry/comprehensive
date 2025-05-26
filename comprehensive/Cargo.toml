@@ -1,6 +1,6 @@
 [package]
 name = "comprehensive"
-version = "0.7.0"
+version = "0.7.1"
 edition = "2024"
 rust-version = "1.86"
 repository = "https://github.com/vandry/comprehensive.git"
@@ -16,7 +16,7 @@ rustdoc-args = ["--cfg", "docsrs"]
 [dependencies]
 boxcar = "0.2"
 clap = { version = "4.5", features = ["derive"] }
-comprehensive_macros = { path = "../comprehensive_macros", version = "0.4.7" }
+comprehensive_macros = { path = "../comprehensive_macros", version = "0.4.8" }
 delegate = "0.13.3"
 either = "1.15.0"
 fixedbitset = "0.5.7"

@@ -210,25 +210,41 @@ impl Iterator for ShutdownSignal<'_> {
 
 impl ExactSizeIterator for ShutdownSignal<'_> {}
 
+fn wake_or_pass_through(ss: &ShutdownSignalInner, i: usize) -> bool {
+    if let Some(ref inner) = ss.slice[i].0 {
+        inner.unreferenced.store(true, Ordering::Release);
+        for slot in &inner.wakers {
+            if let Some(mut maybe_waker) = slot.try_lock() {
+                if let Some(waker) = maybe_waker.take() {
+                    waker.wake()
+                }
+            }
+        }
+        false
+    } else {
+        // This row is inert, nobody is listening.
+        // Propagate on its behalf.
+        true
+    }
+}
+
 fn propagate(ss: &ShutdownSignalInner, dep_matrix: &DepMatrix, row: usize) {
     // On entry, our own refcount is either 0 or 1 (we don't create
     // ShutdownSignalForwarder unless that's true and don't call ourselves
     // recursively unless that's true) and 0 means we have already been called,
     // so we only proceed if it was 1. Either way it will become 0.
-    for i in dep_matrix.decref_last_propagate(row) {
-        if let Some(ref inner) = ss.slice[i].0 {
-            inner.unreferenced.store(true, Ordering::Release);
-            for slot in &inner.wakers {
-                if let Some(mut maybe_waker) = slot.try_lock() {
-                    if let Some(waker) = maybe_waker.take() {
-                        waker.wake()
-                    }
-                }
-            }
-        } else {
-            // This row is inert, nobody is listening.
-            // Propagate on its behalf.
-            propagate(ss, dep_matrix, i);
+    for i in dep_matrix
+        .decref_last_propagate(row)
+        .filter(|i| wake_or_pass_through(ss, *i))
+    {
+        propagate(ss, dep_matrix, i);
+    }
+}
+
+fn propagate_mut(ss: &ShutdownSignalInner, dep_matrix: &mut DepMatrix, row: usize) {
+    for i in dep_matrix.completely_unref(row) {
+        if dep_matrix.decref(i) && wake_or_pass_through(ss, i) {
+            propagate_mut(ss, dep_matrix, i);
         }
     }
 }
@@ -251,6 +267,16 @@ impl ShutdownSignalForwarder {
                 .get_or_init(move || dep_matrix),
             self.row,
         )
+    }
+
+    pub(crate) fn completely_unref(&self, i: usize, dep_matrix: &mut DepMatrix) {
+        self.matrix.slice[i]
+            .0
+            .as_ref()
+            .unwrap()
+            .unreferenced
+            .store(true, Ordering::Release);
+        propagate_mut(&self.matrix, dep_matrix, i);
     }
 }
 

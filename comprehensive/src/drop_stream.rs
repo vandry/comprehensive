@@ -83,7 +83,11 @@ pub struct Builder(Arc<Inner>, FixedBitSet);
 
 /// A [`Stream`] that delivers a value every time an associated [`Sentinel`]
 /// is dropped. The value is the serial number of the [`Sentinel`].
-pub struct DropStream(Arc<Inner>, usize);
+pub struct DropStream {
+    inner: Arc<Inner>,
+    cursor: usize,
+    len: usize,
+}
 
 impl Builder {
     pub fn new(l: usize) -> Self {
@@ -108,7 +112,7 @@ impl Builder {
     }
 
     pub fn into_stream(self) -> DropStream {
-        DropStream(self.0, 0)
+        DropStream { inner: self.0, cursor: 0, len: self.1.count_ones(..) }
     }
 }
 
@@ -116,16 +120,17 @@ impl Stream for DropStream {
     type Item = usize;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<usize>> {
-        if self.1 >= self.0.slice.len() {
-            self.1 = usize::MAX;
+        if self.len == 0 || self.len == usize::MAX {
+            self.len = usize::MAX;
             return Poll::Ready(None);
         }
-        if self.0.header.cursor.load(Ordering::Acquire) > self.1 {
-            let item = self.0.slice[self.1].load(Ordering::Acquire);
-            self.1 += 1;
+        if self.inner.header.cursor.load(Ordering::Acquire) > self.cursor {
+            let item = self.inner.slice[self.cursor].load(Ordering::Acquire);
+            self.cursor += 1;
+            self.len -= 1;
             return Poll::Ready(Some(item));
         }
-        if let Some(mut maybe_waker) = self.0.header.waker.try_lock() {
+        if let Some(mut maybe_waker) = self.inner.header.waker.try_lock() {
             let park = maybe_waker
                 .as_ref()
                 .map(|w| !w.will_wake(cx.waker()))
@@ -137,9 +142,9 @@ impl Stream for DropStream {
                 }
             }
         }
-        if self.0.header.cursor.load(Ordering::Acquire) > self.1 {
-            let item = self.0.slice[self.1].load(Ordering::Acquire);
-            self.1 += 1;
+        if self.inner.header.cursor.load(Ordering::Acquire) > self.cursor {
+            let item = self.inner.slice[self.cursor].load(Ordering::Acquire);
+            self.cursor += 1;
             Poll::Ready(Some(item))
         } else {
             Poll::Pending
@@ -149,6 +154,6 @@ impl Stream for DropStream {
 
 impl futures::stream::FusedStream for DropStream {
     fn is_terminated(&self) -> bool {
-        self.1 == usize::MAX
+        self.len == usize::MAX
     }
 }

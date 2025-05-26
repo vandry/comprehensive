@@ -14,13 +14,14 @@ use syn::{
 };
 
 enum DependencyType<'a> {
-    Concrete(&'a Type),
-    Trait(&'a Type),
+    Concrete(&'a Type, bool),
+    Trait(&'a Type, bool),
     Weak(&'a Type),
 }
 
 enum DependencyLabel {
     Arc,
+    Option,
     Vec,
     PhantomData,
 }
@@ -29,15 +30,22 @@ impl DependencyLabel {
     fn expect_arc_inside(&self) -> bool {
         match *self {
             Self::Arc => false,
+            Self::Option => true,
             Self::PhantomData => false,
             Self::Vec => true,
         }
     }
 
-    fn into_dependency_type(self, ty: &Type) -> Result<DependencyType<'_>, Span> {
+    fn into_dependency_type<'a>(
+        self,
+        ty: &'a Type,
+        attrs: &[Attribute],
+    ) -> Result<DependencyType<'a>, Span> {
+        let may_fail = attrs.iter().any(|a| a.path().is_ident("may_fail"));
         let (expect_trait, result) = match self {
-            Self::Arc => (false, DependencyType::Concrete(ty)),
-            Self::Vec => (true, DependencyType::Trait(ty)),
+            Self::Arc => (false, DependencyType::Concrete(ty, false)),
+            Self::Option => (false, DependencyType::Concrete(ty, true)),
+            Self::Vec => (true, DependencyType::Trait(ty, may_fail)),
             Self::PhantomData => (false, DependencyType::Weak(ty)),
         };
         if expect_trait == matches!(ty, Type::TraitObject(_)) {
@@ -57,6 +65,8 @@ fn find_path_with_1_generic_type(ty: &Type) -> Result<(DependencyLabel, &Type), 
         DependencyLabel::Arc
     } else if last_segment.ident == "Vec" {
         DependencyLabel::Vec
+    } else if last_segment.ident == "Option" {
+        DependencyLabel::Option
     } else if last_segment.ident == "PhantomData" {
         DependencyLabel::PhantomData
     } else {
@@ -76,11 +86,15 @@ fn find_path_with_1_generic_type(ty: &Type) -> Result<(DependencyLabel, &Type), 
     Ok((dep_type, ty))
 }
 
-fn find_dependency_type(orig_ty: &Type) -> Result<DependencyType<'_>, Span> {
+fn find_dependency_type<'a>(
+    orig_ty: &'a Type,
+    attrs: &[Attribute],
+) -> Result<DependencyType<'a>, Span> {
     // We accept:
     // Arc<T>
+    // Option<Arc<T>>
     // Vec<Arc<dyn Tr>>
-    // PhantomData<Arc<T>>
+    // PhantomData<T>
     let (dep_type, mut ty) = find_path_with_1_generic_type(orig_ty)?;
     if dep_type.expect_arc_inside() {
         let (inner_dep_type, inner_ty) = find_path_with_1_generic_type(ty)?;
@@ -89,7 +103,33 @@ fn find_dependency_type(orig_ty: &Type) -> Result<DependencyType<'_>, Span> {
         }
         ty = inner_ty;
     }
-    dep_type.into_dependency_type(ty)
+    dep_type.into_dependency_type(ty, attrs)
+}
+
+fn produce_concrete(
+    dep_types: &Vec<Result<DependencyType<'_>, TokenStream>>,
+    for_optional: bool,
+) -> impl Iterator<Item = TokenStream> {
+    dep_types
+        .iter()
+        .enumerate()
+        .filter_map(move |(i, r)| match r {
+            Ok(DependencyType::Concrete(ty, optional)) if *optional == for_optional => {
+                let temp = format_ident!("dep_{}", i);
+                Some(quote! {
+                    let #temp = ::comprehensive::assembly::Registrar::< #ty >::produce(cx);
+                })
+            }
+            Ok(DependencyType::Trait(ty, optional)) if *optional == for_optional => {
+                let temp = format_ident!("dep_{}", i);
+                Some(if for_optional {
+                    quote! { let #temp = cx.produce_trait::< #ty >(); }
+                } else {
+                    quote! { let #temp = cx.produce_trait_fallible::< #ty >(); }
+                })
+            }
+            _ => None,
+        })
 }
 
 fn derive_r_d_struct(name: &Ident, generics: &Generics, fields: &Fields) -> TokenStream {
@@ -101,19 +141,19 @@ fn derive_r_d_struct(name: &Ident, generics: &Generics, fields: &Fields) -> Toke
         Fields::Unit => NO_FIELDS,
     }
     .iter()
-    .map(|f| match find_dependency_type(&f.ty) {
+    .map(|f| match find_dependency_type(&f.ty, &f.attrs) {
         Ok(dty) => Ok(dty),
         Err(span) => Err(quote_spanned! {
-            span => compile_error!("each field of a ResourceDependencies struct must have a type matching one of: Arc<T>, Vec<Arc<dyn Tr>>, PhantomData<T>");
+            span => compile_error!("each field of a ResourceDependencies struct must have a type matching one of: Arc<T>, Option<Arc<T>>, Vec<Arc<dyn Tr>>, PhantomData<T>");
         }),
     })
     .collect::<Vec<_>>();
 
     let registrations = dep_types.iter().map(|r| match r {
-        Ok(DependencyType::Concrete(ty)) => quote! {
+        Ok(DependencyType::Concrete(ty, _)) => quote! {
             ::comprehensive::assembly::Registrar::< #ty >::register(cx);
         },
-        Ok(DependencyType::Trait(ty)) => quote! {
+        Ok(DependencyType::Trait(ty, _)) => quote! {
             cx.require_trait::< #ty >();
         },
         Ok(DependencyType::Weak(ty)) => quote! {
@@ -121,42 +161,72 @@ fn derive_r_d_struct(name: &Ident, generics: &Generics, fields: &Fields) -> Toke
         },
         Err(ts) => ts.clone(),
     });
-    let productions = dep_types.iter().enumerate().map(|(i, r)| match r {
-        Ok(DependencyType::Concrete(ty)) => {
+    // Produce all of the required dependencies, collecting the errors.
+    let productions1 = produce_concrete(&dep_types, false);
+    // Return if any failed.
+    let productions2 = dep_types.iter().enumerate().filter_map(|(i, r)| match r {
+        Ok(DependencyType::Concrete(_, false)) => {
             let temp = format_ident!("dep_{}", i);
-            quote! {
-                let #temp = ::comprehensive::assembly::Registrar::< #ty >::produce(cx)?;
-            }
+            Some(quote! { let #temp = #temp ?; })
         }
-        Ok(DependencyType::Trait(ty)) => {
+        Ok(DependencyType::Trait(_, false)) => {
             let temp = format_ident!("dep_{}", i);
-            quote! {
-                let #temp = cx.produce_trait::< #ty >();
-            }
+            Some(quote! { let #temp = #temp ?; })
         }
-        Ok(DependencyType::Weak(_)) => {
-            let temp = format_ident!("dep_{}", i);
-            quote! {
-                let #temp = ::std::marker::PhantomData;
-            }
-        }
-        Err(ts) => ts.clone(),
+        _ => None,
     });
+    // Produce all of the optional dependencies.
+    let productions3 = produce_concrete(&dep_types, true);
     let definition = match fields {
         Fields::Named(f) => {
-            let elements = f.named.iter().enumerate().map(|(i, field)| {
-                let name = field.ident.as_ref().unwrap();
-                let temp = format_ident!("dep_{}", i);
-                quote! { #name: #temp, }
-            });
+            let elements =
+                f.named
+                    .iter()
+                    .zip(dep_types.iter())
+                    .enumerate()
+                    .map(|(i, (field, dt))| {
+                        let name = field.ident.as_ref().unwrap();
+                        match dt {
+                            Ok(DependencyType::Concrete(_, false)) => {
+                                let temp = format_ident!("dep_{}", i);
+                                quote! { #name: #temp , }
+                            }
+                            Ok(DependencyType::Concrete(_, true)) => {
+                                let temp = format_ident!("dep_{}", i);
+                                quote! { #name: #temp .ok(), }
+                            }
+                            Ok(DependencyType::Trait(_, _)) => {
+                                let temp = format_ident!("dep_{}", i);
+                                quote! { #name: #temp , }
+                            }
+                            Ok(DependencyType::Weak(_)) => {
+                                quote! { #name: ::std::marker::PhantomData, }
+                            }
+                            Err(ts) => ts.clone(),
+                        }
+                    });
             quote! {
                 ::std::result::Result::Ok(Self { #( #elements )* })
             }
         }
-        Fields::Unnamed(f) => {
-            let elements = f.unnamed.iter().enumerate().map(|(i, _)| {
-                let temp = format_ident!("dep_{}", i);
-                quote! { #temp, }
+        Fields::Unnamed(_) => {
+            let elements = dep_types.iter().enumerate().map(|(i, dt)| match dt {
+                Ok(DependencyType::Concrete(_, false)) => {
+                    let temp = format_ident!("dep_{}", i);
+                    quote! { #temp , }
+                }
+                Ok(DependencyType::Concrete(_, true)) => {
+                    let temp = format_ident!("dep_{}", i);
+                    quote! { #temp .ok(), }
+                }
+                Ok(DependencyType::Trait(_, _)) => {
+                    let temp = format_ident!("dep_{}", i);
+                    quote! { #temp , }
+                }
+                Ok(DependencyType::Weak(_)) => {
+                    quote! { ::std::marker::PhantomData, }
+                }
+                Err(ts) => ts.clone(),
             });
             quote! {
                 ::std::result::Result::Ok(Self ( #( #elements )* ))
@@ -173,7 +243,9 @@ fn derive_r_d_struct(name: &Ident, generics: &Generics, fields: &Fields) -> Toke
             }
 
             fn produce(cx: &mut ::comprehensive::assembly::ProduceContext) -> ::std::result::Result<Self, ::std::boxed::Box<dyn ::std::error::Error>> {
-                #( #productions )*
+                #( #productions1 )*
+                #( #productions2 )*
+                #( #productions3 )*
                 #definition
             }
         }
@@ -189,6 +261,9 @@ fn derive_r_d_struct(name: &Ident, generics: &Generics, fields: &Fields) -> Toke
 ///
 /// - [`Arc<T>`](std::sync::Arc) where T is a Resource. That resource will be a
 ///   required dependency.
+/// - [`Option<Arc<T>>`](std::option::Option) where T is a Resource. That resource
+///   will be an optional dependency with the value being set no [`None`] if
+///   the dependency fails initialisation.
 /// - [`Vec<Arc<dyn T>>`](Vec) where T is a trait that might be implemented by
 ///   some resources. All of the resources that exist in the graph and
 ///   implement that trait and declare that they do so in their
@@ -196,6 +271,20 @@ fn derive_r_d_struct(name: &Ident, generics: &Generics, fields: &Fields) -> Toke
 ///   definition (using
 ///   [`v1::resource`](https://docs.rs/comprehensive/latest/comprehensive/v1/attr.resource.html))
 ///   will be collected here.
+///
+///   By default, if some resources matching the requested trait exist but
+///   fail initialisation, this will be considered an error: this set of
+///   dependencies will fail to construct and the error will be bubbled up.
+///   This mode is suitable for resources that wish to collect all available
+///   dependencies of a given type and not silently ignore a failing subset.
+///
+///   If a struct field of type [`Vec`] is annotated with `#[may_fail]`,
+///   then resources matching the requested trait exist but which fail
+///   initialisation will instead be dropped and a vector containing only
+///   the successful ones will be produced. This mode is suitable for
+///   resources that degrade well if some dependencies are not available
+///   (especially ones seeking just one working dependency resource from
+///   a set of possible ones.
 ///
 ///   Note that in order to be selected for this, a Resource has to exist
 ///   somewhere in the graph already, which means that somewhere it must
@@ -218,7 +307,7 @@ fn derive_r_d_struct(name: &Ident, generics: &Generics, fields: &Fields) -> Toke
 /// See
 /// [`ResourceDependencies`](https://docs.rs/comprehensive/latest/comprehensive/assembly/trait.ResourceDependencies.html)
 /// for usage information.
-#[proc_macro_derive(ResourceDependencies)]
+#[proc_macro_derive(ResourceDependencies, attributes(may_fail))]
 pub fn derive_resource_dependencies(item: proc_macro::TokenStream) -> proc_macro::TokenStream {
     let input: DeriveInput = parse_macro_input!(item);
     match input.data {

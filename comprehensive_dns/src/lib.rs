@@ -5,7 +5,7 @@
 //! resolution services can depend on this one to obtain a handle to
 //! the singleton shared client.
 //!
-//! It wraps a [`trust_dns_resolver::TokioAsyncResolver`].
+//! It wraps a [`hickory_resolver::TokioResolver`].
 //!
 //! There are currently no configuration parameters.
 //!
@@ -41,21 +41,22 @@
 #![warn(missing_docs)]
 
 use comprehensive::{NoArgs, NoDependencies, Resource};
+use hickory_resolver::name_server::TokioConnectionProvider;
+use hickory_resolver::system_conf::read_system_conf;
+use hickory_resolver::{Resolver, TokioResolver};
 use std::sync::Arc;
-use trust_dns_resolver::TokioAsyncResolver;
-use trust_dns_resolver::system_conf::read_system_conf;
 
 /// [`comprehensive::Resource`] for DNS resolution. For DNS resolution
 /// services, depend on this.
 #[derive(Debug)]
-pub struct DNSResolver(TokioAsyncResolver);
+pub struct DNSResolver(TokioResolver);
 
-/// Handle to the DNS resolver. Call `.as_ref()` to get &[`TokioAsyncResolver`].
+/// Handle to the DNS resolver. Call `.as_ref()` to get &[`TokioResolver`].
 #[derive(Clone, Debug)]
 pub struct ResolverHandle(Arc<DNSResolver>);
 
-impl AsRef<TokioAsyncResolver> for ResolverHandle {
-    fn as_ref(&self) -> &TokioAsyncResolver {
+impl AsRef<TokioResolver> for ResolverHandle {
+    fn as_ref(&self) -> &TokioResolver {
         &self.0.0
     }
 }
@@ -70,14 +71,15 @@ impl DNSResolver {
 impl Resource for DNSResolver {
     type Args = NoArgs;
     type Dependencies = NoDependencies;
-    const NAME: &str = "trust-dns-resolver";
+    const NAME: &str = "hickory-resolver";
 
     fn new(_: NoDependencies, _: NoArgs) -> Result<Self, Box<dyn std::error::Error>> {
         let (resolver_config, mut resolver_opts) = read_system_conf()?;
-        resolver_opts.ip_strategy = trust_dns_resolver::config::LookupIpStrategy::Ipv4AndIpv6;
-        Ok(Self(TokioAsyncResolver::tokio(
-            resolver_config,
-            resolver_opts,
-        )))
+        resolver_opts.ip_strategy = hickory_resolver::config::LookupIpStrategy::Ipv4AndIpv6;
+        Ok(Self(
+            Resolver::builder_with_config(resolver_config, TokioConnectionProvider::default())
+                .with_options(resolver_opts)
+                .build(),
+        ))
     }
 }

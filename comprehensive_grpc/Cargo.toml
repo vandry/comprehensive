@@ -1,6 +1,6 @@
 [package]
 name = "comprehensive_grpc"
-version = "0.6.4"
+version = "0.6.5"
 edition = "2024"
 repository = "https://github.com/vandry/comprehensive.git"
 homepage = "https://github.com/vandry/comprehensive"
@@ -16,10 +16,10 @@ atomic-take = "1.1"
 clap = { version = "4.5", features = ["derive"] }
 clap_builder = { version = "4.5", features = ["string"] }
 comprehensive = { path = "../comprehensive", version = "0.7" }
-comprehensive_dns = { path = "../comprehensive_dns", version = "0.1" }
+comprehensive_dns = { path = "../comprehensive_dns", version = "0.2" }
 comprehensive_macros = { path = "../comprehensive_macros", version = "0.4.5" }
 comprehensive_tls = { path = "../comprehensive_tls", version = "0.1", optional = true }
-comprehensive_warm_channels = { path = "../comprehensive_warm_channels", version = "0.1.1" }
+comprehensive_warm_channels = { path = "../comprehensive_warm_channels", version = "0.2" }
 futures = "0.3"
 http = "1.1"
 humantime = "2.1"
@@ -35,7 +35,7 @@ tonic-reflection = "0.12"
 tonic_prometheus_layer = "0.1"
 tower = "0.5"
 tower-layer = "0.3"
-warm_channels = { version = "0.1", features = ["grpc", "metrics"] }
+warm_channels = { version = "0.2", features = ["grpc", "metrics"] }
 
 [features]
 tls = ["comprehensive_tls/unreloadable_tls", "dep:comprehensive_tls", "tonic/tls", "warm_channels/tls"]

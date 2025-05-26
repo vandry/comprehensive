@@ -7,7 +7,7 @@ This crate provides a DNS resolver for including in a
 resolution services can depend on this one to obtain a handle to
 the singleton shared client.
 
-It wraps a [`trust_dns_resolver::TokioAsyncResolver`].
+It wraps a [`hickory_resolver::TokioResolver`].
 
 There are currently no configuration parameters.
 

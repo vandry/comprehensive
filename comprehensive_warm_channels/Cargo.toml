@@ -1,6 +1,6 @@
 [package]
 name = "comprehensive_warm_channels"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 repository = "https://github.com/vandry/comprehensive.git"
 homepage = "https://github.com/vandry/comprehensive"
@@ -20,4 +20,4 @@ http = "1.1"
 pin-project-lite = "0.2"
 tower = "0.5"
 tower-service = "0.3"
-warm_channels = { version = "0.1.3", features = ["diag"] }
+warm_channels = { version = "0.2", features = ["diag"] }

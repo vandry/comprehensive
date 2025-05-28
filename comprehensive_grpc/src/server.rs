@@ -350,7 +350,9 @@ impl HealthRelay {
                 false => tonic_health::ServingStatus::NotServing,
             };
             self.health_reporter.set_service_status("ready", s).await;
-            let _ = self.health_subscriber.changed().await;
+            if self.health_subscriber.changed().await.is_err() {
+                break;
+            }
         }
     }
 }

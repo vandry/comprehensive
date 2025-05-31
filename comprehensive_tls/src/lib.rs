@@ -32,15 +32,17 @@
 
 #![warn(missing_docs)]
 
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use comprehensive::ResourceDependencies;
 use comprehensive::v1::{AssemblyRuntime, Resource, resource};
 use comprehensive_traits::tls_config::{Snapshot, TlsConfigProvider};
+use delegate::delegate;
 use futures::StreamExt;
 use rustls::RootCertStore;
-use rustls::client::{ClientConfig, ResolvesClientCert};
+use rustls::client::danger::ServerCertVerifier;
+use rustls::client::{ClientConfig, ResolvesClientCert, WebPkiServerVerifier};
 use rustls::crypto::CryptoProvider;
-use rustls::pki_types::CertificateDer;
+use rustls::pki_types::{CertificateDer, ServerName};
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
 use std::sync::Arc;
@@ -100,16 +102,114 @@ impl ResolvesClientCert for ReloadableKeyAndCertResolver {
     }
 }
 
+#[derive(Debug)]
+struct NullPeerVerifier;
+
+impl ServerCertVerifier for NullPeerVerifier {
+    fn verify_server_cert(
+        &self,
+        _: &CertificateDer<'_>,
+        _: &[CertificateDer<'_>],
+        _: &ServerName<'_>,
+        _: &[u8],
+        _: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Err(rustls::Error::InvalidCertificate(
+            rustls::CertificateError::UnknownIssuer,
+        ))
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _: &[u8],
+        _: &CertificateDer<'_>,
+        _: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Err(rustls::Error::InvalidCertificate(
+            rustls::CertificateError::UnknownIssuer,
+        ))
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _: &[u8],
+        _: &CertificateDer<'_>,
+        _: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Err(rustls::Error::InvalidCertificate(
+            rustls::CertificateError::UnknownIssuer,
+        ))
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        Vec::new()
+    }
+}
+
+#[derive(Debug, Default)]
+struct PeerVerifier(ArcSwapOption<WebPkiServerVerifier>);
+
+impl PeerVerifier {
+    fn make_inner(
+        roots: RootCertStore,
+        crypto_provider: Arc<CryptoProvider>,
+    ) -> Result<Arc<WebPkiServerVerifier>, rustls::server::VerifierBuilderError> {
+        WebPkiServerVerifier::builder_with_provider(roots.into(), crypto_provider).build()
+    }
+
+    fn new(inner: Option<Arc<WebPkiServerVerifier>>) -> Self {
+        Self(ArcSwapOption::from(inner))
+    }
+
+    fn replace(&self, inner: Option<Arc<WebPkiServerVerifier>>) {
+        self.0.store(inner);
+    }
+}
+
+impl ServerCertVerifier for PeerVerifier {
+    delegate! {
+        #[through(ServerCertVerifier)]
+        #[expr(let inner = self.0.load(); $)]
+        to match *inner {
+            Some(ref v) => &**v,
+            None => &NullPeerVerifier,
+        } {
+            fn verify_server_cert(
+                &self,
+                end_entity: &CertificateDer<'_>,
+                intermediates: &[CertificateDer<'_>],
+                server_name: &ServerName<'_>,
+                ocsp_response: &[u8],
+                now: rustls::pki_types::UnixTime,
+            ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error>;
+            fn verify_tls12_signature(
+                &self,
+                message: &[u8],
+                cert: &CertificateDer<'_>,
+                dss: &rustls::DigitallySignedStruct,
+            ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error>;
+            fn verify_tls13_signature(
+                &self,
+                message: &[u8],
+                cert: &CertificateDer<'_>,
+                dss: &rustls::DigitallySignedStruct,
+            ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error>;
+            fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme>;
+            fn requires_raw_public_keys(&self) -> bool;
+        }
+    }
+}
+
 struct Update {
     certified_key: CertifiedKey,
-    cacerts: Vec<CertificateDer<'static>>,
+    peer_verifier: Option<Arc<WebPkiServerVerifier>>,
     #[cfg(feature = "unreloadable_tls")]
     snapshot: Snapshot,
 }
 
 fn accept_update(
     snapshot: Snapshot,
-    crypto_provider: &Option<Arc<CryptoProvider>>,
+    crypto_provider: Arc<CryptoProvider>,
 ) -> Result<Update, rustls::Error> {
     #[cfg(feature = "unreloadable_tls")]
     let snapshot2 = Snapshot {
@@ -117,15 +217,23 @@ fn accept_update(
         cert: snapshot.cert.clone(),
         cacert: snapshot.cacert.clone(),
     };
-    let private_key = match crypto_provider {
-        Some(p) => p.key_provider.load_private_key(snapshot.key)?,
-        None => rustls::crypto::aws_lc_rs::sign::any_supported_type(&snapshot.key)?,
-    };
+    let private_key = crypto_provider
+        .key_provider
+        .load_private_key(snapshot.key)?;
     let certified_key = CertifiedKey::new(snapshot.cert, private_key);
     certified_key.keys_match()?;
+
+    let peer_verifier = snapshot.cacert.and_then(|cacerts| {
+        let mut roots = RootCertStore::empty();
+        roots.add_parsable_certificates(cacerts);
+        PeerVerifier::make_inner(roots, crypto_provider)
+            .inspect_err(|e| log::warn!("Error constructing server certificate verifier: {}; TLS connections will likely fail.", e))
+            .ok()
+    });
+
     Ok(Update {
         certified_key,
-        cacerts: snapshot.cacert.unwrap_or_default(),
+        peer_verifier,
         #[cfg(feature = "unreloadable_tls")]
         snapshot: snapshot2,
     })
@@ -166,11 +274,11 @@ pub struct TlsConfigDependencies {
 fn setup(
     d: TlsConfigDependencies,
     api: &mut AssemblyRuntime<'_>,
-    crypto_provider: Option<Arc<CryptoProvider>>,
-) -> Result<(Option<TlsConfigInner>, Vec<CertificateDer<'static>>), rustls::Error> {
+    crypto_provider: Arc<CryptoProvider>,
+) -> Result<(Option<TlsConfigInner>, Arc<PeerVerifier>), rustls::Error> {
     let mut providers_it = d.providers.into_iter();
     let Some(provider) = providers_it.next() else {
-        return Ok((None, Vec::new()));
+        return Ok((None, Arc::new(PeerVerifier::default())));
     };
     if providers_it.len() > 0 {
         log::warn!(
@@ -186,29 +294,34 @@ fn setup(
         .unwrap()
         .poll_next_unpin(&mut Context::from_waker(std::task::Waker::noop()))
     else {
-        return Ok((None, Vec::new()));
+        return Ok((None, Arc::new(PeerVerifier::default())));
     };
 
     let Update {
         certified_key,
-        cacerts,
+        peer_verifier,
         #[cfg(feature = "unreloadable_tls")]
         snapshot,
-    } = accept_update(*initial, &crypto_provider)?;
+    } = accept_update(*initial, Arc::clone(&crypto_provider))?;
     let resolver = Arc::new(ReloadableKeyAndCertResolver(ArcSwap::from_pointee(
         certified_key,
     )));
+    let peer_verifier = Arc::new(PeerVerifier::new(peer_verifier));
+    let peer_verifier_for_updating = Arc::clone(&peer_verifier);
     let resolver_for_updating = Arc::clone(&resolver);
     api.set_task(async move {
         let mut update_stream = provider.stream().unwrap();
         while let Some(update) = update_stream.next().await {
-            match accept_update(*update, &crypto_provider) {
+            match accept_update(*update, Arc::clone(&crypto_provider)) {
                 Ok(Update {
                     certified_key,
-                    cacerts: _,
+                    peer_verifier,
                     #[cfg(feature = "unreloadable_tls")]
                         snapshot: _,
-                }) => resolver_for_updating.0.store(certified_key.into()),
+                }) => {
+                    resolver_for_updating.0.store(certified_key.into());
+                    peer_verifier_for_updating.replace(peer_verifier);
+                }
                 Err(e) => {
                     log::error!(
                         "Received updated TLS parameters but they couldn't be applied: {}",
@@ -225,7 +338,7 @@ fn setup(
             #[cfg(feature = "unreloadable_tls")]
             snapshot,
         }),
-        cacerts,
+        peer_verifier,
     ))
 }
 
@@ -238,17 +351,14 @@ impl Resource for TlsConfig {
         _: comprehensive::NoArgs,
         api: &mut AssemblyRuntime<'_>,
     ) -> Result<Arc<Self>, ComprehensiveTlsError> {
-        let crypto_provider = CryptoProvider::get_default();
-        let (inner, cacerts) = setup(d, api, crypto_provider.cloned())?;
-        let mut roots = RootCertStore::empty();
-        roots.add_parsable_certificates(cacerts);
-        let client_config = ClientConfig::builder_with_provider(
-            crypto_provider
-                .cloned()
-                .unwrap_or_else(|| Arc::new(rustls::crypto::aws_lc_rs::default_provider())),
-        )
-        .with_safe_default_protocol_versions()?
-        .with_root_certificates(roots);
+        let crypto_provider = CryptoProvider::get_default()
+            .cloned()
+            .unwrap_or_else(|| Arc::new(rustls::crypto::aws_lc_rs::default_provider()));
+        let (inner, peer_verifier) = setup(d, api, Arc::clone(&crypto_provider))?;
+        let client_config = ClientConfig::builder_with_provider(crypto_provider)
+            .with_safe_default_protocol_versions()?
+            .dangerous()
+            .with_custom_certificate_verifier(peer_verifier);
         let client_config = match inner {
             Some(ref inner) => {
                 let resolver = Arc::clone(&inner.resolver);
@@ -392,9 +502,12 @@ mod tests {
 
     use comprehensive::{Assembly, ResourceDependencies};
     use comprehensive_traits::tls_config::Exchange;
+    use futures::future::Either;
     use futures::{FutureExt, SinkExt, poll};
     use std::io::Cursor;
     use std::pin::pin;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
+    use tokio_rustls::{Accept, Connect, TlsAcceptor, TlsConnector};
 
     const EMPTY: &[std::ffi::OsString] = &[];
 
@@ -508,5 +621,107 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .expect("testdata::USER2_CERT");
         assert_eq!(got.cert, want);
+    }
+
+    fn pair_with_client_config(
+        cc: Arc<ClientConfig>,
+    ) -> (Connect<DuplexStream>, Accept<DuplexStream>) {
+        let p = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let sc = rustls::ServerConfig::builder_with_provider(p)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(
+                rustls_pemfile::certs(&mut Cursor::new(&testdata::USER2_CERT))
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap(),
+                rustls_pemfile::private_key(&mut Cursor::new(&testdata::USER2_KEY))
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+
+        let (client, server) = tokio::io::duplex(64);
+        let client = TlsConnector::from(cc).connect(ServerName::try_from("user2").unwrap(), client);
+        let server = TlsAcceptor::from(Arc::new(sc)).accept(server);
+        (client, server)
+    }
+
+    #[tokio::test]
+    async fn client_verifies_server_cert() {
+        let a = Assembly::<TopDependencies>::new_from_argv(EMPTY).unwrap();
+        let (client, server) = pair_with_client_config(a.top.0.client_config());
+        let client_task = pin!(async move {
+            let mut stream = client.await.expect("client connected");
+            stream
+                .write_all(b"hello")
+                .await
+                .expect("write hello to client");
+            let mut buf = vec![0u8; 3];
+            stream
+                .read_exact(&mut buf)
+                .await
+                .expect("read bye from server");
+            assert_eq!(buf, b"bye");
+        });
+        let server_task = pin!(async move {
+            let mut stream = server.await.expect("server accepted");
+            let mut buf = vec![0u8; 5];
+            stream
+                .read_exact(&mut buf)
+                .await
+                .expect("read hello from client");
+            assert_eq!(buf, b"hello");
+            stream.write_all(b"bye").await.expect("write bye to client");
+            stream.shutdown().await.expect("shutdown");
+        });
+        match futures::future::select(client_task, server_task).await {
+            Either::Left((_, _)) => (),
+            Either::Right((_, client_task)) => client_task.await,
+        }
+    }
+
+    #[tokio::test]
+    async fn client_refuses_server_cert() {
+        let a = Assembly::<TopDependencies>::new_from_argv(EMPTY).unwrap();
+        let cc = a.top.0.client_config();
+        let provider = Arc::clone(&a.top.1);
+        let mut writer = provider.0.writer().unwrap();
+
+        let mut r = pin!(a.run_with_termination_signal(futures::stream::pending()));
+        let _ = futures::future::select(
+            &mut r,
+            writer.send(mksnapshot(
+                &testdata::USER1_KEY,
+                &testdata::USER1_CERT,
+                &testdata::USER1_CERT, // Not the correct trust root
+            )),
+        )
+        .await;
+        assert!(poll!(&mut r).is_pending());
+
+        let (client, server) = pair_with_client_config(cc);
+        let client_task = pin!(async move {
+            let err = client.await.expect_err("should refuse");
+            assert!(err.to_string().contains("certificate"));
+        });
+        match futures::future::select(client_task, server).await {
+            Either::Left((_, _)) => (),
+            Either::Right((_, client_task)) => client_task.await,
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn no_roots() {
+        let a = Assembly::<TopDependencies>::new_from_argv(EMPTY).unwrap();
+        let provider = Arc::clone(&a.top.1);
+        let mut writer = provider.0.writer().unwrap();
+        let mut r = pin!(a.run_with_termination_signal(futures::stream::pending()));
+        let _ = futures::future::select(
+            &mut r,
+            writer.send(mksnapshot(&testdata::USER2_KEY, &testdata::USER2_CERT, b"")),
+        )
+        .await;
+        assert!(poll!(&mut r).is_pending());
     }
 }

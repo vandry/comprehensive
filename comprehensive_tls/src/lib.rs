@@ -69,10 +69,6 @@ pub enum ComprehensiveTlsError {
     /// flags for the private key and certificate.
     #[error("No provider for TLS parameters is available")]
     NoTlsProvider,
-    /// Error PEM-encoding data
-    #[cfg(feature = "unreloadable_tls")]
-    #[error("No provider for TLS parameters is available")]
-    PEMError(#[from] pem_rfc7468::Error),
 }
 
 #[derive(Debug)]
@@ -80,8 +76,6 @@ struct ReloadableContents {
     certified_key: Arc<CertifiedKey>,
     server_verifier: Option<Arc<WebPkiServerVerifier>>,
     roots: Option<Arc<RootCertStore>>,
-    #[cfg(feature = "unreloadable_tls")]
-    snapshot: Snapshot,
 }
 
 /// Certificate resolver for configuring into HTTPS etc... servers.
@@ -254,12 +248,6 @@ fn accept_update(
     snapshot: Snapshot,
     crypto_provider: &Arc<CryptoProvider>,
 ) -> Result<ReloadableContents, rustls::Error> {
-    #[cfg(feature = "unreloadable_tls")]
-    let snapshot2 = Snapshot {
-        key: snapshot.key.clone_key(),
-        cert: snapshot.cert.clone(),
-        cacert: snapshot.cacert.clone(),
-    };
     let private_key = crypto_provider
         .key_provider
         .load_private_key(snapshot.key)?;
@@ -286,8 +274,6 @@ fn accept_update(
         certified_key: Arc::new(certified_key),
         server_verifier,
         roots,
-        #[cfg(feature = "unreloadable_tls")]
-        snapshot: snapshot2,
     })
 }
 
@@ -407,90 +393,6 @@ impl Resource for TlsConfig {
     }
 }
 
-/// struct returned by [`TlsConfig::snapshot`] that contains a snapshot of
-/// the currently loaded TLS certificate and corresponding key, as well as
-/// a CA certificate for verifying peers.
-#[cfg(feature = "unreloadable_tls")]
-pub struct TlsDataSnapshot {
-    /// X.509 key in PEM format.
-    pub key: Vec<u8>,
-    /// X.509 certificate in PEM format.
-    pub cert: Vec<u8>,
-    /// X.509 CA certificate in PEM format.
-    pub cacert: Option<Vec<u8>>,
-}
-
-#[cfg(feature = "unreloadable_tls")]
-mod pem {
-    use super::{CertificateDer, Snapshot, TlsDataSnapshot};
-    use pem_rfc7468::{Error, LineEnding, encode, encoded_len};
-
-    fn pem_certs(certs: &[CertificateDer<'static>]) -> Result<Vec<u8>, Error> {
-        const CERTIFICATE: &str = "CERTIFICATE";
-
-        let expected_len = certs.iter().try_fold(0, |acc, c| {
-            Ok::<_, Error>(acc + encoded_len(CERTIFICATE, LineEnding::LF, c.as_ref())?)
-        })?;
-        let mut out = vec![0u8; expected_len];
-        let mut l = 0;
-        for c in certs {
-            l += encode(CERTIFICATE, LineEnding::LF, c.as_ref(), &mut out[l..])?.len();
-        }
-        Ok(out)
-    }
-
-    pub(super) fn make_pem_snapshot(snapshot: &Snapshot) -> Result<TlsDataSnapshot, Error> {
-        const PRIVATE_KEY: &str = "PRIVATE KEY";
-
-        let expected_len = encoded_len(PRIVATE_KEY, LineEnding::LF, snapshot.key.secret_der())?;
-        let mut key = vec![0u8; expected_len];
-        let _ = encode(
-            PRIVATE_KEY,
-            LineEnding::LF,
-            snapshot.key.secret_der(),
-            &mut key,
-        )?;
-        Ok(TlsDataSnapshot {
-            key,
-            cert: pem_certs(&snapshot.cert)?,
-            cacert: snapshot.cacert.as_ref().map(|c| pem_certs(c)).transpose()?,
-        })
-    }
-
-    #[cfg(test)]
-    mod tests {
-        use crate::{Snapshot, testdata};
-        use std::io::Cursor;
-
-        #[test]
-        fn pem() {
-            let user1 = rustls_pemfile::certs(&mut Cursor::new(&testdata::USER1_CERT))
-                .next()
-                .unwrap()
-                .unwrap();
-            let user2 = rustls_pemfile::certs(&mut Cursor::new(&testdata::USER2_CERT))
-                .next()
-                .unwrap()
-                .unwrap();
-            let s = Snapshot {
-                key: rustls_pemfile::private_key(&mut Cursor::new(&testdata::USER1_KEY))
-                    .unwrap()
-                    .unwrap(),
-                cert: vec![user1.clone()],
-                cacert: vec![user1, user2].into(),
-            };
-            let ds = super::make_pem_snapshot(&s).unwrap();
-            assert_eq!(ds.key, &testdata::USER1_KEY[1..]);
-            assert_eq!(ds.cert, &testdata::USER1_CERT[1..]);
-            let mut cat =
-                Vec::with_capacity(testdata::USER1_CERT.len() + testdata::USER2_CERT.len() - 2);
-            cat.extend(&testdata::USER1_CERT[1..]);
-            cat.extend(&testdata::USER2_CERT[1..]);
-            assert_eq!(ds.cacert.unwrap(), cat);
-        }
-    }
-}
-
 impl TlsConfig {
     /// Returns a struct that implements the
     /// [`rustls::server::ResolvesServerCert`] trait. This can be
@@ -533,21 +435,6 @@ impl TlsConfig {
             .clone()
             .with_client_cert_verifier(client_verifier)
             .with_cert_resolver(resolver)
-    }
-
-    /// Returns an object with raw [`Vec<u8>`] PEM representations of the
-    /// currently loaded key and certificate. This is unreloadable
-    /// unfortunately so it should only be used for `tonic`, which
-    /// currently cannot consume a [`rustls::server::ResolvesServerCert`].
-    #[cfg(feature = "unreloadable_tls")]
-    pub fn snapshot(&self) -> Result<TlsDataSnapshot, ComprehensiveTlsError> {
-        Ok(pem::make_pem_snapshot(
-            &self
-                .reloadable
-                .0
-                .load()
-                .snapshot,
-        )?)
     }
 }
 

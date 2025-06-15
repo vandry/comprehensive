@@ -20,14 +20,10 @@ comprehensive_traits = { path = "../comprehensive_traits", version = "0.1.2", fe
 delegate = "0.13.3"
 futures = "0.3"
 log = "0.4"
-pem-rfc7468 = { version = "0.7.0", optional = true }
 rustls-pemfile = "2.1"
 thiserror = "2.0.12"
 tokio = "1.40"
 tokio-rustls = "0.26"
-
-[features]
-unreloadable_tls = ["dep:pem-rfc7468", "pem-rfc7468/std"]
 
 [dev-dependencies]
 futures = "0.3"

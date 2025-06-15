@@ -21,7 +21,9 @@
 //!         _: comprehensive::NoArgs,
 //!         _: &mut AssemblyRuntime<'_>,
 //!     ) -> Result<Arc<Self>, Box<dyn std::error::Error>> {
-//!         let _ = rustls::ServerConfig::builder()
+//!         let server_config_with_client_auth = d.tls.server_config_mtls();
+//!
+//!         let server_config_no_client_auth = rustls::ServerConfig::builder()
 //!             .with_no_client_auth()
 //!             .with_cert_resolver(d.tls.cert_resolver()?);
 //!         // ...more setup...
@@ -32,7 +34,7 @@
 
 #![warn(missing_docs)]
 
-use arc_swap::{ArcSwap, ArcSwapOption};
+use arc_swap::ArcSwap;
 use comprehensive::ResourceDependencies;
 use comprehensive::v1::{AssemblyRuntime, Resource, resource};
 use comprehensive_traits::tls_config::{Snapshot, TlsConfigProvider};
@@ -43,7 +45,8 @@ use rustls::client::danger::ServerCertVerifier;
 use rustls::client::{ClientConfig, ResolvesClientCert, WebPkiServerVerifier};
 use rustls::crypto::CryptoProvider;
 use rustls::pki_types::{CertificateDer, ServerName};
-use rustls::server::{ClientHello, ResolvesServerCert};
+use rustls::server::danger::ClientCertVerifier;
+use rustls::server::{ClientHello, ResolvesServerCert, ServerConfig, WebPkiClientVerifier};
 use rustls::sign::CertifiedKey;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -72,13 +75,22 @@ pub enum ComprehensiveTlsError {
     PEMError(#[from] pem_rfc7468::Error),
 }
 
+#[derive(Debug)]
+struct ReloadableContents {
+    certified_key: Arc<CertifiedKey>,
+    server_verifier: Option<Arc<WebPkiServerVerifier>>,
+    roots: Option<Arc<RootCertStore>>,
+    #[cfg(feature = "unreloadable_tls")]
+    snapshot: Snapshot,
+}
+
 /// Certificate resolver for configuring into HTTPS etc... servers.
 #[derive(Debug)]
-pub struct ReloadableKeyAndCertResolver(ArcSwap<CertifiedKey>);
+pub struct ReloadableKeyAndCertResolver(ArcSwap<ReloadableContents>);
 
 impl ReloadableKeyAndCertResolver {
     fn real_resolve(&self) -> Option<Arc<CertifiedKey>> {
-        Some(Arc::clone(&self.0.load()))
+        Some(Arc::clone(&self.0.load().certified_key))
     }
 }
 
@@ -103,9 +115,9 @@ impl ResolvesClientCert for ReloadableKeyAndCertResolver {
 }
 
 #[derive(Debug)]
-struct NullPeerVerifier;
+struct NullServerCertVerifier<'a>(&'a CryptoProvider);
 
-impl ServerCertVerifier for NullPeerVerifier {
+impl ServerCertVerifier for NullServerCertVerifier<'_> {
     fn verify_server_cert(
         &self,
         _: &CertificateDer<'_>,
@@ -142,37 +154,29 @@ impl ServerCertVerifier for NullPeerVerifier {
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        Vec::new()
+        self.0.signature_verification_algorithms.supported_schemes()
     }
 }
 
-#[derive(Debug, Default)]
-struct PeerVerifier(ArcSwapOption<WebPkiServerVerifier>);
+#[derive(Debug)]
+struct ServerVerifier(Arc<ReloadableKeyAndCertResolver>, Arc<CryptoProvider>);
 
-impl PeerVerifier {
-    fn make_inner(
-        roots: RootCertStore,
+impl ServerVerifier {
+    fn new(
+        reloadable: Arc<ReloadableKeyAndCertResolver>,
         crypto_provider: Arc<CryptoProvider>,
-    ) -> Result<Arc<WebPkiServerVerifier>, rustls::server::VerifierBuilderError> {
-        WebPkiServerVerifier::builder_with_provider(roots.into(), crypto_provider).build()
-    }
-
-    fn new(inner: Option<Arc<WebPkiServerVerifier>>) -> Self {
-        Self(ArcSwapOption::from(inner))
-    }
-
-    fn replace(&self, inner: Option<Arc<WebPkiServerVerifier>>) {
-        self.0.store(inner);
+    ) -> Self {
+        Self(reloadable, crypto_provider)
     }
 }
 
-impl ServerCertVerifier for PeerVerifier {
+impl ServerCertVerifier for ServerVerifier {
     delegate! {
         #[through(ServerCertVerifier)]
-        #[expr(let inner = self.0.load(); $)]
-        to match *inner {
+        #[expr(let reloadable = self.0.0.load(); $)]
+        to match reloadable.server_verifier {
             Some(ref v) => &**v,
-            None => &NullPeerVerifier,
+            None => &NullServerCertVerifier(&self.1),
         } {
             fn verify_server_cert(
                 &self,
@@ -200,17 +204,56 @@ impl ServerCertVerifier for PeerVerifier {
     }
 }
 
-struct Update {
-    certified_key: CertifiedKey,
-    peer_verifier: Option<Arc<WebPkiServerVerifier>>,
-    #[cfg(feature = "unreloadable_tls")]
-    snapshot: Snapshot,
+#[derive(Debug)]
+struct NullClientCertVerifier(Arc<CryptoProvider>);
+
+impl ClientCertVerifier for NullClientCertVerifier {
+    fn root_hint_subjects(&self) -> &[rustls::DistinguishedName] {
+        &[]
+    }
+
+    fn verify_client_cert(
+        &self,
+        _: &CertificateDer<'_>,
+        _: &[CertificateDer<'_>],
+        _: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::server::danger::ClientCertVerified, rustls::Error> {
+        Err(rustls::Error::InvalidCertificate(
+            rustls::CertificateError::UnknownIssuer,
+        ))
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _: &[u8],
+        _: &CertificateDer<'_>,
+        _: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Err(rustls::Error::InvalidCertificate(
+            rustls::CertificateError::UnknownIssuer,
+        ))
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _: &[u8],
+        _: &CertificateDer<'_>,
+        _: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Err(rustls::Error::InvalidCertificate(
+            rustls::CertificateError::UnknownIssuer,
+        ))
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.0.signature_verification_algorithms.supported_schemes()
+    }
 }
 
 fn accept_update(
     snapshot: Snapshot,
-    crypto_provider: Arc<CryptoProvider>,
-) -> Result<Update, rustls::Error> {
+    crypto_provider: &Arc<CryptoProvider>,
+) -> Result<ReloadableContents, rustls::Error> {
     #[cfg(feature = "unreloadable_tls")]
     let snapshot2 = Snapshot {
         key: snapshot.key.clone_key(),
@@ -223,26 +266,29 @@ fn accept_update(
     let certified_key = CertifiedKey::new(snapshot.cert, private_key);
     certified_key.keys_match()?;
 
-    let peer_verifier = snapshot.cacert.and_then(|cacerts| {
+    let roots = snapshot.cacert.and_then(|cacerts| {
         let mut roots = RootCertStore::empty();
         roots.add_parsable_certificates(cacerts);
-        PeerVerifier::make_inner(roots, crypto_provider)
+        if roots.is_empty() {
+            log::warn!("Empty TLS trust anchors. TLS connections will likely fail.");
+            None
+        } else {
+            Some(Arc::new(roots))
+        }
+    });
+    let server_verifier = roots.as_ref().and_then(|roots| {
+        WebPkiServerVerifier::builder_with_provider(Arc::clone(roots), Arc::clone(crypto_provider)).build()
             .inspect_err(|e| log::warn!("Error constructing server certificate verifier: {}; TLS connections will likely fail.", e))
             .ok()
     });
 
-    Ok(Update {
-        certified_key,
-        peer_verifier,
+    Ok(ReloadableContents {
+        certified_key: Arc::new(certified_key),
+        server_verifier,
+        roots,
         #[cfg(feature = "unreloadable_tls")]
         snapshot: snapshot2,
     })
-}
-
-struct TlsConfigInner {
-    resolver: Arc<ReloadableKeyAndCertResolver>,
-    #[cfg(feature = "unreloadable_tls")]
-    snapshot: Snapshot,
 }
 
 /// Comprenehsive [`Resource`] for loading a TLS key and certificate.
@@ -259,8 +305,10 @@ struct TlsConfigInner {
 /// for now only consumers who use the [`TlsConfig::cert_resolver`]
 /// interface can take advantage of that.
 pub struct TlsConfig {
-    inner: Option<TlsConfigInner>,
+    reloadable: Option<Arc<ReloadableKeyAndCertResolver>>,
     client_config: Arc<ClientConfig>,
+    server_config_builder: rustls::ConfigBuilder<ServerConfig, rustls::WantsVerifier>,
+    crypto_provider: Arc<CryptoProvider>,
 }
 
 #[doc(hidden)]
@@ -274,11 +322,11 @@ pub struct TlsConfigDependencies {
 fn setup(
     d: TlsConfigDependencies,
     api: &mut AssemblyRuntime<'_>,
-    crypto_provider: Arc<CryptoProvider>,
-) -> Result<(Option<TlsConfigInner>, Arc<PeerVerifier>), rustls::Error> {
+    crypto_provider: &Arc<CryptoProvider>,
+) -> Result<Option<Arc<ReloadableKeyAndCertResolver>>, rustls::Error> {
     let mut providers_it = d.providers.into_iter();
     let Some(provider) = providers_it.next() else {
-        return Ok((None, Arc::new(PeerVerifier::default())));
+        return Ok(None);
     };
     if providers_it.len() > 0 {
         log::warn!(
@@ -294,33 +342,21 @@ fn setup(
         .unwrap()
         .poll_next_unpin(&mut Context::from_waker(std::task::Waker::noop()))
     else {
-        return Ok((None, Arc::new(PeerVerifier::default())));
+        return Ok(None);
     };
 
-    let Update {
-        certified_key,
-        peer_verifier,
-        #[cfg(feature = "unreloadable_tls")]
-        snapshot,
-    } = accept_update(*initial, Arc::clone(&crypto_provider))?;
+    let contents = accept_update(*initial, crypto_provider)?;
     let resolver = Arc::new(ReloadableKeyAndCertResolver(ArcSwap::from_pointee(
-        certified_key,
+        contents,
     )));
-    let peer_verifier = Arc::new(PeerVerifier::new(peer_verifier));
-    let peer_verifier_for_updating = Arc::clone(&peer_verifier);
     let resolver_for_updating = Arc::clone(&resolver);
+    let crypto_provider = Arc::clone(crypto_provider);
     api.set_task(async move {
         let mut update_stream = provider.stream().unwrap();
         while let Some(update) = update_stream.next().await {
-            match accept_update(*update, Arc::clone(&crypto_provider)) {
-                Ok(Update {
-                    certified_key,
-                    peer_verifier,
-                    #[cfg(feature = "unreloadable_tls")]
-                        snapshot: _,
-                }) => {
-                    resolver_for_updating.0.store(certified_key.into());
-                    peer_verifier_for_updating.replace(peer_verifier);
+            match accept_update(*update, &crypto_provider) {
+                Ok(contents) => {
+                    resolver_for_updating.0.store(contents.into());
                 }
                 Err(e) => {
                     log::error!(
@@ -332,14 +368,7 @@ fn setup(
         }
         Ok(())
     });
-    Ok((
-        Some(TlsConfigInner {
-            resolver,
-            #[cfg(feature = "unreloadable_tls")]
-            snapshot,
-        }),
-        peer_verifier,
-    ))
+    Ok(Some(resolver))
 }
 
 #[resource]
@@ -354,21 +383,34 @@ impl Resource for TlsConfig {
         let crypto_provider = CryptoProvider::get_default()
             .cloned()
             .unwrap_or_else(|| Arc::new(rustls::crypto::aws_lc_rs::default_provider()));
-        let (inner, peer_verifier) = setup(d, api, Arc::clone(&crypto_provider))?;
-        let client_config = ClientConfig::builder_with_provider(crypto_provider)
-            .with_safe_default_protocol_versions()?
-            .dangerous()
-            .with_custom_certificate_verifier(peer_verifier);
-        let client_config = match inner {
-            Some(ref inner) => {
-                let resolver = Arc::clone(&inner.resolver);
-                client_config.with_client_cert_resolver(resolver)
+        let reloadable = setup(d, api, &crypto_provider)?;
+        let client_config = ClientConfig::builder_with_provider(Arc::clone(&crypto_provider))
+            .with_safe_default_protocol_versions()?;
+
+        let client_config = match reloadable {
+            Some(ref reloadable) => {
+                let resolver = Arc::clone(reloadable);
+                let server_verifier = Arc::new(ServerVerifier::new(
+                    Arc::clone(reloadable),
+                    Arc::clone(&crypto_provider),
+                ));
+                client_config
+                    .dangerous()
+                    .with_custom_certificate_verifier(server_verifier)
+                    .with_client_cert_resolver(resolver)
             }
-            None => client_config.with_no_client_auth(),
+            None => client_config
+                .with_root_certificates(Arc::new(RootCertStore::empty()))
+                .with_no_client_auth(),
         };
+        let server_config_builder =
+            ServerConfig::builder_with_provider(Arc::clone(&crypto_provider))
+                .with_safe_default_protocol_versions()?;
         Ok(Arc::new(Self {
-            inner,
+            reloadable,
             client_config: Arc::new(client_config),
+            server_config_builder,
+            crypto_provider,
         }))
     }
 }
@@ -457,6 +499,15 @@ mod pem {
     }
 }
 
+#[derive(Debug)]
+struct NeverResolvesServerCert;
+
+impl ResolvesServerCert for NeverResolvesServerCert {
+    fn resolve(&self, _client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        None
+    }
+}
+
 impl TlsConfig {
     /// Returns a struct that implements the
     /// [`rustls::server::ResolvesServerCert`] trait. This can be
@@ -466,11 +517,9 @@ impl TlsConfig {
         &self,
     ) -> Result<Arc<ReloadableKeyAndCertResolver>, ComprehensiveTlsError> {
         Ok(Arc::clone(
-            &self
-                .inner
+            self.reloadable
                 .as_ref()
-                .ok_or(ComprehensiveTlsError::NoTlsProvider)?
-                .resolver,
+                .ok_or(ComprehensiveTlsError::NoTlsProvider)?,
         ))
     }
 
@@ -478,6 +527,40 @@ impl TlsConfig {
     /// If a local key and certificate are supplied then this will do client auth.
     pub fn client_config(&self) -> Arc<ClientConfig> {
         Arc::clone(&self.client_config)
+    }
+
+    /// Returns a TLS [`ServerConfig`] built from the runtime configuration
+    /// and is suitable for mTLS (mutual TLS).
+    ///
+    /// Due to a [limitation](https://github.com/rustls/rustls/issues/2497)
+    /// of the [`ClientCertVerifier`] trait, the output of this method is
+    /// built from a snapshot of the [`TlsConfig`] and becomes stale after
+    /// the underlying config is reloaded. Therefore a fresh [`ServerConfig`]
+    /// should be regenerated before each handshake, or at least at intervals.
+    pub fn server_config_mtls(&self) -> ServerConfig {
+        self.reloadable.as_ref().map(|reloadable| {
+            let client_verifier = reloadable.0.load().roots
+                .as_ref()
+                .and_then(|roots| {
+                    WebPkiClientVerifier::builder_with_provider(
+                        Arc::clone(roots),
+                        Arc::clone(&self.crypto_provider),
+                    ).build()
+                        .inspect_err(|e| log::warn!("Error constructing client certificate verifier: {}; TLS connections will likely fail.", e))
+                        .ok()
+                })
+                .unwrap_or_else(|| Arc::new(NullClientCertVerifier(Arc::clone(&self.crypto_provider))));
+            let resolver = Arc::clone(reloadable);
+            self.server_config_builder
+                .clone()
+                .with_client_cert_verifier(client_verifier)
+                .with_cert_resolver(resolver)
+        }).unwrap_or_else(|| {
+            self.server_config_builder
+                .clone()
+                .with_client_cert_verifier(Arc::new(NullClientCertVerifier(Arc::clone(&self.crypto_provider))))
+                .with_cert_resolver(Arc::new(NeverResolvesServerCert))
+        })
     }
 
     /// Returns an object with raw [`Vec<u8>`] PEM representations of the
@@ -488,9 +571,11 @@ impl TlsConfig {
     pub fn snapshot(&self) -> Result<TlsDataSnapshot, ComprehensiveTlsError> {
         Ok(pem::make_pem_snapshot(
             &self
-                .inner
+                .reloadable
                 .as_ref()
                 .ok_or(ComprehensiveTlsError::NoTlsProvider)?
+                .0
+                .load()
                 .snapshot,
         )?)
     }
@@ -627,7 +712,7 @@ mod tests {
         cc: Arc<ClientConfig>,
     ) -> (Connect<DuplexStream>, Accept<DuplexStream>) {
         let p = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
-        let sc = rustls::ServerConfig::builder_with_provider(p)
+        let sc = ServerConfig::builder_with_provider(p)
             .with_safe_default_protocol_versions()
             .unwrap()
             .with_no_client_auth()
@@ -647,10 +732,38 @@ mod tests {
         (client, server)
     }
 
-    #[tokio::test]
-    async fn client_verifies_server_cert() {
-        let a = Assembly::<TopDependencies>::new_from_argv(EMPTY).unwrap();
-        let (client, server) = pair_with_client_config(a.top.0.client_config());
+    fn pair_with_server_config(
+        sc: Arc<ServerConfig>,
+    ) -> (Connect<DuplexStream>, Accept<DuplexStream>) {
+        let p = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let mut roots = RootCertStore::empty();
+        roots.add_parsable_certificates(
+            rustls_pemfile::certs(&mut Cursor::new(&testdata::CACERT))
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+        );
+        let cc = ClientConfig::builder_with_provider(p)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(Arc::new(roots))
+            .with_client_auth_cert(
+                rustls_pemfile::certs(&mut Cursor::new(&testdata::USER2_CERT))
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap(),
+                rustls_pemfile::private_key(&mut Cursor::new(&testdata::USER2_KEY))
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+
+        let (client, server) = tokio::io::duplex(64);
+        let client = TlsConnector::from(Arc::new(cc))
+            .connect(ServerName::try_from("user1").unwrap(), client);
+        let server = TlsAcceptor::from(sc).accept(server);
+        (client, server)
+    }
+
+    async fn talk(client: Connect<DuplexStream>, server: Accept<DuplexStream>) {
         let client_task = pin!(async move {
             let mut stream = client.await.expect("client connected");
             stream
@@ -679,6 +792,13 @@ mod tests {
             Either::Left((_, _)) => (),
             Either::Right((_, client_task)) => client_task.await,
         }
+    }
+
+    #[tokio::test]
+    async fn client_verifies_server_cert() {
+        let a = Assembly::<TopDependencies>::new_from_argv(EMPTY).unwrap();
+        let (client, server) = pair_with_client_config(a.top.0.client_config());
+        talk(client, server).await;
     }
 
     #[tokio::test]
@@ -723,5 +843,42 @@ mod tests {
         )
         .await;
         assert!(poll!(&mut r).is_pending());
+    }
+
+    #[tokio::test]
+    async fn server_verifies_client_cert() {
+        let a = Assembly::<TopDependencies>::new_from_argv(EMPTY).unwrap();
+        let (client, server) = pair_with_server_config(Arc::new(a.top.0.server_config_mtls()));
+        talk(client, server).await;
+    }
+
+    #[tokio::test]
+    async fn server_refuses_client_cert() {
+        let a = Assembly::<TopDependencies>::new_from_argv(EMPTY).unwrap();
+        let tlsc = Arc::clone(&a.top.0);
+        let provider = Arc::clone(&a.top.1);
+        let mut writer = provider.0.writer().unwrap();
+
+        let mut r = pin!(a.run_with_termination_signal(futures::stream::pending()));
+        let _ = futures::future::select(
+            &mut r,
+            writer.send(mksnapshot(
+                &testdata::USER1_KEY,
+                &testdata::USER1_CERT,
+                &testdata::USER1_CERT, // Not the correct trust root
+            )),
+        )
+        .await;
+        assert!(poll!(&mut r).is_pending());
+
+        let (client, server) = pair_with_server_config(Arc::new(tlsc.server_config_mtls()));
+        let server_task = pin!(async move {
+            let err = server.await.expect_err("should refuse");
+            assert!(err.to_string().contains("certificate"));
+        });
+        match futures::future::select(client, server_task).await {
+            Either::Left((_, server_task)) => server_task.await,
+            Either::Right((_, _)) => (),
+        }
     }
 }

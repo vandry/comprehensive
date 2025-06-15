@@ -24,29 +24,37 @@ futures = "0.3"
 http = "1.1"
 humantime = "2.1"
 log = "0.4"
+pin-project-lite = { version = "0.2", optional = true }
 prometheus = "0.13"
 prost = "0.13"
 prost-types = "0.13"
 thiserror = "2.0.12"
 tokio = "1.40"
+tokio-rustls = { version = "0.26", optional = true }
+tokio-stream = { version = "0.1", optional = true }
 tonic = "0.12"
 tonic-health = "0.12"
 tonic-reflection = "0.12"
 tonic_prometheus_layer = "0.1"
 tower = "0.5"
 tower-layer = "0.3"
+tower-service = "0.3.3"
 warm_channels = { version = "0.2", features = ["grpc", "metrics"] }
 
 [features]
-tls = ["comprehensive_tls/unreloadable_tls", "dep:comprehensive_tls", "tonic/tls", "warm_channels/tls"]
+tls = ["dep:comprehensive_tls", "dep:pin-project-lite", "dep:tokio-rustls", "dep:tokio-stream", "tonic/tls", "warm_channels/tls"]
 
 [build-dependencies]
 tonic-build = "0.12"
 
 [dev-dependencies]
 comprehensive_http = { path = "../comprehensive_http", version = "0.1" }
+comprehensive_traits = { path = "../comprehensive_traits", version = "0.1.2", features = ["tls_config"] }
+delegate = "0.13.3"
 http-body-util = "0.1"
+hyper-util = "0.1.14"
 rand = "0.8"
+rustls-pemfile = "2.1"
 test-log = "0.2"
 tokio-rustls = "0.26"
 tokio-stream = "0.1"

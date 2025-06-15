@@ -142,6 +142,11 @@ use thiserror::Error;
 pub mod client;
 pub mod server;
 
+#[cfg(feature = "tls")]
+mod incoming;
+#[cfg(all(test, feature = "tls"))]
+mod tls_test;
+
 /// Trait which can be derived to create a [`Resource`] already attached to
 /// the server and provided with an implementation. The implementation must
 /// itself implement both the [`Resource`] trait and the codegen'd trait for
@@ -171,10 +176,10 @@ fn tonic_prometheus_layer_use_default_registry() {
 /// Error type returned by various Comprehensive gRPC functions
 #[derive(Debug, Error)]
 pub enum ComprehensiveGrpcError {
-    /// An error from [`comprehensive_tls`].
+    /// Wrapper for [`std::io::Error`].
     #[cfg(feature = "tls")]
     #[error("{0}")]
-    ComprehensiveTlsError(#[from] comprehensive_tls::ComprehensiveTlsError),
+    IOError(#[from] std::io::Error),
     /// An error from [`tonic`].
     #[error("{0}")]
     TonicTransportError(#[from] tonic::transport::Error),

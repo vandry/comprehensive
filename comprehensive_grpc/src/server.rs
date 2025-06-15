@@ -52,7 +52,7 @@ use tonic::body::BoxBody;
 use tonic::server::NamedService;
 use tonic::service::Routes;
 use tonic_prometheus_layer::MetricsLayer;
-use tower::Service;
+use tower_service::Service;
 
 use super::{ComprehensiveGrpcError, GrpcService};
 
@@ -295,14 +295,6 @@ mod secure_server {
                 let Some(tlsc) = d.tls else {
                     return Err(crate::ComprehensiveGrpcError::NoTlsProvider);
                 };
-                let snapshot = tlsc.snapshot()?;
-                let identity = tonic::transport::Identity::from_pem(snapshot.cert, snapshot.key);
-                let mut tls = tonic::transport::ServerTlsConfig::new().identity(identity);
-                if let Some(cacert) = snapshot.cacert {
-                    let cert = tonic::transport::Certificate::from_pem(cacert);
-                    tls = tls.client_ca_root(cert);
-                }
-
                 let mut adder = GrpcServiceAdder::new(&d.health);
                 for dep in d.services.into_iter() {
                     dep.add_to_server(&mut adder)?;
@@ -310,12 +302,14 @@ mod secure_server {
                 let stop = api.self_stop();
                 let (routes, relay) = adder.into_routes_and_relay();
                 let addr = (args.grpcs_bind_addr, port).into();
-                let mut base = new_base_layer().tls_config(tls)?;
+                let incoming = crate::incoming::tls_over_tcp(addr, tlsc)?;
+                let base = new_base_layer();
                 api.set_task(async move {
                     log::info!("Secure gRPC server listening on {}", addr);
                     serve(relay, async move {
-                        base.add_routes(routes)
-                            .serve_with_shutdown(addr, stop)
+                        base.layer(crate::incoming::AddUnderlyingConnectInfoLayer)
+                            .add_routes(routes)
+                            .serve_with_incoming_shutdown(incoming, stop)
                             .await
                     })
                     .await

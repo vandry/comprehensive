@@ -338,7 +338,7 @@ impl<I: InstanceDescriptor> FromArgMatches for GrpcClientArgs<I> {
 pub struct GRPCClientDependencies {
     resolver: Arc<DNSResolver>,
     #[cfg(feature = "tls")]
-    tls_config: Arc<comprehensive_tls::TlsConfig>,
+    tls_config: Option<Arc<comprehensive_tls::TlsConfig>>,
     health: Arc<HealthReporter>,
     _include_me: PhantomData<WarmChannelsDiag>,
 }
@@ -382,8 +382,8 @@ pub fn new<I>(
 
     #[cfg(feature = "tls")]
     let connector = {
-        let tls_config = d.tls_config.client_config();
-        TLSConnector::new(StreamConnector::default(), &uri, Some(&tls_config))?
+        let tls_config = d.tls_config.map(|tlsc| tlsc.client_config());
+        TLSConnector::new(StreamConnector::default(), &uri, tls_config.as_deref())?
     };
     #[cfg(not(feature = "tls"))]
     let connector = StreamConnector::default();

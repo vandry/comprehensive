@@ -275,7 +275,7 @@ mod secure_server {
 
     #[derive(ResourceDependencies)]
     pub(super) struct SecureGrpcServerDependencies {
-        tls: Arc<comprehensive_tls::TlsConfig>,
+        tls: Option<Arc<comprehensive_tls::TlsConfig>>,
         services: Vec<Arc<dyn GrpcService>>,
         health: Arc<HealthReporter>,
     }
@@ -292,7 +292,10 @@ mod secure_server {
             api: &mut AssemblyRuntime<'_>,
         ) -> Result<Arc<Self>, crate::ComprehensiveGrpcError> {
             if let Some(port) = args.grpcs_port {
-                let snapshot = d.tls.snapshot()?;
+                let Some(tlsc) = d.tls else {
+                    return Err(crate::ComprehensiveGrpcError::NoTlsProvider);
+                };
+                let snapshot = tlsc.snapshot()?;
                 let identity = tonic::transport::Identity::from_pem(snapshot.cert, snapshot.key);
                 let mut tls = tonic::transport::ServerTlsConfig::new().identity(identity);
                 if let Some(cacert) = snapshot.cacert {

@@ -198,6 +198,10 @@ pub enum ComprehensiveGrpcError {
         "No file descriptor set registered covering {0}. Register one with register_encoded_file_descriptor_set or call disable_reflection."
     )]
     NoServiceDescriptor(&'static str),
+    /// gRPCs serving is requested but no TLS parameters are available.
+    #[cfg(feature = "tls")]
+    #[error("gRPCs serving is requested but no TLS parameters are available")]
+    NoTlsProvider,
 }
 
 pub use comprehensive_macros::GrpcClient;

@@ -241,6 +241,19 @@ mod insecure_server {
 mod secure_server {
     use super::*;
 
+    use thiserror::Error;
+
+    /// Error type returned by Comprehensive HTTPS server
+    #[derive(Debug, Error)]
+    pub enum ComprehensiveHttpsError {
+        /// An error from [`comprehensive_tls`].
+        #[error("{0}")]
+        ComprehensiveTlsError(#[from] comprehensive_tls::ComprehensiveTlsError),
+        /// HTTPS serving is requested but no TLS parameters are available.
+        #[error("HTTPS serving is requested but no TLS parameters are available")]
+        NoTlsProvider,
+    }
+
     #[cfg(not(test))]
     type TlsConfig = comprehensive_tls::TlsConfig;
     #[cfg(test)]
@@ -270,7 +283,7 @@ mod secure_server {
 
     #[derive(ResourceDependencies)]
     pub(super) struct SecureHttpServerDependencies {
-        tls: Arc<TlsConfig>,
+        tls: Option<Arc<TlsConfig>>,
     }
 
     pub(super) struct SecureHttpServer<I>
@@ -289,17 +302,20 @@ mod secure_server {
             d: SecureHttpServerDependencies,
             args: SecureHttpServerArgs<I>,
             api: &mut AssemblyRuntime<'_>,
-        ) -> Result<Arc<Self>, comprehensive_tls::ComprehensiveTlsError> {
+        ) -> Result<Arc<Self>, ComprehensiveHttpsError> {
             let Some(port) = args.https_port else {
                 return Ok(Arc::new(Self {
                     conf: None,
                     _i: PhantomData,
                 }));
             };
+            let Some(tlsc) = d.tls else {
+                return Err(ComprehensiveHttpsError::NoTlsProvider);
+            };
             let addr = (args.https_bind_addr, port).into();
             let mut sc = rustls::ServerConfig::builder()
                 .with_no_client_auth()
-                .with_cert_resolver(d.tls.cert_resolver()?);
+                .with_cert_resolver(tlsc.cert_resolver()?);
             sc.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
             let config = RustlsConfig::from_config(Arc::new(sc));
             let server = axum_server::bind_rustls(addr, config);

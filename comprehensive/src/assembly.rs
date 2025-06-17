@@ -42,7 +42,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use topological_sort::TopologicalSort;
 
-use crate::drop_stream::Sentinel;
+use crate::drop_stream::{DropStream, Sentinel};
 use crate::matrix::DepMatrix;
 use crate::shutdown::{ShutdownSignal, ShutdownSignalForwarder, ShutdownSignalParticipantCreator};
 
@@ -611,7 +611,7 @@ pub struct Assembly<T> {
     shutdown_notify: ShutdownSignalForwarder,
     tasks: FuturesUnordered<ResourceFut>,
     names: Box<[Option<&'static str>]>,
-    task_quits: crate::drop_stream::DropStream,
+    task_quits: DropStream,
     dep_matrix: DepMatrix,
     /// The constructed instances of the top-level (root) dependencies.
     /// Access to this is freqently not required as these resources
@@ -774,6 +774,23 @@ impl MakeSentinel<'_> {
     }
 }
 
+fn log_failures(
+    msg: &str,
+    task_quits: &mut DropStream,
+    nodes: &[GraphNode],
+) -> impl Iterator<Item = usize> {
+    ConsumeReady(task_quits).inspect(move |failed_i| {
+        if let Some(e) = nodes[*failed_i].error() {
+            log::warn!(
+                "{} {} failed to initialise: {}",
+                msg,
+                nodes[*failed_i].name(),
+                e
+            );
+        }
+    })
+}
+
 impl<T> Assembly<T>
 where
     T: ResourceDependencies,
@@ -884,8 +901,12 @@ where
             );
         }
         let mut task_quits = task_quits_gen.into_stream();
-        let top =
-            T::produce(&mut cx).map_err(|e| ResourceInstantiationError::new(e, &mut cx, None))?;
+        let top = T::produce(&mut cx).map_err(|e| {
+            let _ = log_failures("Resource", &mut task_quits, &nodes).last();
+            let e = ResourceInstantiationError::new(e, &mut cx, None);
+            log::error!("Failed to construct assembly: {}", e);
+            e
+        })?;
         let root_participant_iter = participants
             .last_mut()
             .unwrap()
@@ -899,14 +920,7 @@ where
             panic!("graph construction bug: something depends on the root");
         };
 
-        for failed_i in ConsumeReady(&mut task_quits) {
-            if let Some(e) = nodes[failed_i].error() {
-                log::warn!(
-                    "Optional resource {} failed to initialise: {}",
-                    nodes[failed_i].name(),
-                    e
-                );
-            }
+        for failed_i in log_failures("Optional resource", &mut task_quits, &nodes) {
             shutdown_notify.completely_unref(failed_i, &mut dep_matrix);
         }
 

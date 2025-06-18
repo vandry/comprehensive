@@ -34,8 +34,9 @@
 
 #![warn(missing_docs)]
 
-use arc_swap::ArcSwap;
+use arc_swap::ArcSwapOption;
 use comprehensive::ResourceDependencies;
+use comprehensive::health::HealthReporter;
 use comprehensive::v1::{AssemblyRuntime, Resource, resource};
 use comprehensive_traits::tls_config::{Snapshot, TlsConfigProvider};
 use delegate::delegate;
@@ -69,6 +70,9 @@ pub enum ComprehensiveTlsError {
     /// flags for the private key and certificate.
     #[error("No provider for TLS parameters is available")]
     NoTlsProvider,
+    /// Health signal registration error.
+    #[error("{0}")]
+    ComprehensiveError(#[from] comprehensive::ComprehensiveError),
 }
 
 #[derive(Debug)]
@@ -80,11 +84,11 @@ struct ReloadableContents {
 
 /// Certificate resolver for configuring into HTTPS etc... servers.
 #[derive(Debug)]
-pub struct ReloadableKeyAndCertResolver(ArcSwap<ReloadableContents>);
+pub struct ReloadableKeyAndCertResolver(ArcSwapOption<ReloadableContents>);
 
 impl ReloadableKeyAndCertResolver {
     fn real_resolve(&self) -> Option<Arc<CertifiedKey>> {
-        Some(Arc::clone(&self.0.load().certified_key))
+        self.0.load().as_ref().map(|s| Arc::clone(&s.certified_key))
     }
 }
 
@@ -168,8 +172,9 @@ impl ServerCertVerifier for ServerVerifier {
     delegate! {
         #[through(ServerCertVerifier)]
         #[expr(let reloadable = self.0.0.load(); $)]
-        to match reloadable.server_verifier {
-            Some(ref v) => &**v,
+        to match reloadable.as_ref().map(|s| &s.server_verifier) {
+            Some(Some(v)) => &**v,
+            Some(None) => &NullServerCertVerifier(&self.1),
             None => &NullServerCertVerifier(&self.1),
         } {
             fn verify_server_cert(
@@ -302,6 +307,7 @@ pub struct TlsConfig {
 pub struct TlsConfigDependencies {
     #[may_fail]
     providers: Vec<Arc<dyn TlsConfigProvider>>,
+    health: Arc<HealthReporter>,
     _default_built_in_provider: std::marker::PhantomData<files::TlsConfigFiles>,
 }
 
@@ -321,20 +327,32 @@ fn setup(
         );
     }
 
-    // For now, we require that the provider has already supplied as initial
-    // value. This will not work for all providers, so it will need to change.
-    let Poll::Ready(Some(initial)) = provider
+    // If the provider has already supplied as initial value, get it now.
+    // That is more efficient and potentially less confusing than starting
+    // out with empty config and filling it in later. Providers that have
+    // the ability to make their config available early enough for this
+    // should do so.
+    let (resolver_inner, mut health) = match provider
         .stream()
         .unwrap()
         .poll_next_unpin(&mut Context::from_waker(std::task::Waker::noop()))
-    else {
-        return Err(ComprehensiveTlsError::NoTlsProvider);
+    {
+        Poll::Ready(Some(snapshot)) => (
+            ArcSwapOption::from_pointee(accept_update(*snapshot, crypto_provider)?),
+            // We already have a config, no need to interact with health.
+            None,
+        ),
+        Poll::Ready(None) => {
+            log::error!("TlsConfig: provider delivered a 0-length stream");
+            return Err(ComprehensiveTlsError::NoTlsProvider);
+        }
+        Poll::Pending => (
+            ArcSwapOption::empty(),
+            // Withhold healthy status until we have something loaded.
+            Some(d.health.register("TlsConfig")?),
+        ),
     };
-
-    let contents = accept_update(*initial, crypto_provider)?;
-    let resolver = Arc::new(ReloadableKeyAndCertResolver(ArcSwap::from_pointee(
-        contents,
-    )));
+    let resolver = Arc::new(ReloadableKeyAndCertResolver(resolver_inner));
     let resolver_for_updating = Arc::clone(&resolver);
     let crypto_provider = Arc::clone(crypto_provider);
     api.set_task(async move {
@@ -342,7 +360,10 @@ fn setup(
         while let Some(update) = update_stream.next().await {
             match accept_update(*update, &crypto_provider) {
                 Ok(contents) => {
-                    resolver_for_updating.0.store(contents.into());
+                    if let Some(s) = health.take() {
+                        s.set_healthy(true);
+                    }
+                    resolver_for_updating.0.store(Some(contents.into()));
                 }
                 Err(e) => {
                     log::error!(
@@ -419,7 +440,7 @@ impl TlsConfig {
     /// the underlying config is reloaded. Therefore a fresh [`ServerConfig`]
     /// should be regenerated before each handshake, or at least at intervals.
     pub fn server_config_mtls(&self) -> ServerConfig {
-        let client_verifier = self.reloadable.0.load().roots
+        let client_verifier = self.reloadable.0.load().as_ref().and_then(|s| s.roots
             .as_ref()
             .and_then(|roots| {
                 WebPkiClientVerifier::builder_with_provider(
@@ -428,7 +449,7 @@ impl TlsConfig {
                 ).build()
                     .inspect_err(|e| log::warn!("Error constructing client certificate verifier: {}; TLS connections will likely fail.", e))
                     .ok()
-            })
+            }))
             .unwrap_or_else(|| Arc::new(NullClientCertVerifier(Arc::clone(&self.crypto_provider))));
         let resolver = Arc::clone(&self.reloadable);
         self.server_config_builder
@@ -469,24 +490,33 @@ mod tests {
 
     struct TestTlsConfig(Exchange);
 
+    #[derive(clap::Args)]
+    #[group(skip)]
+    struct TestTlsConfigArgs {
+        #[arg(long)]
+        delayed: bool,
+    }
+
     #[resource]
     #[export(dyn TlsConfigProvider)]
     impl Resource for TestTlsConfig {
         fn new(
             _: comprehensive::NoDependencies,
-            _: comprehensive::NoArgs,
+            a: TestTlsConfigArgs,
             _: &mut AssemblyRuntime<'_>,
         ) -> Result<Arc<Self>, std::convert::Infallible> {
             let exchange = Exchange::default();
-            let _ = exchange
-                .writer()
-                .unwrap()
-                .send(mksnapshot(
-                    &testdata::USER1_KEY,
-                    &testdata::USER1_CERT,
-                    &testdata::CACERT,
-                ))
-                .poll_unpin(&mut Context::from_waker(std::task::Waker::noop()));
+            if !a.delayed {
+                let _ = exchange
+                    .writer()
+                    .unwrap()
+                    .send(mksnapshot(
+                        &testdata::USER1_KEY,
+                        &testdata::USER1_CERT,
+                        &testdata::CACERT,
+                    ))
+                    .poll_unpin(&mut Context::from_waker(std::task::Waker::noop()));
+            }
             Ok(Arc::new(Self(exchange)))
         }
     }
@@ -498,11 +528,12 @@ mod tests {
     }
 
     #[derive(ResourceDependencies)]
-    struct TopDependencies(Arc<TlsConfig>, Arc<TestTlsConfig>);
+    struct TopDependencies(Arc<TlsConfig>, Arc<TestTlsConfig>, Arc<HealthReporter>);
 
     #[test]
     fn first_load() {
         let a = Assembly::<TopDependencies>::new_from_argv(EMPTY).unwrap();
+        assert!(a.top.2.is_healthy());
         let resolver = a.top.0.cert_resolver().expect("get resolver");
 
         let got = resolver.real_resolve().expect("resolve");
@@ -563,6 +594,34 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .expect("testdata::USER2_CERT");
         assert_eq!(got.cert, want);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn delayed_load() {
+        let argv: Vec<std::ffi::OsString> = vec!["cmd".into(), "--delayed".into()];
+        let a = Assembly::<TopDependencies>::new_from_argv(argv).unwrap();
+        let health = Arc::clone(&a.top.2);
+        assert!(!health.is_healthy());
+        let provider = Arc::clone(&a.top.1);
+        let mut writer = provider.0.writer().unwrap();
+        let resolver = a.top.0.cert_resolver().expect("get resolver");
+
+        assert!(resolver.real_resolve().is_none());
+
+        let mut r = pin!(a.run_with_termination_signal(futures::stream::pending()));
+        let _ = futures::future::select(
+            &mut r,
+            writer.send(mksnapshot(
+                &testdata::USER1_KEY,
+                &testdata::USER1_CERT,
+                &testdata::CACERT,
+            )),
+        )
+        .await;
+        assert!(poll!(&mut r).is_pending());
+
+        assert!(health.is_healthy());
+        assert!(resolver.real_resolve().is_some());
     }
 
     fn pair_with_client_config(

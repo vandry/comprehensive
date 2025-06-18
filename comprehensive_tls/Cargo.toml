@@ -1,6 +1,6 @@
 [package]
 name = "comprehensive_tls"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2024"
 repository = "https://github.com/vandry/comprehensive.git"
 homepage = "https://github.com/vandry/comprehensive"

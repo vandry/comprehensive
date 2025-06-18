@@ -66,7 +66,7 @@ impl DepMatrix {
 
     pub(crate) fn decref(&mut self, row: usize) -> bool {
         let refcount = self.0.slice[row].refcount.get_mut();
-        *refcount -= 1;
+        *refcount = refcount.saturating_sub(1);
         *refcount == 1
     }
 

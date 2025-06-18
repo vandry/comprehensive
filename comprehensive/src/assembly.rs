@@ -1191,7 +1191,7 @@ mod tests {
         }
 
         fn augment_args(c: clap::Command) -> clap::Command {
-            if T::NAME == "Mid" || T::NAME == "FailsToCreate" {
+            if T::NAME == "Mid" || T::NAME == "FailsToCreate" || T::NAME == "Fail1" {
                 c.arg(
                     clap::Arg::new("count")
                         .long("count")
@@ -1899,6 +1899,41 @@ mod tests {
         let _ = tx.try_send(()).unwrap();
         assert!(e.poll(&mut r).is_ready());
         assert!(shared.0.load(Ordering::Acquire));
+    }
+
+    struct Fail2;
+
+    impl TestResource for Fail2 {
+        type Dependencies = NoDependencies;
+        const NAME: &str = "Fail2";
+
+        fn new(_: NoDependencies) -> Result<Self, Box<dyn std::error::Error>> {
+            Err("fail2".into())
+        }
+    }
+
+    #[derive(ResourceDependencies)]
+    struct Fail1Dependencies(Option<Arc<Fail2>>);
+
+    struct Fail1;
+
+    impl TestResource for Fail1 {
+        type Dependencies = Fail1Dependencies;
+        const NAME: &str = "Fail1";
+
+        fn new(d: Fail1Dependencies) -> Result<Self, Box<dyn std::error::Error>> {
+            assert!(d.0.is_none());
+            Err("fail1".into())
+        }
+    }
+
+    #[derive(ResourceDependencies)]
+    struct FailFailTop(Option<Arc<Fail1>>);
+
+    #[test]
+    fn optfail_depends_on_optfail() {
+        let assembly = Assembly::<FailFailTop>::new_from_argv(EMPTY).unwrap();
+        assert!(assembly.top.0.is_none());
     }
 
     trait TestTrait {}

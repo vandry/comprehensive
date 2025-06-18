@@ -305,7 +305,7 @@ fn accept_update(
 /// for now only consumers who use the [`TlsConfig::cert_resolver`]
 /// interface can take advantage of that.
 pub struct TlsConfig {
-    reloadable: Option<Arc<ReloadableKeyAndCertResolver>>,
+    reloadable: Arc<ReloadableKeyAndCertResolver>,
     client_config: Arc<ClientConfig>,
     server_config_builder: rustls::ConfigBuilder<ServerConfig, rustls::WantsVerifier>,
     crypto_provider: Arc<CryptoProvider>,
@@ -323,10 +323,10 @@ fn setup(
     d: TlsConfigDependencies,
     api: &mut AssemblyRuntime<'_>,
     crypto_provider: &Arc<CryptoProvider>,
-) -> Result<Option<Arc<ReloadableKeyAndCertResolver>>, rustls::Error> {
+) -> Result<Arc<ReloadableKeyAndCertResolver>, ComprehensiveTlsError> {
     let mut providers_it = d.providers.into_iter();
     let Some(provider) = providers_it.next() else {
-        return Ok(None);
+        return Err(ComprehensiveTlsError::NoTlsProvider);
     };
     if providers_it.len() > 0 {
         log::warn!(
@@ -342,7 +342,7 @@ fn setup(
         .unwrap()
         .poll_next_unpin(&mut Context::from_waker(std::task::Waker::noop()))
     else {
-        return Ok(None);
+        return Err(ComprehensiveTlsError::NoTlsProvider);
     };
 
     let contents = accept_update(*initial, crypto_provider)?;
@@ -368,7 +368,7 @@ fn setup(
         }
         Ok(())
     });
-    Ok(Some(resolver))
+    Ok(resolver)
 }
 
 #[resource]
@@ -384,25 +384,17 @@ impl Resource for TlsConfig {
             .cloned()
             .unwrap_or_else(|| Arc::new(rustls::crypto::aws_lc_rs::default_provider()));
         let reloadable = setup(d, api, &crypto_provider)?;
-        let client_config = ClientConfig::builder_with_provider(Arc::clone(&crypto_provider))
-            .with_safe_default_protocol_versions()?;
 
-        let client_config = match reloadable {
-            Some(ref reloadable) => {
-                let resolver = Arc::clone(reloadable);
-                let server_verifier = Arc::new(ServerVerifier::new(
-                    Arc::clone(reloadable),
-                    Arc::clone(&crypto_provider),
-                ));
-                client_config
-                    .dangerous()
-                    .with_custom_certificate_verifier(server_verifier)
-                    .with_client_cert_resolver(resolver)
-            }
-            None => client_config
-                .with_root_certificates(Arc::new(RootCertStore::empty()))
-                .with_no_client_auth(),
-        };
+        let resolver = Arc::clone(&reloadable);
+        let server_verifier = Arc::new(ServerVerifier::new(
+            Arc::clone(&reloadable),
+            Arc::clone(&crypto_provider),
+        ));
+        let client_config = ClientConfig::builder_with_provider(Arc::clone(&crypto_provider))
+            .with_safe_default_protocol_versions()?
+            .dangerous()
+            .with_custom_certificate_verifier(server_verifier)
+            .with_client_cert_resolver(resolver);
         let server_config_builder =
             ServerConfig::builder_with_provider(Arc::clone(&crypto_provider))
                 .with_safe_default_protocol_versions()?;
@@ -499,15 +491,6 @@ mod pem {
     }
 }
 
-#[derive(Debug)]
-struct NeverResolvesServerCert;
-
-impl ResolvesServerCert for NeverResolvesServerCert {
-    fn resolve(&self, _client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
-        None
-    }
-}
-
 impl TlsConfig {
     /// Returns a struct that implements the
     /// [`rustls::server::ResolvesServerCert`] trait. This can be
@@ -516,11 +499,7 @@ impl TlsConfig {
     pub fn cert_resolver(
         &self,
     ) -> Result<Arc<ReloadableKeyAndCertResolver>, ComprehensiveTlsError> {
-        Ok(Arc::clone(
-            self.reloadable
-                .as_ref()
-                .ok_or(ComprehensiveTlsError::NoTlsProvider)?,
-        ))
+        Ok(Arc::clone(&self.reloadable))
     }
 
     /// Returns a TLS [`ClientConfig`] built from the runtime configuration.
@@ -538,29 +517,22 @@ impl TlsConfig {
     /// the underlying config is reloaded. Therefore a fresh [`ServerConfig`]
     /// should be regenerated before each handshake, or at least at intervals.
     pub fn server_config_mtls(&self) -> ServerConfig {
-        self.reloadable.as_ref().map(|reloadable| {
-            let client_verifier = reloadable.0.load().roots
-                .as_ref()
-                .and_then(|roots| {
-                    WebPkiClientVerifier::builder_with_provider(
-                        Arc::clone(roots),
-                        Arc::clone(&self.crypto_provider),
-                    ).build()
-                        .inspect_err(|e| log::warn!("Error constructing client certificate verifier: {}; TLS connections will likely fail.", e))
-                        .ok()
-                })
-                .unwrap_or_else(|| Arc::new(NullClientCertVerifier(Arc::clone(&self.crypto_provider))));
-            let resolver = Arc::clone(reloadable);
-            self.server_config_builder
-                .clone()
-                .with_client_cert_verifier(client_verifier)
-                .with_cert_resolver(resolver)
-        }).unwrap_or_else(|| {
-            self.server_config_builder
-                .clone()
-                .with_client_cert_verifier(Arc::new(NullClientCertVerifier(Arc::clone(&self.crypto_provider))))
-                .with_cert_resolver(Arc::new(NeverResolvesServerCert))
-        })
+        let client_verifier = self.reloadable.0.load().roots
+            .as_ref()
+            .and_then(|roots| {
+                WebPkiClientVerifier::builder_with_provider(
+                    Arc::clone(roots),
+                    Arc::clone(&self.crypto_provider),
+                ).build()
+                    .inspect_err(|e| log::warn!("Error constructing client certificate verifier: {}; TLS connections will likely fail.", e))
+                    .ok()
+            })
+            .unwrap_or_else(|| Arc::new(NullClientCertVerifier(Arc::clone(&self.crypto_provider))));
+        let resolver = Arc::clone(&self.reloadable);
+        self.server_config_builder
+            .clone()
+            .with_client_cert_verifier(client_verifier)
+            .with_cert_resolver(resolver)
     }
 
     /// Returns an object with raw [`Vec<u8>`] PEM representations of the
@@ -572,8 +544,6 @@ impl TlsConfig {
         Ok(pem::make_pem_snapshot(
             &self
                 .reloadable
-                .as_ref()
-                .ok_or(ComprehensiveTlsError::NoTlsProvider)?
                 .0
                 .load()
                 .snapshot,

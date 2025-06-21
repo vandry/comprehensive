@@ -25,6 +25,7 @@ use comprehensive_warm_channels::WarmChannelsDiag;
 use futures::{Stream, StreamExt, TryStreamExt};
 use http::Uri;
 use humantime::{format_duration, parse_duration};
+use std::borrow::Cow;
 use std::future::Future;
 use std::marker::PhantomData;
 use std::pin::Pin;
@@ -73,8 +74,29 @@ impl ClientWorker {
     }
 }
 
+/// Default flag values for a derived [`crate::GrpcClient`].
+///
+/// This struct should be returned by the argument to the `#[defaults(...)]`
+/// attribute to [`macro@crate::GrpcClient`] and determines the default values
+/// of the instance-specific flags for the client.
+#[derive(Debug, Default)]
+pub struct GrpcClientResourceDefaults {
+    /// Default value for the `--PREFIXuri` flag. If [`None`], there is no
+    /// default value for that flag.
+    pub uri: Option<Cow<'static, str>>,
+    /// Default value for the `--PREFIXconnect-uri` flag. If [`None`], there is no
+    /// default value for that flag.
+    pub connect_uri: Option<Cow<'static, str>>,
+    /// Default values for the rest of the flags.
+    pub config: GRPCChannelConfig,
+}
+
 #[doc(hidden)]
 pub trait InstanceDescriptor {
+    fn instance_defaults() -> GrpcClientResourceDefaults {
+        GrpcClientResourceDefaults::default()
+    }
+
     const REQUIRED: bool;
     const URI_FLAG_NAME: &str;
     const CONNECT_URI_FLAG_NAME: &str;
@@ -122,8 +144,8 @@ impl FromStr for UriOrPath {
     type Err = <Uri as FromStr>::Err;
 
     fn from_str(s: &str) -> Result<UriOrPath, Self::Err> {
-        Ok(if s.starts_with("unix:") {
-            UriOrPath::Path(s[5..].into())
+        Ok(if let Some(suffix) = s.strip_prefix("unix:") {
+            UriOrPath::Path(suffix.into())
         } else {
             UriOrPath::Uri(Uri::from_str(s)?)
         })
@@ -156,43 +178,51 @@ fn parse_optional_duration(d: &str) -> Result<Option<Duration>, humantime::Durat
 
 impl<I: InstanceDescriptor> Args for GrpcClientArgs<I> {
     fn augment_args(cmd: Command) -> Command {
-        let default = GRPCChannelConfig::default();
+        let GrpcClientResourceDefaults {
+            config,
+            uri,
+            connect_uri,
+        } = I::instance_defaults();
         let n_subchannels_want =
-            clap::builder::Str::from(default.pool.n_subchannels_want.to_string());
+            clap::builder::Str::from(config.pool.n_subchannels_want.to_string());
         let n_subchannels_healthy_min =
-            clap::builder::Str::from(default.pool.n_subchannels_healthy_min.to_string());
+            clap::builder::Str::from(config.pool.n_subchannels_healthy_min.to_string());
         let n_subchannels_healthy_critical_min =
-            clap::builder::Str::from(default.pool.n_subchannels_healthy_critical_min.to_string());
+            clap::builder::Str::from(config.pool.n_subchannels_healthy_critical_min.to_string());
         let log_unhealthy_initial_delay =
-            format_optional_duration(default.pool.log_unhealthy_initial_delay);
+            format_optional_duration(config.pool.log_unhealthy_initial_delay);
         let log_unhealthy_repeat_delay =
-            format_optional_duration(default.pool.log_unhealthy_repeat_delay);
+            format_optional_duration(config.pool.log_unhealthy_repeat_delay);
         let health_check_timeout =
-            clap::builder::Str::from(format_duration(default.health_checking.timeout).to_string());
+            clap::builder::Str::from(format_duration(config.health_checking.timeout).to_string());
         let health_check_interval =
-            clap::builder::Str::from(format_duration(default.health_checking.interval).to_string());
+            clap::builder::Str::from(format_duration(config.health_checking.interval).to_string());
         let mut hc_service_flag = Arg::new(I::HEALTH_CHECK_SERVICE_FLAG_NAME)
             .long(I::HEALTH_CHECK_SERVICE_FLAG_NAME)
             .conflicts_with(I::NO_HEALTH_CHECK_ENABLE_FLAG_NAME)
             .help("gRPC health checking protocol service name.");
-        if let Some(ref service) = default.health_checking.service {
+        if let Some(ref service) = config.health_checking.service {
             hc_service_flag = hc_service_flag.default_value((**service).to_owned());
+        }
+        let mut uri_flag = Arg::new(I::URI_FLAG_NAME)
+            .long(I::URI_FLAG_NAME)
+            .value_parser(value_parser!(Uri))
+            .help("URI of gRPC backend. The path and query are ignored.");
+        uri_flag = match uri {
+            Some(ref u) => uri_flag.default_value((**u).to_owned()),
+            None => uri_flag.required(I::REQUIRED),
+        };
+        let mut connect_uri_flag = Arg::new(I::CONNECT_URI_FLAG_NAME)
+            .long(I::CONNECT_URI_FLAG_NAME)
+            .value_parser(value_parser!(UriOrPath))
+            .help("Alternate URI to resolve and connect to instead of the main URI. Can be http[s]://host:port/ or unix:/socket/path. Useful when a different TLS server name is required.");
+        if let Some(ref u) = connect_uri {
+            connect_uri_flag = connect_uri_flag.default_value((**u).to_owned());
         }
 
         cmd
-            .arg(
-                Arg::new(I::URI_FLAG_NAME)
-                    .long(I::URI_FLAG_NAME)
-                    .required(I::REQUIRED)
-                    .value_parser(value_parser!(Uri))
-                    .help("URI of gRPC backend. The path and query are ignored.")
-            )
-            .arg(
-                Arg::new(I::CONNECT_URI_FLAG_NAME)
-                    .long(I::CONNECT_URI_FLAG_NAME)
-                    .value_parser(value_parser!(UriOrPath))
-                    .help("Alternate URI to resolve and connect to instead of the main URI. Can be http[s]://host:port/ or unix:/socket/path. Useful when a different TLS server name is required.")
-            )
+            .arg(uri_flag)
+            .arg(connect_uri_flag)
             .arg(
                 Arg::new(I::N_SUBCHANNELS_WANT_FLAG_NAME)
                     .long(I::N_SUBCHANNELS_WANT_FLAG_NAME)
@@ -419,7 +449,7 @@ where
             );
         }
     };
-    Ok(warm_channels::resolver::resolve_uri(&ruri, resolver)?
+    Ok(warm_channels::resolver::resolve_uri(ruri, resolver)?
         .map_ok(|v| v.into_iter().map(Into::into).collect())
         .right_stream())
 }

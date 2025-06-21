@@ -555,11 +555,25 @@ fn derive_grpc_client_struct(
 
     let mut propagate_health = true;
     let mut deps = quote! { GRPCClientDependencies };
+    let mut defaults = quote! {};
     for attr in attrs {
         if attr.path().is_ident("no_propagate_health") {
             propagate_health = false;
         }
         if attr.path().is_ident("no_tls") {
+            deps = quote! { GRPCClientDependenciesNoTls };
+        }
+        if let syn::Meta::List(l) = &attr.meta {
+            if l.path.is_ident("defaults") {
+                let tokens = &l.tokens;
+                defaults = quote! {
+                    fn instance_defaults() -> ::comprehensive_grpc::client::GrpcClientResourceDefaults {
+                        #tokens
+                    }
+                };
+            }
+        }
+        if attr.path().is_ident("defaults") {
             deps = quote! { GRPCClientDependenciesNoTls };
         }
     }
@@ -685,6 +699,7 @@ fn derive_grpc_client_struct(
         impl #impl_generics ::comprehensive_grpc::client::InstanceDescriptor for #name #ty_generics #where_clause {
             const REQUIRED: bool = #required ;
             ::comprehensive_grpc::declare_client_flag_name_constants!( #flag_prefix );
+            #defaults
         }
 
         #[automatically_derived]
@@ -741,10 +756,15 @@ fn derive_grpc_client_struct(
 /// circular dependency. In this case, the struct field should referncen
 /// `ChannelNoTls` instead of `Channel`.
 ///
+/// To customise the default values of the command line flags used to set the gRPC
+/// client channels' default parameters, add `#[defaults(foo)]` where `foo` is a
+/// block of code that evaluates to [`GrpcClientResourceDefaults`].
+///
 /// [`tonic`]: https://docs.rs/tonic/latest/tonic/
 /// [`Channel`]: https://docs.rs/comprehensive_grpc/latest/comprehensive_grpc/client/type.Channel.html
+/// [`GrpcClientResourceDefaults`]: https://docs.rs/comprehensive_grpc/latest/comprehensive_grpc/client/type.GrpcClientResourceDefaults.html
 /// [`Assembly`]: https://docs.rs/comprehensive/latest/comprehensive/assembly/struct.Assembly.html
-#[proc_macro_derive(GrpcClient, attributes(no_propagate_health, no_tls))]
+#[proc_macro_derive(GrpcClient, attributes(defaults, no_propagate_health, no_tls))]
 pub fn derive_grpc_client(item: proc_macro::TokenStream) -> proc_macro::TokenStream {
     let input: DeriveInput = parse_macro_input!(item);
     match input.data {

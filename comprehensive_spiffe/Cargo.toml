@@ -1,0 +1,29 @@
+[package]
+name = "comprehensive_spiffe"
+version = "0.1.0"
+edition = "2024"
+repository = "https://github.com/vandry/comprehensive.git"
+homepage = "https://github.com/vandry/comprehensive"
+description = "A harness for creating consistently-shaped servers will less boilerplate"
+license = "MIT"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+comprehensive = { path = "../comprehensive", version = "0.7.1" }
+comprehensive_grpc = { path = "../comprehensive_grpc", version = "0.6.7" }
+comprehensive_traits = { path = "../comprehensive_traits", version = "0.1.2", features = ["tls_config"] }
+futures = "0.3"
+log = "0.4"
+prost = "0.13"
+prost-types = "0.13.5"
+rustls-pki-types = "1.12"
+thiserror = "2.0.12"
+tonic = "0.12"
+x509-parser = "0.17.0"
+
+[build-dependencies]
+tonic-build = "0.12"

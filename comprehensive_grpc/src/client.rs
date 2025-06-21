@@ -1,22 +1,7 @@
 //! gRPC client support
 //!
-//! To use gRPC clients in Comprehensive, define a struct with exactly 1 field:
-//! a [`tonic`] gRPC client type, parameterised with [`Channel`].
-//!
-//! This field may be wrapped in an [`Option`].
-//!   - If it is, then the client is considered optional and will
-//!     be [`Some`] only if a URI for it is given on the command line.
-//!   - If it is not, then the client is considered required and
-//!     the program will fail at startup unless a URI for it is given.
-//!
-//! The struct may have either named or unnamed fields, it doesn't matter.
-//! The field will not be accessed directly by user code.
-//!
-//! `#[derive(GrpcClient)]` on the struct.
-//!
-//! Normally, the health of the gRPC client will count toward the health of
-//! the [`comprehensive::Assembly`] as a whole. To prevent that, add
-//! `#[no_propagate_health]`.
+//! To use gRPC clients in Comprehensive, define a struct with exactly 1 field
+//! and [derive `GrpcClient`](macro@crate::GrpcClient) on it.
 //!
 //! ```
 //! # mod pb {
@@ -57,7 +42,10 @@ use warm_channels::tls::TLSConnector;
 pub type Channel = GRPCChannel<IPOrUNIXAddress, TLSConnector<StreamConnector>>;
 /// Type of the gRPC channel as returned by [`warm_channels`].
 #[cfg(not(feature = "tls"))]
-pub type Channel = GRPCChannel<IPOrUNIXAddress, StreamConnector>;
+pub type Channel = ChannelNoTls;
+
+/// Type of the gRPC channel as returned by [`warm_channels`] without TLS.
+pub type ChannelNoTls = GRPCChannel<IPOrUNIXAddress, StreamConnector>;
 
 /// Opaque type of a worker task associated with the channel. This goes
 /// into the second field of the gRPC client struct. The derived implementation
@@ -333,14 +321,82 @@ impl<I: InstanceDescriptor> FromArgMatches for GrpcClientArgs<I> {
     }
 }
 
+#[cfg(feature = "tls")]
 #[doc(hidden)]
 #[derive(ResourceDependencies)]
 pub struct GRPCClientDependencies {
     resolver: Arc<DNSResolver>,
-    #[cfg(feature = "tls")]
     tls_config: Option<Arc<comprehensive_tls::TlsConfig>>,
     health: Arc<HealthReporter>,
     _include_me: PhantomData<WarmChannelsDiag>,
+}
+
+#[doc(hidden)]
+#[derive(ResourceDependencies)]
+pub struct GRPCClientDependenciesNoTls {
+    resolver: Arc<DNSResolver>,
+    health: Arc<HealthReporter>,
+    _include_me: PhantomData<WarmChannelsDiag>,
+}
+
+#[cfg(not(feature = "tls"))]
+#[doc(hidden)]
+pub type GRPCClientDependencies = GRPCClientDependenciesNoTls;
+
+mod deps {
+    use super::*;
+
+    pub struct OtherDependencies {
+        pub(super) resolver: Arc<DNSResolver>,
+        pub(super) health: Arc<HealthReporter>,
+    }
+
+    #[cfg(feature = "tls")]
+    impl From<GRPCClientDependencies> for OtherDependencies {
+        fn from(d: GRPCClientDependencies) -> Self {
+            Self {
+                resolver: d.resolver,
+                health: d.health,
+            }
+        }
+    }
+
+    impl From<GRPCClientDependenciesNoTls> for OtherDependencies {
+        fn from(d: GRPCClientDependenciesNoTls) -> Self {
+            Self {
+                resolver: d.resolver,
+                health: d.health,
+            }
+        }
+    }
+
+    pub trait ClientDeps: Into<OtherDependencies> {
+        type Connector: warm_channels::Connector<IPOrUNIXAddress> + Send + Sync + 'static;
+
+        fn connector(&self, _: &Uri) -> Result<Self::Connector, Box<dyn std::error::Error>>;
+    }
+
+    #[cfg(feature = "tls")]
+    impl ClientDeps for super::GRPCClientDependencies {
+        type Connector = TLSConnector<StreamConnector>;
+
+        fn connector(&self, uri: &Uri) -> Result<Self::Connector, Box<dyn std::error::Error>> {
+            let tls_config = self.tls_config.as_ref().map(|tlsc| tlsc.client_config());
+            Ok(TLSConnector::new(
+                StreamConnector::default(),
+                uri,
+                tls_config.as_deref(),
+            )?)
+        }
+    }
+
+    impl ClientDeps for super::GRPCClientDependenciesNoTls {
+        type Connector = StreamConnector;
+
+        fn connector(&self, _: &Uri) -> Result<Self::Connector, Box<dyn std::error::Error>> {
+            Ok(StreamConnector::default())
+        }
+    }
 }
 
 fn resolve<'a, R, RR>(
@@ -369,25 +425,30 @@ where
 }
 
 #[doc(hidden)]
-pub fn new<I>(
+pub fn new<I, D>(
     a: GrpcClientArgs<I>,
     name: &'static str,
     propagate_health: bool,
-    d: GRPCClientDependencies,
-) -> Result<(Option<(Channel, Uri)>, ClientWorker), Box<dyn std::error::Error>> {
+    d: D,
+) -> Result<
+    (
+        Option<(GRPCChannel<IPOrUNIXAddress, D::Connector>, Uri)>,
+        ClientWorker,
+    ),
+    Box<dyn std::error::Error>,
+>
+where
+    D: deps::ClientDeps,
+    <D::Connector as warm_channels::Connector<IPOrUNIXAddress>>::IO: Send,
+    <D::Connector as warm_channels::Connector<IPOrUNIXAddress>>::Error: Send + Sync + 'static,
+{
     let Some(uri) = a.uri else {
         return Ok((None, ClientWorker::empty()));
     };
     super::tonic_prometheus_layer_use_default_registry();
 
-    #[cfg(feature = "tls")]
-    let connector = {
-        let tls_config = d.tls_config.map(|tlsc| tlsc.client_config());
-        TLSConnector::new(StreamConnector::default(), &uri, tls_config.as_deref())?
-    };
-    #[cfg(not(feature = "tls"))]
-    let connector = StreamConnector::default();
-
+    let connector = d.connector(&uri)?;
+    let d: deps::OtherDependencies = d.into();
     let signaller = if propagate_health {
         Some(d.health.register(name)?)
     } else {

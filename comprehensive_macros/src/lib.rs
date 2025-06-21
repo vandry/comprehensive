@@ -554,9 +554,13 @@ fn derive_grpc_client_struct(
     let cts = client_field.ty.span();
 
     let mut propagate_health = true;
+    let mut deps = quote! { GRPCClientDependencies };
     for attr in attrs {
         if attr.path().is_ident("no_propagate_health") {
             propagate_health = false;
+        }
+        if attr.path().is_ident("no_tls") {
+            deps = quote! { GRPCClientDependenciesNoTls };
         }
     }
 
@@ -641,10 +645,10 @@ fn derive_grpc_client_struct(
         quote! {
             impl #impl_generics ::comprehensive::Resource for #name #ty_generics #where_clause {
                 type Args = ::comprehensive_grpc::client::GrpcClientArgs<Self>;
-                type Dependencies = ::comprehensive_grpc::client::GRPCClientDependencies;
+                type Dependencies = ::comprehensive_grpc::client:: #deps ;
                 const NAME: &'static str = #name_lit ;
 
-                fn new(d: ::comprehensive_grpc::client::GRPCClientDependencies, a: ::comprehensive_grpc::client::GrpcClientArgs<Self>) -> ::std::result::Result<Self, ::std::boxed::Box<dyn ::std::error::Error>> {
+                fn new(d: ::comprehensive_grpc::client:: #deps , a: ::comprehensive_grpc::client::GrpcClientArgs<Self>) -> ::std::result::Result<Self, ::std::boxed::Box<dyn ::std::error::Error>> {
                     let (param, worker) = ::comprehensive_grpc::client::new(a, #label , #propagate_health , d)?;
                     Ok( #builder )
                 }
@@ -659,12 +663,12 @@ fn derive_grpc_client_struct(
         quote! {
             impl #impl_generics ::comprehensive::v1::Resource for #name #ty_generics #where_clause {
                 type Args = ::comprehensive_grpc::client::GrpcClientArgs<Self>;
-                type Dependencies = ::comprehensive_grpc::client::GRPCClientDependencies;
+                type Dependencies = ::comprehensive_grpc::client:: #deps ;
                 type CreationError = ::std::boxed::Box<dyn ::std::error::Error>;
                 const NAME: &'static str = #name_lit ;
 
                 fn new(
-                    d: ::comprehensive_grpc::client::GRPCClientDependencies,
+                    d: ::comprehensive_grpc::client:: #deps ,
                     a: ::comprehensive_grpc::client::GrpcClientArgs<Self>,
                     api: &mut ::comprehensive::v1::AssemblyRuntime<'_>,
                 ) -> ::std::result::Result<::std::sync::Arc<Self>, ::std::boxed::Box<dyn ::std::error::Error>> {
@@ -695,7 +699,52 @@ fn derive_grpc_client_struct(
     }
 }
 
-#[proc_macro_derive(GrpcClient, attributes(no_propagate_health))]
+/// Declare a resource for a gRPC client using a particular gRPC service to
+/// a particular backend.
+///
+/// Use this derive macro on a struct with a single field:
+/// a [`tonic`] gRPC client type, parameterised with [`Channel`].
+///
+/// The single field may be wrapped in an [`Option`].
+///   - If it is, then the client is considered optional and will
+///     be [`Some`] only if a URI for it is given on the command line.
+///   - If it is not, then the client is considered required and
+///     the program will fail at startup unless a URI for it is given.
+///
+/// ```
+/// # mod pb {
+/// #     pub mod test_client {
+/// #         #[derive(Clone)]
+/// #         pub struct TestClient<T>(std::marker::PhantomData<T>);
+/// #         impl<T> TestClient<T> {
+/// #             pub fn with_origin<U>(_: T, _: U) -> Self {
+/// #                 Self(std::marker::PhantomData)
+/// #             }
+/// #         }
+/// #     }
+/// # }
+/// use comprehensive_grpc::GrpcClient;
+/// use comprehensive_grpc::client::Channel;
+///
+/// #[derive(GrpcClient)]
+/// struct MyClientResource(
+///     pb::test_client::TestClient<Channel>,
+/// );
+/// ```
+///
+/// Normally, the health of the gRPC client will count toward the health of
+/// the [`Assembly`] as a whole. To prevent that, add `#[no_propagate_health]`.
+///
+/// The attribute `#[no_tls]` may be used to prevent the channel from
+/// supporting TLS even when the `tls` feature is enabled. That attribute
+/// is not expected to be widely useful and exists only to prevent a
+/// circular dependency. In this case, the struct field should referncen
+/// `ChannelNoTls` instead of `Channel`.
+///
+/// [`tonic`]: https://docs.rs/tonic/latest/tonic/
+/// [`Channel`]: https://docs.rs/comprehensive_grpc/latest/comprehensive_grpc/client/type.Channel.html
+/// [`Assembly`]: https://docs.rs/comprehensive/latest/comprehensive/assembly/struct.Assembly.html
+#[proc_macro_derive(GrpcClient, attributes(no_propagate_health, no_tls))]
 pub fn derive_grpc_client(item: proc_macro::TokenStream) -> proc_macro::TokenStream {
     let input: DeriveInput = parse_macro_input!(item);
     match input.data {

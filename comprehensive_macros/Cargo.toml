@@ -19,3 +19,7 @@ convert_case = "0.7"
 proc-macro2 = "1.0"
 quote = "1.0"
 syn = { version = "2.0", features = ["full"] }
+
+[dev-dependencies]
+comprehensive = { path = "../comprehensive", version = "0.7" }
+comprehensive_grpc = { path = "../comprehensive_grpc", version = "0.6" }

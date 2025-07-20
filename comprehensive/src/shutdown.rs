@@ -258,15 +258,11 @@ impl ShutdownSignalForwarder {
         )
     }
 
-    pub(crate) fn propagate_with_dep_matrix(self, dep_matrix: DepMatrix) {
-        propagate(
-            &self.matrix,
-            self.matrix
-                .header
-                .dep_matrix
-                .get_or_init(move || dep_matrix),
-            self.row,
-        )
+    pub(crate) fn accept_dep_matrix(&self, dep_matrix: DepMatrix) {
+        self.matrix
+            .header
+            .dep_matrix
+            .get_or_init(move || dep_matrix);
     }
 
     pub(crate) fn completely_unref(&self, i: usize, dep_matrix: &mut DepMatrix) {
@@ -277,6 +273,11 @@ impl ShutdownSignalForwarder {
             .unreferenced
             .store(true, Ordering::Release);
         propagate_mut(&self.matrix, dep_matrix, i);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn edges(&self) -> impl Iterator<Item = (usize, usize)> {
+        self.matrix.header.dep_matrix.get().unwrap().edges()
     }
 }
 

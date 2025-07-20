@@ -612,7 +612,6 @@ pub struct Assembly<T> {
     tasks: FuturesUnordered<ResourceFut>,
     names: Box<[Option<&'static str>]>,
     task_quits: DropStream,
-    dep_matrix: DepMatrix,
     /// The constructed instances of the top-level (root) dependencies.
     /// Access to this is freqently not required as these resources
     /// will work autonomously once included in the graph.
@@ -639,19 +638,15 @@ fn active_list(names: &[Option<&'static str>]) -> String {
 pin_project! {
     struct TerminationSignal<T> {
         #[pin] signal_stream: Option<T>,
-        shutdown_notify: Option<(ShutdownSignalForwarder, DepMatrix)>,
+        shutdown_notify: Option<ShutdownSignalForwarder>,
     }
 }
 
 impl<T> TerminationSignal<T> {
-    fn new(
-        signal_stream: T,
-        shutdown_notify: ShutdownSignalForwarder,
-        dep_matrix: DepMatrix,
-    ) -> Self {
+    fn new(signal_stream: T, shutdown_notify: ShutdownSignalForwarder) -> Self {
         Self {
             signal_stream: Some(signal_stream),
-            shutdown_notify: Some((shutdown_notify, dep_matrix)),
+            shutdown_notify: Some(shutdown_notify),
         }
     }
 }
@@ -665,9 +660,9 @@ impl<T: Stream> Future for TerminationSignal<T> {
             if let Some(s) = this.signal_stream.as_mut().as_pin_mut() {
                 let _ = ready!(s.poll_next(cx));
                 match this.shutdown_notify.take() {
-                    Some((n, dep_matrix)) => {
+                    Some(n) => {
                         log::warn!("SIGTERM received; shutting down");
-                        n.propagate_with_dep_matrix(dep_matrix);
+                        n.propagate();
                         continue;
                     }
                     None => {
@@ -929,6 +924,7 @@ where
             .map(|n| if n.created() { Some(n.name()) } else { None })
             .collect();
         let tasks = nodes.into_iter().filter_map(|n| n.task()).collect();
+        shutdown_notify.accept_dep_matrix(dep_matrix);
 
         Ok(Self {
             tasks,
@@ -936,7 +932,6 @@ where
             top,
             shutdown_notify,
             task_quits,
-            dep_matrix,
         })
     }
 
@@ -967,7 +962,6 @@ where
             mut names,
             mut task_quits,
             top: _,
-            dep_matrix,
         } = self;
         log::info!(
             "Comprehensive starting with {} resources: {}",
@@ -1009,7 +1003,7 @@ where
             names.iter().filter(|n| n.is_some()).count(),
             active_list(&names)
         );
-        let mut term = TerminationSignal::new(termination_signal, shutdown_notify, dep_matrix);
+        let mut term = TerminationSignal::new(termination_signal, shutdown_notify);
         loop {
             futures::select! {
                 task_result = tasks.next() => {
@@ -1205,7 +1199,11 @@ mod tests {
         }
 
         fn augment_args(c: clap::Command) -> clap::Command {
-            if T::NAME == "Mid" || T::NAME == "FailsToCreate" || T::NAME == "Fail1" {
+            if T::NAME == "Mid"
+                || T::NAME == "FailsToCreate"
+                || T::NAME == "Fail1"
+                || T::NAME == "FailLeaveOrphan"
+            {
                 c.arg(
                     clap::Arg::new("count")
                         .long("count")
@@ -1660,7 +1658,7 @@ mod tests {
     fn depends_optionally_on_fails_to_create() {
         let a = Assembly::<DependsOptionallyOnFailsToCreateTop>::new_from_argv(EMPTY).unwrap();
         let edges = a
-            .dep_matrix
+            .shutdown_notify
             .edges()
             .map(|(i, j)| (a.names.get(i), a.names.get(j)))
             .collect::<Vec<_>>();
@@ -1948,6 +1946,72 @@ mod tests {
     fn optfail_depends_on_optfail() {
         let assembly = Assembly::<FailFailTop>::new_from_argv(EMPTY).unwrap();
         assert!(assembly.top.0.is_none());
+    }
+
+    struct InertResource;
+
+    struct InertResourceProduction {
+        shared: Arc<InertResource>,
+        _keepalive: Sentinel,
+        stopper: ShutdownSignalParticipant,
+    }
+
+    impl sealed::ResourceBase<{ crate::ResourceVariety::Test as usize }> for InertResource {
+        const NAME: &str = "InertResource";
+        type Production = InertResourceProduction;
+
+        fn make(
+            _: &mut ProduceContext<'_>,
+            _: &mut ArgMatches,
+            stoppers: ShutdownSignalParticipantCreator,
+            sentinel: Sentinel,
+            _: sealed::DependencyTest,
+        ) -> Result<InertResourceProduction, Box<dyn Error>> {
+            Ok(InertResourceProduction {
+                shared: Arc::new(Self),
+                _keepalive: sentinel,
+                stopper: stoppers.into_inner().unwrap(),
+            })
+        }
+
+        fn shared(re: &InertResourceProduction) -> Arc<Self> {
+            Arc::clone(&re.shared)
+        }
+
+        fn task(
+            re: InertResourceProduction,
+        ) -> Pin<Box<dyn Future<Output = Result<(), Box<dyn Error>>> + Send>> {
+            Box::pin(async move {
+                re.stopper.await.propagate();
+                Ok(())
+            })
+        }
+    }
+
+    struct FailLeaveOrphan;
+
+    #[derive(ResourceDependencies)]
+    struct FailLeaveOrphanDependencies(Arc<InertResource>);
+
+    impl TestResource for FailLeaveOrphan {
+        type Dependencies = FailLeaveOrphanDependencies;
+        const NAME: &str = "FailLeaveOrphan";
+
+        fn new(d: FailLeaveOrphanDependencies) -> Result<Self, Box<dyn std::error::Error>> {
+            let _ = d.0;
+            Err("fail leave orphan".into())
+        }
+    }
+
+    #[derive(ResourceDependencies)]
+    struct FailOrphanTop(Option<Arc<FailLeaveOrphan>>);
+
+    #[tokio::test]
+    async fn optfail_leaves_orphan() {
+        let assembly = Assembly::<FailOrphanTop>::new_from_argv(EMPTY).unwrap();
+        let _ = assembly.top.0;
+        let mut r = pin!(assembly.run_with_termination_signal(futures::stream::pending()));
+        assert!(poll!(&mut r).is_ready());
     }
 
     trait TestTrait {}

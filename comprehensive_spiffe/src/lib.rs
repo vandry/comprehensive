@@ -1,49 +1,68 @@
 //! Provide TLS configuration parameters to a [`comprehensive::Assembly`]
 //! from SPIFFE by contacting the local agent using the workload API.
-//!
-//! # WARNING
-//!
-//! This provider is not yet usable because
-//! [the SPIFFE certificates can't be verified](https://github.com/rustls/rustls/issues/1194).
-//! This is a work in progress.
 
 #![warn(missing_docs)]
 
 use comprehensive::ResourceDependencies;
 use comprehensive::v1::{AssemblyRuntime, Resource, resource};
+#[cfg(not(test))]
 use comprehensive_grpc::GrpcClient;
 use comprehensive_grpc::client::GrpcClientResourceDefaults;
-use comprehensive_traits::tls_config::{Exchange, Snapshot, TlsConfigProvider};
+use comprehensive_tls::api::{
+    IdentityHints, LatestValueStream, TlsConfigInstance, TlsConfigProvider,
+    VerifyExpectedIdentityResult, rustls, rustls_pki_types, x509_parser,
+};
 use futures::{SinkExt, StreamExt};
-use rustls_pki_types::CertificateDer;
+use http::Uri;
+use itertools::Itertools;
+use rustls::crypto::CryptoProvider;
+use rustls::sign::CertifiedKey;
+use rustls::{DistinguishedName, RootCertStore};
+use rustls_pki_types::{CertificateDer, TrustAnchor};
+use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::sync::Arc;
 use thiserror::Error;
+use x509_parser::certificate::X509Certificate;
 
 mod pb {
     tonic::include_proto!("_");
 }
 
+#[cfg(test)]
+mod testdata;
+
 type X509ParserError = x509_parser::nom::Err<x509_parser::error::X509Error>;
+
+const SPIFFE_SCHEME: &str = "spiffe";
 
 #[derive(Debug, Error)]
 enum SpiffeError {
     #[error("X509SVIDResponse containing no SVIDs")]
     Empty,
+    #[error("spiffe_id {0} is invalid URI: {1}")]
+    InvalidUri(String, http::uri::InvalidUri),
+    #[error("spiffe_id {0} has wrong scheme")]
+    WrongScheme(String),
     #[error("{0}")]
     KeyError(&'static str),
     #[error("{0}")]
     X509Error(#[from] X509ParserError),
+    #[error("{0}")]
+    RustlsError(#[from] rustls::Error),
+    #[error("{0}")]
+    WebpkiError(#[from] webpki::Error),
 }
 
-struct Certificates<'a>(&'a [u8]);
+struct ConcatenatedCertificates<'a>(&'a [u8]);
 
-impl<'a> Certificates<'a> {
+impl<'a> ConcatenatedCertificates<'a> {
     fn new(der: &'a [u8]) -> Self {
         Self(der)
     }
 }
 
-impl Iterator for Certificates<'_> {
+impl Iterator for ConcatenatedCertificates<'_> {
     type Item = Result<CertificateDer<'static>, X509ParserError>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -65,23 +84,298 @@ impl Iterator for Certificates<'_> {
     }
 }
 
-fn accept_svids(response: pb::X509svidResponse) -> Result<Box<Snapshot>, SpiffeError> {
-    let mut it = response.svids.into_iter();
-    let Some(svid) = it.next() else {
-        return Err(SpiffeError::Empty);
-    };
-    if it.next().is_some() {
-        log::warn!("X509SVIDResponse containing more than 1 SVID; using the first");
+#[derive(Debug)]
+struct SvidBundle {
+    id: Uri,
+    trust_anchors: Arc<[TrustAnchor<'static>]>,
+    root_subjects: Arc<[DistinguishedName]>,
+}
+
+impl<R: AsRef<[u8]>> TryFrom<(String, R)> for SvidBundle {
+    type Error = SpiffeError;
+
+    fn try_from((uri_s, roots_b): (String, R)) -> Result<Self, Self::Error> {
+        let id: Uri = match uri_s.parse() {
+            Ok(uri) => uri,
+            Err(e) => {
+                return Err(SpiffeError::InvalidUri(uri_s, e));
+            }
+        };
+        if id.scheme_str() != Some(SPIFFE_SCHEME) {
+            return Err(SpiffeError::WrongScheme(uri_s));
+        }
+        let roots = ConcatenatedCertificates::new(roots_b.as_ref())
+            .map(|c| Ok(webpki::anchor_from_trusted_cert(&c?)?.to_owned()))
+            .collect::<Result<RootCertStore, SpiffeError>>()?;
+        Ok(SvidBundle {
+            id,
+            root_subjects: roots.subjects().into(),
+            trust_anchors: roots.roots.into(),
+        })
     }
-    log::info!("Local SPIFFE ID is {}", svid.spiffe_id);
-    Ok(Box::new(Snapshot {
-        key: svid
-            .x509_svid_key
-            .try_into()
-            .map_err(SpiffeError::KeyError)?,
-        cert: Certificates::new(&svid.x509_svid).collect::<Result<Vec<_>, _>>()?,
-        cacert: Some(Certificates::new(&svid.bundle).collect::<Result<Vec<_>, _>>()?),
-    }))
+}
+
+#[derive(Debug)]
+struct SingleSvid {
+    bundle: SvidBundle,
+    certified_key: Arc<CertifiedKey>,
+}
+
+impl TryFrom<(pb::X509svid, &'_ CryptoProvider)> for SingleSvid {
+    type Error = SpiffeError;
+
+    fn try_from(
+        (svid, crypto_provider): (pb::X509svid, &'_ CryptoProvider),
+    ) -> Result<Self, Self::Error> {
+        let bundle = (svid.spiffe_id, svid.bundle).try_into()?;
+        let private_key = crypto_provider.key_provider.load_private_key(
+            svid.x509_svid_key
+                .try_into()
+                .map_err(SpiffeError::KeyError)?,
+        )?;
+        let cert = ConcatenatedCertificates::new(&svid.x509_svid).collect::<Result<Vec<_>, _>>()?;
+        let certified_key = CertifiedKey::new(cert, private_key);
+        certified_key.keys_match()?;
+        Ok(SingleSvid {
+            certified_key: certified_key.into(),
+            bundle,
+        })
+    }
+}
+
+#[derive(Copy, Clone, Debug)]
+enum SvidReference {
+    Native(usize),
+    Federated(usize),
+}
+
+#[derive(Debug, Default)]
+struct SpiffeConfig {
+    svids: Vec<SingleSvid>,
+    federated: Vec<SvidBundle>,
+    domain_index: HashMap<String, SvidReference>,
+    root_index: HashMap<Vec<u8>, SvidReference>,
+    uri_index: HashMap<Uri, SvidReference>,
+}
+
+impl SpiffeConfig {
+    fn get_svid(&self, i: SvidReference) -> Option<&SingleSvid> {
+        match i {
+            SvidReference::Native(i) => self.svids.get(i),
+            SvidReference::Federated(_) => None,
+        }
+    }
+
+    fn get_bundle(&self, i: SvidReference) -> Option<&SvidBundle> {
+        match i {
+            SvidReference::Native(i) => self.svids.get(i).map(|s| &s.bundle),
+            SvidReference::Federated(i) => self.federated.get(i),
+        }
+    }
+
+    fn select_identity_impl(
+        &self,
+        try_harder: bool,
+        requested: Option<&Uri>,
+        root_hint_subjects: Option<&[DistinguishedName]>,
+        sni: Option<&str>,
+    ) -> Option<Arc<CertifiedKey>> {
+        if try_harder {
+            if self.svids.is_empty() {
+                None
+            } else {
+                Some(&SvidReference::Native(0))
+            }
+        } else {
+            requested
+                .and_then(|uri| self.uri_index.get(uri))
+                .or_else(|| match root_hint_subjects {
+                    // Prefer root_hints if available.
+                    Some(hints) => hints
+                        .iter()
+                        .filter_map(|dn| self.root_index.get(dn.as_ref()))
+                        .next(),
+                    // Fall back to SNI.
+                    None => sni.and_then(|sni| self.domain_index.get(sni)),
+                })
+        }
+        .and_then(|i| self.get_svid(*i).map(|s| Arc::clone(&s.certified_key)))
+    }
+
+    fn domain_to_bundle(&self, uri: Option<&Uri>) -> Option<&SvidBundle> {
+        uri.filter(|uri| uri.scheme_str() == Some(SPIFFE_SCHEME))
+            .and_then(|uri| uri.host())
+            .and_then(|host| self.domain_index.get(host))
+            .and_then(|i| self.get_bundle(*i))
+    }
+}
+
+impl TlsConfigInstance for SpiffeConfig {
+    fn has_any_identity(&self) -> bool {
+        !self.svids.is_empty()
+    }
+
+    fn select_identity(
+        &self,
+        try_harder: bool,
+        hints: &IdentityHints<'_>,
+    ) -> Option<Arc<CertifiedKey>> {
+        self.select_identity_impl(
+            try_harder,
+            hints.requested,
+            hints.root_hint_subjects,
+            hints.sni,
+        )
+    }
+
+    fn choose_root_hint_subjects(
+        &self,
+        _local_identity: Option<&Uri>,
+        remote_identity: Option<&Uri>,
+    ) -> Option<Arc<[DistinguishedName]>> {
+        // Hint the trust roots for the SPIFFE domain we expect from the peer.
+        self.domain_to_bundle(remote_identity)
+            .map(|b| Arc::clone(&b.root_subjects))
+    }
+
+    fn trust_anchors_for_cert(
+        &self,
+        try_harder: bool,
+        end_entity: &X509Certificate<'_>,
+        _intermediates: &[X509Certificate<'_>],
+    ) -> Option<Arc<[TrustAnchor<'static>]>> {
+        if try_harder {
+            // We already gave our best answer when try_harder was false.
+            return None;
+        }
+        if let Ok(Some(ext)) = end_entity.subject_alternative_name() {
+            for san in &ext.value.general_names {
+                if let x509_parser::extensions::GeneralName::URI(u) = san {
+                    if let Ok(uri) = u.parse::<Uri>() {
+                        if let Some(bundle) = self.domain_to_bundle(Some(&uri)) {
+                            return Some(Arc::clone(&bundle.trust_anchors));
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn verify_expected_identity(
+        &self,
+        end_entity: &X509Certificate<'_>,
+        expected_identity: &Uri,
+    ) -> VerifyExpectedIdentityResult {
+        if expected_identity.scheme_str() != Some(SPIFFE_SCHEME) {
+            return VerifyExpectedIdentityResult::No;
+        };
+        if let Ok(Some(ext)) = end_entity.subject_alternative_name() {
+            for san in &ext.value.general_names {
+                if let x509_parser::extensions::GeneralName::URI(uri) = san {
+                    if uri == expected_identity {
+                        return VerifyExpectedIdentityResult::Yes;
+                    }
+                }
+            }
+        }
+        VerifyExpectedIdentityResult::No
+    }
+}
+
+impl TryFrom<(pb::X509svidResponse, &'_ CryptoProvider)> for SpiffeConfig {
+    type Error = SpiffeError;
+
+    fn try_from(
+        (response, crypto_provider): (pb::X509svidResponse, &'_ CryptoProvider),
+    ) -> Result<Self, Self::Error> {
+        let svids = response
+            .svids
+            .into_iter()
+            .map(|s| (s, crypto_provider).try_into())
+            .collect::<Result<Vec<SingleSvid>, _>>()?;
+        let federated = response
+            .federated_bundles
+            .into_iter()
+            .map(TryInto::<SvidBundle>::try_into)
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut conf = Self {
+            domain_index: HashMap::new(),
+            root_index: HashMap::new(),
+            uri_index: HashMap::new(),
+            svids,
+            federated,
+        };
+        if conf.svids.is_empty() {
+            return Err(SpiffeError::Empty);
+        };
+        for (i, bundle) in conf
+            .svids
+            .iter()
+            .map(|svid| &svid.bundle)
+            .enumerate()
+            .map(|(i, b)| (SvidReference::Native(i), b))
+            .chain(
+                conf.federated
+                    .iter()
+                    .enumerate()
+                    .map(|(i, b)| (SvidReference::Federated(i), b)),
+            )
+        {
+            if let Some(host) = bundle.id.host() {
+                match conf.domain_index.entry(host.to_owned()) {
+                    Entry::Occupied(other) => {
+                        let other = *other.get();
+                        log::warn!(
+                            "SPIFFE ids {} and {} have the same domain. Will provide root_hint_subjects only for the first one when expecting servers in that domain.",
+                            conf.get_bundle(other).map(|b| &b.id).unwrap(),
+                            bundle.id
+                        );
+                    }
+                    Entry::Vacant(vacant) => {
+                        vacant.insert(i);
+                    }
+                }
+            }
+            for subject in bundle.root_subjects.as_ref() {
+                match conf.root_index.entry(subject.as_ref().to_vec()) {
+                    Entry::Occupied(other) => {
+                        let other = *other.get();
+                        log::warn!(
+                            "SPIFFE ids {} and {} share a trust root. Will select only the first identity when that trust root is received through root_hint_subjects.",
+                            conf.get_bundle(other).map(|b| &b.id).unwrap(),
+                            bundle.id
+                        );
+                    }
+                    Entry::Vacant(vacant) => {
+                        vacant.insert(i);
+                    }
+                }
+            }
+            if matches!(i, SvidReference::Native(_)) {
+                match conf.uri_index.entry(bundle.id.clone()) {
+                    Entry::Occupied(_) => {
+                        log::warn!(
+                            "SPIFFE id {} is duplicated. Only one of them will be selectable as a requested local ID.",
+                            bundle.id
+                        );
+                    }
+                    Entry::Vacant(vacant) => {
+                        vacant.insert(i);
+                    }
+                }
+            }
+        }
+        log::info!(
+            "{} local SPIFFE identities loaded: {}",
+            conf.svids.len(),
+            conf.svids
+                .iter()
+                .map(|id| id.bundle.id.to_string())
+                .join(", ")
+        );
+        Ok(conf)
+    }
 }
 
 fn grpc_client_defaults() -> GrpcClientResourceDefaults {
@@ -106,6 +400,10 @@ fn grpc_client_defaults() -> GrpcClientResourceDefaults {
     d
 }
 
+#[cfg(test)]
+struct SpiffeWorkloadApiClient;
+
+#[cfg(not(test))]
 #[derive(GrpcClient)]
 #[defaults(grpc_client_defaults())]
 #[no_tls]
@@ -117,7 +415,10 @@ struct SpiffeWorkloadApiClient(
 
 #[derive(ResourceDependencies)]
 #[doc(hidden)]
-pub struct Dependencies(Arc<SpiffeWorkloadApiClient>);
+pub struct Dependencies {
+    workload_api_client: Arc<SpiffeWorkloadApiClient>,
+    crypto_provider: Arc<comprehensive_tls::crypto_provider::RustlsCryptoProvider>,
+}
 
 #[derive(clap::Args)]
 #[doc(hidden)]
@@ -163,7 +464,7 @@ impl std::error::Error for NotEnabled {}
 /// It will then be picked up by [`comprehensive_tls::TlsConfig`].
 ///
 /// [`comprehensive_tls::TlsConfig`]: https://docs.rs/comprehensive_tls/latest/comprehensive_tls/struct.TlsConfig.html
-pub struct SpiffeTlsProvider(Exchange);
+pub struct SpiffeTlsProvider(LatestValueStream);
 
 #[resource]
 #[export(dyn TlsConfigProvider)]
@@ -176,11 +477,12 @@ impl Resource for SpiffeTlsProvider {
         if a.no_spiffe || !(a.spiffe || std::env::var("SPIFFE_ENDPOINT_SOCKET").is_ok()) {
             return Err(NotEnabled);
         }
-        let mut client = d.0.client();
-        let shared = Arc::new(Self(Exchange::default()));
+        let mut client = d.workload_api_client.client();
+        let crypto_provider = d.crypto_provider.crypto_provider();
+        let shared = Arc::new(Self(LatestValueStream::default()));
         let shared2 = Arc::clone(&shared);
         api.set_task(async move {
-            let mut writer = shared.0.writer().unwrap();
+            let mut writer = shared.0.writer();
             let mut req = tonic::Request::new(pb::X509svidRequest::default());
             let _ = req.metadata_mut().insert(
                 "workload.spiffe.io",
@@ -189,8 +491,8 @@ impl Resource for SpiffeTlsProvider {
             let mut stream = client.fetch_x509svid(req).await?.into_inner();
             while let Some(frame) = stream.next().await {
                 match frame {
-                    Ok(response) => match accept_svids(response) {
-                        Ok(d) => writer.send(d).await.unwrap(),
+                    Ok(response) => match (response, &*crypto_provider).try_into() {
+                        Ok(d) => writer.send(Box::<SpiffeConfig>::new(d)).await.unwrap(),
                         Err(e) => {
                             log::error!("X509SVIDResponse: {}", e);
                         }
@@ -208,7 +510,294 @@ impl Resource for SpiffeTlsProvider {
 }
 
 impl TlsConfigProvider for SpiffeTlsProvider {
-    fn stream(&self) -> Option<comprehensive_traits::tls_config::Reader<'_>> {
+    fn stream(&self) -> comprehensive_tls::api::Reader<'_> {
         self.0.reader()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use comprehensive::Assembly;
+    use futures::Stream;
+    use futures::future::Either;
+    use std::pin::pin;
+    use tonic::Request;
+    use x509_parser::prelude::FromDer;
+
+    use crate::pb::{X509svidRequest, X509svidResponse};
+
+    fn test_config() -> SpiffeConfig {
+        let p = rustls::crypto::aws_lc_rs::default_provider();
+        (testdata::SVID_RESPONSE.clone(), &p).try_into().unwrap()
+    }
+
+    #[resource]
+    impl Resource for SpiffeWorkloadApiClient {
+        fn new(
+            _: comprehensive::NoDependencies,
+            _: comprehensive::NoArgs,
+            _: &mut AssemblyRuntime<'_>,
+        ) -> Result<Arc<Self>, std::convert::Infallible> {
+            Ok(Arc::new(Self))
+        }
+    }
+
+    pub struct MockResponse;
+
+    impl MockResponse {
+        pub fn into_inner(
+            self,
+        ) -> impl Stream<Item = Result<X509svidResponse, std::convert::Infallible>> {
+            futures::stream::once(std::future::ready(Ok(testdata::SVID_RESPONSE.clone())))
+                .chain(futures::stream::pending())
+        }
+    }
+
+    pub struct MockSpiffeWorkloadApiClient;
+
+    impl MockSpiffeWorkloadApiClient {
+        pub async fn fetch_x509svid(
+            &mut self,
+            _: Request<X509svidRequest>,
+        ) -> Result<MockResponse, std::convert::Infallible> {
+            Ok(MockResponse)
+        }
+    }
+
+    impl SpiffeWorkloadApiClient {
+        pub fn client(&self) -> MockSpiffeWorkloadApiClient {
+            let _ = grpc_client_defaults();
+            MockSpiffeWorkloadApiClient
+        }
+    }
+
+    #[derive(ResourceDependencies)]
+    struct TopDependencies(Arc<SpiffeTlsProvider>);
+
+    #[tokio::test]
+    async fn end_to_end() {
+        let argv: Vec<std::ffi::OsString> = vec!["cmd".into(), "--spiffe".into()];
+        let a = Assembly::<TopDependencies>::new_from_argv(argv).unwrap();
+        let spiffe_config = Arc::clone(&a.top.0);
+        let mut r = pin!(a.run_with_termination_signal(futures::stream::pending()));
+        let mut stream = spiffe_config.stream();
+        let mut reader = pin!(stream.next());
+        let config = match futures::future::select(&mut r, &mut reader).await {
+            Either::Left((e, _)) => {
+                panic!("Assembly quit: {:?}", e);
+            }
+            Either::Right((o, _)) => o,
+        };
+        assert!(
+            config
+                .expect("Box<dyn TlsConfigInstance>")
+                .has_any_identity()
+        );
+    }
+
+    #[test]
+    fn select_identity_no_hints() {
+        let config = test_config();
+        assert!(
+            config
+                .select_identity_impl(false, None, None, None)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn select_identity_requested() {
+        let config = test_config();
+        let requested = Uri::from_static("spiffe://spiffe.example.org/node1/workload1");
+        // Provide the other hints so they disagree. requested should win.
+        let sni = "spiffe2.example.org";
+        let root_hints = vec![DistinguishedName::from(testdata::SPIFFE2_ROOT_DN.to_vec())];
+        assert_eq!(
+            config
+                .select_identity_impl(
+                    false,
+                    Some(&requested),
+                    Some(root_hints.as_slice()),
+                    Some(&sni)
+                )
+                .expect("workload1")
+                .cert,
+            config.svids[0].certified_key.cert
+        );
+    }
+
+    #[test]
+    fn select_identity_requested_not_available() {
+        let config = test_config();
+        let requested = Uri::from_static("spiffe://unknown.example.org/foo");
+        // Since requested is not available, expect root_hints to be used.
+        let sni = "spiffe2.example.org";
+        let root_hints = vec![DistinguishedName::from(testdata::SPIFFE2_ROOT_DN.to_vec())];
+        assert_eq!(
+            config
+                .select_identity_impl(
+                    false,
+                    Some(&requested),
+                    Some(root_hints.as_slice()),
+                    Some(&sni)
+                )
+                .expect("workload2")
+                .cert,
+            config.svids[1].certified_key.cert
+        );
+    }
+
+    #[test]
+    fn select_identity_root_hints_preferred() {
+        let config = test_config();
+        let sni = "spiffe.example.org";
+        let root_hints = vec![DistinguishedName::from(testdata::SPIFFE2_ROOT_DN.to_vec())];
+        assert_eq!(
+            config
+                .select_identity_impl(false, None, Some(root_hints.as_slice()), Some(&sni))
+                .expect("workload2")
+                .cert,
+            config.svids[1].certified_key.cert
+        );
+    }
+
+    #[test]
+    fn select_identity_root_hints_not_available() {
+        let config = test_config();
+        let sni = "spiffe.example.org";
+        let root_hints = vec![DistinguishedName::from(testdata::WRONG_DN.to_vec())];
+        assert!(
+            config
+                .select_identity_impl(false, None, Some(root_hints.as_slice()), Some(&sni))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn select_identity_sni() {
+        let config = test_config();
+        let sni = "spiffe2.example.org";
+        assert_eq!(
+            config
+                .select_identity_impl(false, None, None, Some(&sni))
+                .expect("workload2")
+                .cert,
+            config.svids[1].certified_key.cert
+        );
+    }
+
+    #[test]
+    fn choose_roots_no_remote_identity() {
+        let config = test_config();
+        assert!(config.choose_root_hint_subjects(None, None).is_none());
+    }
+
+    #[test]
+    fn choose_roots_unrelated_remote_identity() {
+        let config = test_config();
+
+        let uri = Uri::from_static("https://user1/");
+        assert!(config.choose_root_hint_subjects(None, Some(&uri)).is_none());
+
+        let cert = X509Certificate::from_der(&testdata::UNRELATED_CERT)
+            .unwrap()
+            .1;
+        assert!(config.trust_anchors_for_cert(false, &cert, &[]).is_none());
+    }
+
+    #[test]
+    fn choose_roots_local_identity() {
+        let config = test_config();
+        let want = [testdata::SPIFFE2_ROOT_DN.as_ref()];
+
+        let uri = Uri::from_static("spiffe://spiffe2.example.org/foo/bar");
+        assert_eq!(
+            config
+                .choose_root_hint_subjects(None, Some(&uri))
+                .expect("spiffe2")
+                .iter()
+                .map(AsRef::as_ref)
+                .collect::<Vec<_>>()
+                .as_slice(),
+            want.as_slice()
+        );
+
+        let cert = X509Certificate::from_der(&config.svids[1].certified_key.cert[0].as_ref())
+            .unwrap()
+            .1;
+        let ta = config
+            .trust_anchors_for_cert(false, &cert, &[])
+            .expect("spiffe2");
+        assert_eq!(
+            RootCertStore { roots: ta.to_vec() }
+                .subjects()
+                .iter()
+                .map(AsRef::as_ref)
+                .collect::<Vec<_>>()
+                .as_slice(),
+            want.as_slice(),
+        );
+    }
+
+    #[test]
+    fn choose_roots_federated_identity() {
+        let config = test_config();
+        let want = [testdata::SPIFFE3_ROOT_DN.as_ref()];
+
+        let uri = Uri::from_static("spiffe://spiffe3.example.org/foo/bar");
+        assert_eq!(
+            config
+                .choose_root_hint_subjects(None, Some(&uri))
+                .expect("spiffe3")
+                .iter()
+                .map(AsRef::as_ref)
+                .collect::<Vec<_>>()
+                .as_slice(),
+            want.as_slice()
+        );
+
+        let cert = X509Certificate::from_der(&testdata::SPIFFE3_CERT)
+            .unwrap()
+            .1;
+        let ta = config
+            .trust_anchors_for_cert(false, &cert, &[])
+            .expect("spiffe3");
+        assert_eq!(
+            RootCertStore { roots: ta.to_vec() }
+                .subjects()
+                .iter()
+                .map(AsRef::as_ref)
+                .collect::<Vec<_>>()
+                .as_slice(),
+            want.as_slice(),
+        );
+    }
+
+    #[test]
+    fn verify_expected_identity_yes() {
+        let cert = X509Certificate::from_der(&testdata::SPIFFE3_CERT)
+            .unwrap()
+            .1;
+        let uri = Uri::from_static("spiffe://spiffe3.example.org/node3/workload3");
+        let config = test_config();
+        assert!(matches!(
+            config.verify_expected_identity(&cert, &uri),
+            VerifyExpectedIdentityResult::Yes
+        ));
+    }
+
+    #[test]
+    fn verify_expected_identity_no() {
+        let cert = X509Certificate::from_der(&testdata::SPIFFE3_CERT)
+            .unwrap()
+            .1;
+        let uri = Uri::from_static("spiffe://nifty3.example.org/node3/workload3");
+        let config = test_config();
+        assert!(matches!(
+            config.verify_expected_identity(&cert, &uri),
+            VerifyExpectedIdentityResult::No
+        ));
     }
 }

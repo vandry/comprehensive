@@ -1,9 +1,17 @@
 use comprehensive::v1::{AssemblyRuntime, Resource, resource};
-use comprehensive_traits::tls_config::{Exchange, Snapshot, TlsConfigProvider};
+use comprehensive_tls::api::{
+    LatestValueStream, TlsConfigInstance, TlsConfigProvider, VerifyExpectedIdentityResult, rustls,
+    rustls_pki_types, x509_parser,
+};
 use futures::{FutureExt, SinkExt};
+use http::Uri;
+use rustls::DistinguishedName;
+use rustls::sign::CertifiedKey;
+use rustls_pki_types::TrustAnchor;
 use std::io::Cursor;
 use std::sync::Arc;
 use std::task::Context;
+use x509_parser::certificate::X509Certificate;
 
 const USER1_KEY: &[u8] = br#"
 -----BEGIN PRIVATE KEY-----
@@ -124,30 +132,91 @@ I6snlcxZJk6CVv/lGNUJRQKgncKXgvkaVo2enAKoE6l7
 -----END CERTIFICATE-----
 "#;
 
-pub(crate) struct User1(Exchange);
+pub(crate) struct User1(LatestValueStream);
+
+#[derive(Debug)]
+struct Instance {
+    certified_key: Arc<CertifiedKey>,
+    cacert: Arc<[TrustAnchor<'static>]>,
+}
+
+impl TlsConfigInstance for Instance {
+    fn has_any_identity(&self) -> bool {
+        true
+    }
+
+    fn select_identity(
+        &self,
+        _try_harder: bool,
+        _hints: &comprehensive_tls::api::IdentityHints<'_>,
+    ) -> Option<Arc<CertifiedKey>> {
+        Some(Arc::clone(&self.certified_key))
+    }
+
+    fn choose_root_hint_subjects(
+        &self,
+        _local_identity: Option<&Uri>,
+        _remote_identity: Option<&Uri>,
+    ) -> Option<Arc<[DistinguishedName]>> {
+        None
+    }
+
+    fn trust_anchors_for_cert(
+        &self,
+        _try_harder: bool,
+        _end_entity: &X509Certificate<'_>,
+        _intermediates: &[X509Certificate<'_>],
+    ) -> Option<Arc<[TrustAnchor<'static>]>> {
+        Some(Arc::clone(&self.cacert))
+    }
+
+    fn verify_expected_identity(
+        &self,
+        _: &X509Certificate<'_>,
+        _: &Uri,
+    ) -> VerifyExpectedIdentityResult {
+        VerifyExpectedIdentityResult::UseWebpki
+    }
+}
+
+#[derive(comprehensive::ResourceDependencies)]
+pub struct User1Dependencies {
+    crypto_provider: Arc<comprehensive_tls::crypto_provider::RustlsCryptoProvider>,
+}
 
 #[resource]
 #[export(dyn TlsConfigProvider)]
 impl Resource for User1 {
     fn new(
-        _: comprehensive::NoDependencies,
+        d: User1Dependencies,
         _: comprehensive::NoArgs,
         _: &mut AssemblyRuntime<'_>,
     ) -> Result<Arc<Self>, std::convert::Infallible> {
-        let exchange = Exchange::default();
+        let exchange = LatestValueStream::default();
+        let key = rustls_pemfile::private_key(&mut Cursor::new(USER1_KEY))
+            .unwrap()
+            .unwrap();
+        let cert = rustls_pemfile::certs(&mut Cursor::new(USER1_CERT))
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let private_key = d
+            .crypto_provider
+            .crypto_provider()
+            .key_provider
+            .load_private_key(key)
+            .unwrap();
+        let certified_key = CertifiedKey::new(cert, private_key);
         let _ = exchange
             .writer()
-            .unwrap()
-            .send(Box::new(Snapshot {
-                key: rustls_pemfile::private_key(&mut Cursor::new(USER1_KEY))
-                    .unwrap()
-                    .unwrap(),
-                cert: rustls_pemfile::certs(&mut Cursor::new(USER1_CERT))
-                    .collect::<Result<Vec<_>, _>>()
-                    .unwrap(),
+            .send(Box::new(Instance {
+                certified_key: certified_key.into(),
                 cacert: rustls_pemfile::certs(&mut Cursor::new(CACERT))
-                    .collect::<Result<Vec<_>, _>>()
-                    .ok(),
+                    .map(|der| {
+                        webpki::anchor_from_trusted_cert(&der.unwrap())
+                            .unwrap()
+                            .to_owned()
+                    })
+                    .collect(),
             }))
             .poll_unpin(&mut Context::from_waker(std::task::Waker::noop()));
         Ok(Arc::new(Self(exchange)))
@@ -155,7 +224,7 @@ impl Resource for User1 {
 }
 
 impl TlsConfigProvider for User1 {
-    fn stream(&self) -> Option<comprehensive_traits::tls_config::Reader<'_>> {
+    fn stream(&self) -> comprehensive_tls::api::Reader<'_> {
         self.0.reader()
     }
 }

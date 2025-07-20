@@ -51,7 +51,6 @@
 //! }
 //!
 //! #[cfg(feature = "tls")]
-//! let _ = tokio_rustls::rustls::crypto::aws_lc_rs::default_provider().install_default();
 //! let assembly = comprehensive::Assembly::<JustAServer>::new().unwrap();
 //! ```
 
@@ -65,8 +64,6 @@ use futures::pin_mut;
 use std::marker::PhantomData;
 use std::net::IpAddr;
 use std::sync::Arc;
-#[cfg(feature = "tls")]
-use tokio_rustls::rustls;
 
 async fn run_in_task<A>(
     b: axum_server::Server<A>,
@@ -313,9 +310,7 @@ mod secure_server {
                 return Err(ComprehensiveHttpsError::NoTlsProvider);
             };
             let addr = (args.https_bind_addr, port).into();
-            let mut sc = rustls::ServerConfig::builder()
-                .with_no_client_auth()
-                .with_cert_resolver(tlsc.cert_resolver()?);
+            let mut sc = tlsc.server_config::<comprehensive_tls::ClientAuthDisabled>();
             sc.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
             let config = RustlsConfig::from_config(Arc::new(sc));
             let server = axum_server::bind_rustls(addr, config);
@@ -557,7 +552,6 @@ mod tests {
     #[cfg(feature = "tls")]
     #[tokio::test]
     async fn https_only() {
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let port = testutil::pick_unused_port(None);
         let argv = test_args(None, Some(port));
         let assembly = comprehensive::Assembly::<JustAServer>::new_from_argv(argv).unwrap();
@@ -592,7 +586,6 @@ mod tests {
     #[cfg(feature = "tls")]
     #[tokio::test]
     async fn http_and_https() {
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let port_http = testutil::pick_unused_port(None);
         let port_https = testutil::pick_unused_port(Some(port_http));
         let argv = test_args(Some(port_http), Some(port_https));

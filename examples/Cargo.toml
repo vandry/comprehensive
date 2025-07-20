@@ -16,8 +16,8 @@ path = "src/helloworld-grpc-client.rs"
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
 comprehensive = { path = "../comprehensive", version = "0.7" }
-comprehensive_grpc = { path = "../comprehensive_grpc", version = "0.6", features = ["tls"] }
-comprehensive_http = { path = "../comprehensive_http", version = "0.1", features = ["tls"] }
+comprehensive_grpc = { path = "../comprehensive_grpc", version = "0.7", features = ["tls"] }
+comprehensive_http = { path = "../comprehensive_http", version = "0.2", features = ["tls"] }
 env_logger = "0.10"
 humantime = "2.1"
 prost = "0.13"

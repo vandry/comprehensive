@@ -4,7 +4,7 @@
 //! <https://github.com/hyperium/tonic/blob/master/tonic/src/transport/server/io_stream.rs>
 //! and other tonic sources.
 
-use comprehensive_tls::TlsConfig;
+use comprehensive_tls::{ClientAuthEnabled, TlsConfig};
 use futures::Stream;
 use pin_project_lite::pin_project;
 use std::pin::Pin;
@@ -27,7 +27,7 @@ fn tls_accept<IO>(
 where
     IO: AsyncRead + AsyncWrite + Unpin + 'static,
 {
-    let mut sc = tlsc.server_config_mtls();
+    let mut sc = tlsc.server_config::<ClientAuthEnabled>();
     sc.alpn_protocols.push(b"h2".into());
     TlsAcceptor::from(Arc::new(sc)).accept(s)
 }
@@ -259,8 +259,11 @@ mod tests {
             .0;
         let (client, server) = tokio::io::duplex(64);
         let server = WrappedDuplexStream { inner: server };
-        let client = tokio_rustls::TlsConnector::from(tlsc.client_config())
-            .connect(ServerName::try_from("user1").unwrap(), client);
+        let client = tokio_rustls::TlsConnector::from(Arc::new(
+            tlsc.client_config(&Uri::from_static("https://user1/"), None)
+                .unwrap(),
+        ))
+        .connect(ServerName::try_from("user1").unwrap(), client);
         let acceptor = Acceptor::new(
             futures::stream::select(
                 futures::stream::once(std::future::ready(Ok(server))),

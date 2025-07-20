@@ -11,6 +11,3 @@
 
 #[cfg(feature = "http_diag")]
 pub mod http_diag;
-
-#[cfg(feature = "tls_config")]
-pub mod tls_config;

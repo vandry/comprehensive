@@ -1,5 +1,3 @@
-use std::path::PathBuf;
-
 pub(crate) const USER1_KEY: &[u8] = br#"
 -----BEGIN PRIVATE KEY-----
 MIIJQQIBADANBgkqhkiG9w0BAQEFAASCCSswggknAgEAAoICAQDxusR41enNC45F
@@ -206,25 +204,10 @@ I6snlcxZJk6CVv/lGNUJRQKgncKXgvkaVo2enAKoE6l7
 -----END CERTIFICATE-----
 "#;
 
-pub(crate) struct CertAndKeyFiles {
-    pub(crate) dir: tempfile::TempDir,
-}
+pub(crate) const CACERT_DN: &[u8] = b"\x30\x0d\x31\x0b\x30\x09\x06\x03\x55\x04\x03\x0c\x02CA";
 
-impl CertAndKeyFiles {
-    pub(crate) fn user1() -> std::io::Result<Self> {
-        let this = Self {
-            dir: tempfile::tempdir()?,
-        };
-        std::fs::write(this.key_path(), USER1_KEY)?;
-        std::fs::write(this.cert_path(), USER1_CERT)?;
-        Ok(this)
-    }
-
-    pub(crate) fn key_path(&self) -> PathBuf {
-        self.dir.path().join("key")
-    }
-
-    pub(crate) fn cert_path(&self) -> PathBuf {
-        self.dir.path().join("cert")
-    }
+#[test]
+fn cacert_dn_decodes() {
+    use x509_parser::prelude::FromDer;
+    x509_parser::x509::X509Name::from_der(CACERT_DN).expect("CACERT_DN");
 }

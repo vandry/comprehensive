@@ -17,7 +17,7 @@
 //! ```
 
 use atomic_take::AtomicTake;
-use clap::{Arg, ArgMatches, Args, Command, FromArgMatches, value_parser};
+use clap::{Arg, ArgGroup, ArgMatches, Args, Command, FromArgMatches, value_parser};
 use comprehensive::ResourceDependencies;
 use comprehensive::health::HealthReporter;
 use comprehensive_dns::DNSResolver;
@@ -87,6 +87,9 @@ pub struct GrpcClientResourceDefaults {
     /// Default value for the `--PREFIXconnect-uri` flag. If [`None`], there is no
     /// default value for that flag.
     pub connect_uri: Option<Cow<'static, str>>,
+    /// Default value for the `--PREFIXserver-identity` flag. If [`None`], there
+    /// is no default value for that flag.
+    pub server_identity: Option<Cow<'static, str>>,
     /// Default values for the rest of the flags.
     pub config: GRPCChannelConfig,
 }
@@ -100,6 +103,8 @@ pub trait InstanceDescriptor {
     const REQUIRED: bool;
     const URI_FLAG_NAME: &str;
     const CONNECT_URI_FLAG_NAME: &str;
+    const SERVER_IDENTITY_FLAG_NAME: &str;
+    const CLIENT_IDENTITY_FLAG_NAME: &str;
     const N_SUBCHANNELS_WANT_FLAG_NAME: &str;
     const N_SUBCHANNELS_HEALTHY_MIN_FLAG_NAME: &str;
     const N_SUBCHANNELS_HEALTHY_CRITICAL_MIN_FLAG_NAME: &str;
@@ -109,6 +114,9 @@ pub trait InstanceDescriptor {
     const HEALTH_CHECK_SERVICE_FLAG_NAME: &str;
     const HEALTH_CHECK_TIMEOUT_FLAG_NAME: &str;
     const HEALTH_CHECK_INTERVAL_FLAG_NAME: &str;
+
+    const CONNECT_URI_GROUP_NAME: &str;
+    const SERVER_IDENTITY_GROUP_NAME: &str;
 }
 
 #[doc(hidden)]
@@ -117,6 +125,8 @@ macro_rules! declare_client_flag_name_constants {
     ($prefix:literal) => {
         const URI_FLAG_NAME: &str = concat!($prefix, "uri");
         const CONNECT_URI_FLAG_NAME: &str = concat!($prefix, "connect-uri");
+        const SERVER_IDENTITY_FLAG_NAME: &str = concat!($prefix, "server-identity");
+        const CLIENT_IDENTITY_FLAG_NAME: &str = concat!($prefix, "client-identity");
         const N_SUBCHANNELS_WANT_FLAG_NAME: &str = concat!($prefix, "n-subchannels-want");
         const N_SUBCHANNELS_HEALTHY_MIN_FLAG_NAME: &str =
             concat!($prefix, "n-subchannels-healthy-min");
@@ -131,6 +141,9 @@ macro_rules! declare_client_flag_name_constants {
         const HEALTH_CHECK_SERVICE_FLAG_NAME: &str = concat!($prefix, "health-check-service");
         const HEALTH_CHECK_TIMEOUT_FLAG_NAME: &str = concat!($prefix, "health-check-timeout");
         const HEALTH_CHECK_INTERVAL_FLAG_NAME: &str = concat!($prefix, "health-check-interval");
+
+        const CONNECT_URI_GROUP_NAME: &str = concat!($prefix, "connect-uri-group");
+        const SERVER_IDENTITY_GROUP_NAME: &str = concat!($prefix, "server-identity-group");
     };
 }
 
@@ -157,6 +170,8 @@ impl FromStr for UriOrPath {
 pub struct GrpcClientArgs<I> {
     uri: Option<Uri>,
     connect_uri: Option<UriOrPath>,
+    server_identity: Option<Uri>,
+    client_identity: Option<Uri>,
     config: GRPCChannelConfig,
     _i: PhantomData<I>,
 }
@@ -177,11 +192,12 @@ fn parse_optional_duration(d: &str) -> Result<Option<Duration>, humantime::Durat
 }
 
 impl<I: InstanceDescriptor> Args for GrpcClientArgs<I> {
-    fn augment_args(cmd: Command) -> Command {
+    fn augment_args(mut cmd: Command) -> Command {
         let GrpcClientResourceDefaults {
             config,
             uri,
             connect_uri,
+            server_identity,
         } = I::instance_defaults();
         let n_subchannels_want =
             clap::builder::Str::from(config.pool.n_subchannels_want.to_string());
@@ -204,25 +220,44 @@ impl<I: InstanceDescriptor> Args for GrpcClientArgs<I> {
         if let Some(ref service) = config.health_checking.service {
             hc_service_flag = hc_service_flag.default_value((**service).to_owned());
         }
+        let mut connect_uri_satisfied = !I::REQUIRED;
+        let mut server_identity_satisfied = !I::REQUIRED;
         let mut uri_flag = Arg::new(I::URI_FLAG_NAME)
             .long(I::URI_FLAG_NAME)
             .value_parser(value_parser!(Uri))
-            .help("URI of gRPC backend. The path and query are ignored.");
-        uri_flag = match uri {
-            Some(ref u) => uri_flag.default_value((**u).to_owned()),
-            None => uri_flag.required(I::REQUIRED),
-        };
+            .help("URI of gRPC backend. If not given then both *-connect-uri and *-server-identity must be given.");
+        if let Some(ref u) = uri {
+            uri_flag = uri_flag.default_value((**u).to_owned());
+            connect_uri_satisfied = true;
+            server_identity_satisfied = true;
+        }
         let mut connect_uri_flag = Arg::new(I::CONNECT_URI_FLAG_NAME)
             .long(I::CONNECT_URI_FLAG_NAME)
             .value_parser(value_parser!(UriOrPath))
-            .help("Alternate URI to resolve and connect to instead of the main URI. Can be http[s]://host:port/ or unix:/socket/path. Useful when a different TLS server name is required.");
+            .help("Alternate URI to resolve and connect to instead of the main URI. Can be http[s]://host:port/ or unix:/socket/path. Useful when a different TLS server name is required. At least this or the main URI must be given.");
         if let Some(ref u) = connect_uri {
             connect_uri_flag = connect_uri_flag.default_value((**u).to_owned());
+            connect_uri_satisfied = true;
+        }
+        let mut server_identity_flag = Arg::new(I::SERVER_IDENTITY_FLAG_NAME)
+            .long(I::SERVER_IDENTITY_FLAG_NAME)
+            .value_parser(value_parser!(Uri))
+            .help("Server's expected TLS identity as a URI. Unlike the main URI this does not set the gRPC origin. At least this or the main URI must be given.");
+        if let Some(ref u) = server_identity {
+            server_identity_flag = server_identity_flag.default_value((**u).to_owned());
+            server_identity_satisfied = true;
         }
 
-        cmd
+        cmd = cmd
             .arg(uri_flag)
             .arg(connect_uri_flag)
+            .arg(server_identity_flag)
+            .arg(
+                Arg::new(I::CLIENT_IDENTITY_FLAG_NAME)
+                    .long(I::CLIENT_IDENTITY_FLAG_NAME)
+                    .value_parser(value_parser!(Uri))
+                    .help("URI of the client TLS identity to use. Only needed if more than one identity is provisioned and the wrong one might be chosen.")
+            )
             .arg(
                 Arg::new(I::N_SUBCHANNELS_WANT_FLAG_NAME)
                     .long(I::N_SUBCHANNELS_WANT_FLAG_NAME)
@@ -280,7 +315,26 @@ impl<I: InstanceDescriptor> Args for GrpcClientArgs<I> {
                     .default_value(&health_check_interval)
                     .conflicts_with(I::NO_HEALTH_CHECK_ENABLE_FLAG_NAME)
                     .help("Interval between each individual health check probe.")
-            )
+            );
+        if !connect_uri_satisfied {
+            cmd = cmd.group(
+                ArgGroup::new(I::CONNECT_URI_GROUP_NAME)
+                    .arg(I::URI_FLAG_NAME)
+                    .arg(I::CONNECT_URI_FLAG_NAME)
+                    .multiple(true)
+                    .required(true),
+            );
+        }
+        if !server_identity_satisfied {
+            cmd = cmd.group(
+                ArgGroup::new(I::SERVER_IDENTITY_GROUP_NAME)
+                    .arg(I::URI_FLAG_NAME)
+                    .arg(I::SERVER_IDENTITY_FLAG_NAME)
+                    .multiple(true)
+                    .required(true),
+            );
+        }
+        cmd
     }
 
     fn augment_args_for_update(cmd: Command) -> Command {
@@ -298,6 +352,8 @@ impl<I: InstanceDescriptor> FromArgMatches for GrpcClientArgs<I> {
         let mut this = Self {
             uri: None,
             connect_uri: None,
+            server_identity: None,
+            client_identity: None,
             config: GRPCChannelConfig::default(),
             _i: PhantomData,
         };
@@ -313,6 +369,8 @@ impl<I: InstanceDescriptor> FromArgMatches for GrpcClientArgs<I> {
     fn update_from_arg_matches_mut(&mut self, matches: &mut ArgMatches) -> Result<(), clap::Error> {
         self.uri = matches.remove_one(I::URI_FLAG_NAME);
         self.connect_uri = matches.remove_one(I::CONNECT_URI_FLAG_NAME);
+        self.server_identity = matches.remove_one(I::SERVER_IDENTITY_FLAG_NAME);
+        self.client_identity = matches.remove_one(I::CLIENT_IDENTITY_FLAG_NAME);
         self.config.pool.n_subchannels_want = matches
             .remove_one(I::N_SUBCHANNELS_WANT_FLAG_NAME)
             .expect("has default_value");
@@ -403,19 +461,33 @@ mod deps {
     pub trait ClientDeps: Into<OtherDependencies> {
         type Connector: warm_channels::Connector<IPOrUNIXAddress> + Send + Sync + 'static;
 
-        fn connector(&self, _: &Uri) -> Result<Self::Connector, Box<dyn std::error::Error>>;
+        fn connector(
+            &self,
+            _: &Uri,
+            _: Option<&Uri>,
+        ) -> Result<Self::Connector, Box<dyn std::error::Error>>;
     }
 
     #[cfg(feature = "tls")]
     impl ClientDeps for super::GRPCClientDependencies {
         type Connector = TLSConnector<StreamConnector>;
 
-        fn connector(&self, uri: &Uri) -> Result<Self::Connector, Box<dyn std::error::Error>> {
-            let tls_config = self.tls_config.as_ref().map(|tlsc| tlsc.client_config());
+        fn connector(
+            &self,
+            server_identity: &Uri,
+            client_identity: Option<&Uri>,
+        ) -> Result<Self::Connector, Box<dyn std::error::Error>> {
+            let tls_config = self
+                .tls_config
+                .as_ref()
+                .map(|tlsc| tlsc.client_config(server_identity, client_identity))
+                .transpose()?;
             Ok(TLSConnector::new(
                 StreamConnector::default(),
-                uri,
-                tls_config.as_deref(),
+                // This determines whether or not TLS will be done, and if so,
+                // whether or not SNI will be done, and if so, the SNI name.
+                server_identity,
+                tls_config.as_ref(),
             )?)
         }
     }
@@ -423,7 +495,11 @@ mod deps {
     impl ClientDeps for super::GRPCClientDependenciesNoTls {
         type Connector = StreamConnector;
 
-        fn connector(&self, _: &Uri) -> Result<Self::Connector, Box<dyn std::error::Error>> {
+        fn connector(
+            &self,
+            _: &Uri,
+            _: Option<&Uri>,
+        ) -> Result<Self::Connector, Box<dyn std::error::Error>> {
             Ok(StreamConnector::default())
         }
     }
@@ -472,19 +548,30 @@ where
     <D::Connector as warm_channels::Connector<IPOrUNIXAddress>>::IO: Send,
     <D::Connector as warm_channels::Connector<IPOrUNIXAddress>>::Error: Send + Sync + 'static,
 {
-    let Some(uri) = a.uri else {
-        return Ok((None, ClientWorker::empty()));
+    let (uri, connect_uri, server_identity) = match (a.uri, a.connect_uri, a.server_identity) {
+        // connect_uri alone or server_identity alone (or nothing) is not enough.
+        (None, _, None) | (None, None, _) => {
+            return Ok((None, ClientWorker::empty()));
+        }
+        // Omiting the main URI only works if the server_identity is given
+        // which is only useful with TLS so use a https placeholder.
+        (None, Some(c), Some(i)) => (Uri::from_static("https://_/"), Some(c), Some(i)),
+        // Main URI stands in for the other 2.
+        (Some(u), maybe_c, maybe_i) => (u, maybe_c, maybe_i),
     };
     super::tonic_prometheus_layer_use_default_registry();
 
-    let connector = d.connector(&uri)?;
+    let connector = d.connector(
+        server_identity.as_ref().unwrap_or(&uri),
+        a.client_identity.as_ref(),
+    )?;
     let d: deps::OtherDependencies = d.into();
     let signaller = if propagate_health {
         Some(d.health.register(name)?)
     } else {
         None
     };
-    let reso = resolve(&uri, a.connect_uri, d.resolver.resolver())?;
+    let reso = resolve(&uri, connect_uri, d.resolver.resolver())?;
     let (stack, worker) = grpc_channel(uri.clone(), a.config, name, connector, reso, move |h| {
         signaller.as_ref().inspect(|s| s.set_healthy(h));
     });

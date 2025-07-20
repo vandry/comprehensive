@@ -1,6 +1,6 @@
 [package]
 name = "comprehensive_macros"
-version = "0.4.9"
+version = "0.4.10"
 edition = "2024"
 repository = "https://github.com/vandry/comprehensive.git"
 homepage = "https://github.com/vandry/comprehensive"
@@ -22,4 +22,4 @@ syn = { version = "2.0", features = ["full"] }
 
 [dev-dependencies]
 comprehensive = { path = "../comprehensive", version = "0.7" }
-comprehensive_grpc = { path = "../comprehensive_grpc", version = "0.6" }
+comprehensive_grpc = { path = "../comprehensive_grpc", version = "0.7" }

@@ -32,27 +32,11 @@ pub(crate) async fn wait_until_serving(addr: &SocketAddr) {
 
 #[cfg(feature = "tls")]
 pub(crate) mod tls {
-    use std::sync::Arc;
-    use tokio_rustls::rustls::crypto::CryptoProvider;
-    use tokio_rustls::rustls::pki_types::pem::PemObject;
-    use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
-    use tokio_rustls::rustls::server::ClientHello;
-    use tokio_rustls::rustls::sign::CertifiedKey;
+    use comprehensive_tls::api::rustls;
+    use rustls::pki_types::pem::PemObject;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
     use crate::tls_testdata;
-
-    #[derive(Debug)]
-    pub(crate) struct Resolver;
-
-    impl tokio_rustls::rustls::server::ResolvesServerCert for Resolver {
-        fn resolve(&self, _client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
-            let cert = CertificateDer::from_pem_slice(tls_testdata::USER1_CERT).unwrap();
-            let provider = CryptoProvider::get_default().unwrap();
-            let key = PrivateKeyDer::from_pem_slice(tls_testdata::USER1_KEY).unwrap();
-            let key = provider.key_provider.load_private_key(key).unwrap();
-            Some(Arc::new(CertifiedKey::new(vec![cert], key)))
-        }
-    }
 
     pub(crate) struct MockTlsConfig;
 
@@ -70,8 +54,17 @@ pub(crate) mod tls {
     }
 
     impl MockTlsConfig {
-        pub fn cert_resolver(&self) -> Result<Arc<Resolver>, comprehensive_tls::ComprehensiveTlsError> {
-            Ok(Arc::new(Resolver))
+        pub fn server_config<T>(&self) -> rustls::ServerConfig {
+            let p = rustls::crypto::aws_lc_rs::default_provider();
+            rustls::ServerConfig::builder_with_provider(p.into())
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_no_client_auth()
+                .with_single_cert(
+                    vec![CertificateDer::from_pem_slice(tls_testdata::USER1_CERT).unwrap()],
+                    PrivateKeyDer::from_pem_slice(tls_testdata::USER1_KEY).unwrap(),
+                )
+                .unwrap()
         }
     }
 }

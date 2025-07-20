@@ -1,6 +1,6 @@
 [package]
 name = "comprehensive_http"
-version = "0.1.3"
+version = "0.2.0"
 edition = "2024"
 repository = "https://github.com/vandry/comprehensive.git"
 homepage = "https://github.com/vandry/comprehensive"
@@ -18,8 +18,8 @@ axum-server = "0.7"
 clap = { version = "4.5", features = ["derive"] }
 comprehensive = { path = "../comprehensive", version = "0.7" }
 comprehensive_macros = { path = "../comprehensive_macros", version = "0.4.6" }
-comprehensive_tls = { path = "../comprehensive_tls", version = "0.2", optional = true }
-comprehensive_traits = { path = "../comprehensive_traits", version = "0.1.1", features = ["http_diag"] }
+comprehensive_tls = { path = "../comprehensive_tls", version = "0.3", optional = true }
+comprehensive_traits = { path = "../comprehensive_traits", version = "0.2.0", features = ["http_diag"] }
 futures = "0.3"
 http = "1.1"
 hyper = "1.4"
@@ -27,10 +27,9 @@ log = "0.4"
 prometheus = "0.13"
 thiserror = "2.0.12"
 tokio = { version = "1.40", features = ["macros", "rt-multi-thread", "signal"] }
-tokio-rustls = { version = "0.26", optional = true }
 
 [features]
-tls = ["axum-server/tls-rustls", "dep:comprehensive_tls", "dep:tokio-rustls"]
+tls = ["axum-server/tls-rustls", "dep:comprehensive_tls"]
 
 [dev-dependencies]
 rand = "0.8"

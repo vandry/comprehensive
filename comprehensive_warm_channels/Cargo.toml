@@ -1,6 +1,6 @@
 [package]
 name = "comprehensive_warm_channels"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 repository = "https://github.com/vandry/comprehensive.git"
 homepage = "https://github.com/vandry/comprehensive"
@@ -15,7 +15,7 @@ rustdoc-args = ["--cfg", "docsrs"]
 axum-core = "0.4"
 clap = { version = "4.5", features = ["derive"] }
 comprehensive = { path = "../comprehensive", version = "0.7" }
-comprehensive_traits = { path = "../comprehensive_traits", version = "0.1", features = ["http_diag"] }
+comprehensive_traits = { path = "../comprehensive_traits", version = "0.2.0", features = ["http_diag"] }
 http = "1.1"
 pin-project-lite = "0.2"
 tower = "0.5"

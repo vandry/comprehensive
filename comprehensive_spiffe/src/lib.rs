@@ -3,6 +3,8 @@
 
 #![warn(missing_docs)]
 
+use backoff::ExponentialBackoffBuilder;
+use backoff::backoff::Backoff;
 use comprehensive::ResourceDependencies;
 use comprehensive::v1::{AssemblyRuntime, Resource, resource};
 #[cfg(not(test))]
@@ -12,7 +14,7 @@ use comprehensive_tls::api::{
     IdentityHints, LatestValueStream, TlsConfigInstance, TlsConfigProvider,
     VerifyExpectedIdentityResult, rustls, rustls_pki_types, x509_parser,
 };
-use futures::{SinkExt, StreamExt};
+use futures::{SinkExt, Stream, StreamExt};
 use http::Uri;
 use itertools::Itertools;
 use rustls::crypto::CryptoProvider;
@@ -406,6 +408,7 @@ struct SpiffeWorkloadApiClient;
 #[cfg(not(test))]
 #[derive(GrpcClient)]
 #[defaults(grpc_client_defaults())]
+#[no_propagate_health] // Okay to lose contact with the agent.
 #[no_tls]
 struct SpiffeWorkloadApiClient(
     pb::spiffe_workload_api_client::SpiffeWorkloadApiClient<
@@ -466,6 +469,34 @@ impl std::error::Error for NotEnabled {}
 /// [`comprehensive_tls::TlsConfig`]: https://docs.rs/comprehensive_tls/latest/comprehensive_tls/struct.TlsConfig.html
 pub struct SpiffeTlsProvider(LatestValueStream);
 
+async fn handle_stream<S, E, B>(
+    mut stream: S,
+    writer: &mut comprehensive_tls::api::Writer<'_>,
+    crypto_provider: &CryptoProvider,
+    backoff: &mut B,
+) where
+    S: Stream<Item = Result<pb::X509svidResponse, E>> + Unpin,
+    E: std::error::Error,
+    B: Backoff,
+{
+    while let Some(frame) = stream.next().await {
+        match frame {
+            Ok(response) => match (response, &*crypto_provider).try_into() {
+                Ok(d) => {
+                    writer.send(Box::<SpiffeConfig>::new(d)).await.unwrap();
+                    backoff.reset();
+                }
+                Err(e) => {
+                    log::error!("X509SVIDResponse: {}", e);
+                }
+            },
+            Err(e) => {
+                log::error!("Error requesting SPIFFE X.509 SVID: {}", e);
+            }
+        }
+    }
+}
+
 #[resource]
 #[export(dyn TlsConfigProvider)]
 impl Resource for SpiffeTlsProvider {
@@ -481,29 +512,34 @@ impl Resource for SpiffeTlsProvider {
         let crypto_provider = d.crypto_provider.crypto_provider();
         let shared = Arc::new(Self(LatestValueStream::default()));
         let shared2 = Arc::clone(&shared);
+        let mut backoff = ExponentialBackoffBuilder::new()
+            .with_max_elapsed_time(None) // Never completely give up.
+            .build();
         api.set_task(async move {
             let mut writer = shared.0.writer();
-            let mut req = tonic::Request::new(pb::X509svidRequest::default());
-            let _ = req.metadata_mut().insert(
-                "workload.spiffe.io",
-                tonic::metadata::MetadataValue::from_static("true"),
-            );
-            let mut stream = client.fetch_x509svid(req).await?.into_inner();
-            while let Some(frame) = stream.next().await {
-                match frame {
-                    Ok(response) => match (response, &*crypto_provider).try_into() {
-                        Ok(d) => writer.send(Box::<SpiffeConfig>::new(d)).await.unwrap(),
-                        Err(e) => {
-                            log::error!("X509SVIDResponse: {}", e);
-                        }
-                    },
+            loop {
+                let mut req = tonic::Request::new(pb::X509svidRequest::default());
+                let _ = req.metadata_mut().insert(
+                    "workload.spiffe.io",
+                    tonic::metadata::MetadataValue::from_static("true"),
+                );
+                match client.fetch_x509svid(req).await {
+                    Ok(r) => {
+                        handle_stream(r.into_inner(), &mut writer, &*crypto_provider, &mut backoff)
+                            .await
+                    }
                     Err(e) => {
-                        log::error!("Error requesting SPIFFE X.509 SVID: {}", e);
+                        log::error!("FetchX509SVID: {:?}", e);
                     }
                 }
+                match backoff.next_backoff() {
+                    None => {
+                        break;
+                    }
+                    Some(t) => tokio::time::sleep(t).await,
+                }
             }
-            log::error!("lost stream");
-            Ok(())
+            Err("Gave up on SPIFFE (should not happen)".into())
         });
         Ok(shared2)
     }

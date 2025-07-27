@@ -25,6 +25,7 @@ prost = "0.13"
 prost-types = "0.13.5"
 rustls-webpki = "0.103.3"
 thiserror = "2.0.12"
+time = "0.3.41"
 tokio = { version = "1.40", features = ["time"] }
 tonic = "0.12"
 

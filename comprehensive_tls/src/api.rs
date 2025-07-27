@@ -104,6 +104,7 @@ use rustls_pki_types::TrustAnchor;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
+use time::OffsetDateTime;
 use x509_parser::certificate::X509Certificate;
 
 pub use rustls;
@@ -204,6 +205,13 @@ pub trait TlsConfigInstance: Send + Sync + std::fmt::Debug {
         end_entity: &X509Certificate<'_>,
         expected_identity: &Uri,
     ) -> VerifyExpectedIdentityResult;
+
+    /// Report on when the identity presented by this provider is due to
+    /// expire. This is used to emit warnings and eventually to turn the
+    /// assembly unhealthy if the current time gets too close to it.
+    fn identity_valid_until(&self) -> Option<OffsetDateTime> {
+        None
+    }
 }
 
 #[derive(Default)]

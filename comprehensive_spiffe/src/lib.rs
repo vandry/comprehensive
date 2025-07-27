@@ -25,6 +25,7 @@ use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::sync::Arc;
 use thiserror::Error;
+use time::OffsetDateTime;
 use x509_parser::certificate::X509Certificate;
 
 mod pb {
@@ -64,19 +65,19 @@ impl<'a> ConcatenatedCertificates<'a> {
     }
 }
 
-impl Iterator for ConcatenatedCertificates<'_> {
-    type Item = Result<CertificateDer<'static>, X509ParserError>;
+impl<'a> Iterator for ConcatenatedCertificates<'a> {
+    type Item = Result<(CertificateDer<'static>, X509Certificate<'a>), X509ParserError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.0.is_empty() {
             return None;
         }
         Some(match x509_parser::parse_x509_certificate(self.0) {
-            Ok((rest, _)) => {
+            Ok((rest, parsed)) => {
                 let der_len = self.0.len() - rest.len();
                 let cert = self.0[..der_len].to_vec().into();
                 self.0 = rest;
-                Ok(cert)
+                Ok((cert, parsed))
             }
             Err(e) => {
                 self.0 = b"";
@@ -107,7 +108,7 @@ impl<R: AsRef<[u8]>> TryFrom<(String, R)> for SvidBundle {
             return Err(SpiffeError::WrongScheme(uri_s));
         }
         let roots = ConcatenatedCertificates::new(roots_b.as_ref())
-            .map(|c| Ok(webpki::anchor_from_trusted_cert(&c?)?.to_owned()))
+            .map(|c| Ok(webpki::anchor_from_trusted_cert(&c?.0)?.to_owned()))
             .collect::<Result<RootCertStore, SpiffeError>>()?;
         Ok(SvidBundle {
             id,
@@ -121,6 +122,7 @@ impl<R: AsRef<[u8]>> TryFrom<(String, R)> for SvidBundle {
 struct SingleSvid {
     bundle: SvidBundle,
     certified_key: Arc<CertifiedKey>,
+    soonest_expiration: Option<OffsetDateTime>,
 }
 
 impl TryFrom<(pb::X509svid, &'_ CryptoProvider)> for SingleSvid {
@@ -135,12 +137,25 @@ impl TryFrom<(pb::X509svid, &'_ CryptoProvider)> for SingleSvid {
                 .try_into()
                 .map_err(SpiffeError::KeyError)?,
         )?;
-        let cert = ConcatenatedCertificates::new(&svid.x509_svid).collect::<Result<Vec<_>, _>>()?;
+        let mut soonest_expiration = None;
+        let cert = ConcatenatedCertificates::new(&svid.x509_svid)
+            .map_ok(|(c, parsed)| {
+                let this_expiration = parsed.validity().not_after.to_datetime();
+                if soonest_expiration
+                    .map(|e| this_expiration < e)
+                    .unwrap_or(true)
+                {
+                    soonest_expiration = Some(this_expiration);
+                }
+                c
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let certified_key = CertifiedKey::new(cert, private_key);
         certified_key.keys_match()?;
         Ok(SingleSvid {
             certified_key: certified_key.into(),
             bundle,
+            soonest_expiration,
         })
     }
 }
@@ -158,6 +173,7 @@ struct SpiffeConfig {
     domain_index: HashMap<String, SvidReference>,
     root_index: HashMap<Vec<u8>, SvidReference>,
     uri_index: HashMap<Uri, SvidReference>,
+    soonest_expiration: Option<OffsetDateTime>,
 }
 
 impl SpiffeConfig {
@@ -283,6 +299,10 @@ impl TlsConfigInstance for SpiffeConfig {
         }
         VerifyExpectedIdentityResult::No
     }
+
+    fn identity_valid_until(&self) -> Option<OffsetDateTime> {
+        self.soonest_expiration
+    }
 }
 
 impl TryFrom<(pb::X509svidResponse, &'_ CryptoProvider)> for SpiffeConfig {
@@ -305,6 +325,10 @@ impl TryFrom<(pb::X509svidResponse, &'_ CryptoProvider)> for SpiffeConfig {
             domain_index: HashMap::new(),
             root_index: HashMap::new(),
             uri_index: HashMap::new(),
+            soonest_expiration: svids
+                .iter()
+                .filter_map(|svid| svid.soonest_expiration)
+                .min(),
             svids,
             federated,
         };
@@ -481,7 +505,7 @@ async fn handle_stream<S, E, B>(
 {
     while let Some(frame) = stream.next().await {
         match frame {
-            Ok(response) => match (response, &*crypto_provider).try_into() {
+            Ok(response) => match (response, crypto_provider).try_into() {
                 Ok(d) => {
                     writer.send(Box::<SpiffeConfig>::new(d)).await.unwrap();
                     backoff.reset();
@@ -525,7 +549,7 @@ impl Resource for SpiffeTlsProvider {
                 );
                 match client.fetch_x509svid(req).await {
                     Ok(r) => {
-                        handle_stream(r.into_inner(), &mut writer, &*crypto_provider, &mut backoff)
+                        handle_stream(r.into_inner(), &mut writer, &crypto_provider, &mut backoff)
                             .await
                     }
                     Err(e) => {
@@ -835,5 +859,13 @@ mod tests {
             config.verify_expected_identity(&cert, &uri),
             VerifyExpectedIdentityResult::No
         ));
+    }
+
+    #[test]
+    fn expiration() {
+        assert_eq!(
+            test_config().identity_valid_until().expect("expiration"),
+            OffsetDateTime::from_unix_timestamp(1753124458).unwrap(),
+        );
     }
 }

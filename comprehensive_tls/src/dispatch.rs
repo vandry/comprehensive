@@ -29,12 +29,12 @@
 //! ```
 
 use arc_swap::ArcSwapOption;
-use atomic_take::AtomicTake;
-use comprehensive::ResourceDependencies;
-use comprehensive::health::HealthReporter;
+use comprehensive::health::{HealthReporter, HealthSignaller};
 use comprehensive::v1::{AssemblyRuntime, Resource, resource};
-use futures::{FutureExt, StreamExt};
+use comprehensive::{ComprehensiveError, ResourceDependencies};
+use futures::{FutureExt, Stream, StreamExt};
 use http::Uri;
+use pin_project_lite::pin_project;
 use rustls::client::danger::{ServerCertVerified, ServerCertVerifier};
 use rustls::client::{
     ClientConfig, ResolvesClientCert, verify_server_cert_signed_by_trust_anchor, verify_server_name,
@@ -49,16 +49,22 @@ use rustls::server::{
 };
 use rustls::sign::CertifiedKey;
 use rustls::{CertificateError, ConfigBuilder, DistinguishedName, RootCertStore};
-use std::sync::Arc;
+use slice_dst::SliceWithHeader;
+use std::pin::{Pin, pin};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
+use std::time::SystemTime;
 use thiserror::Error;
+use time::OffsetDateTime;
 use x509_parser::certificate::X509Certificate;
 use x509_parser::prelude::FromDer;
 
 use crate::api::{
     IdentityHints, TlsConfigInstance, TlsConfigProvider, VerifyExpectedIdentityResult, rustls,
 };
+
+const UNHEALTHY_TTL_THRESHOLD: time::Duration = time::Duration::seconds(30);
 
 /// Error type returned by comprehensive_tls functions
 #[derive(Debug, Error)]
@@ -73,14 +79,279 @@ pub enum ComprehensiveTlsError {
     NoTlsProvider,
     /// Health signal registration error.
     #[error("{0}")]
-    ComprehensiveError(#[from] comprehensive::ComprehensiveError),
+    ComprehensiveError(#[from] ComprehensiveError),
+}
+
+trait Clock {
+    fn now(&self) -> SystemTime;
+}
+
+#[cfg(test)]
+mod clock {
+    use std::sync::Arc;
+    use std::time::SystemTime;
+
+    pub(super) struct Clock(tokio::time::Instant);
+
+    impl super::Clock for Arc<Clock> {
+        fn now(&self) -> SystemTime {
+            SystemTime::UNIX_EPOCH + self.0.elapsed()
+        }
+    }
+
+    #[comprehensive::v1::resource]
+    impl comprehensive::v1::Resource for Clock {
+        fn new(
+            _: comprehensive::NoDependencies,
+            _: comprehensive::NoArgs,
+            _: &mut comprehensive::v1::AssemblyRuntime<'_>,
+        ) -> Result<Arc<Self>, std::convert::Infallible> {
+            Ok(Arc::new(Self(tokio::time::Instant::now())))
+        }
+    }
+}
+
+#[cfg(not(test))]
+mod clock {
+    use std::time::SystemTime;
+
+    pub(super) struct Clock;
+
+    impl super::Clock for Clock {
+        fn now(&self) -> SystemTime {
+            SystemTime::now()
+        }
+    }
+}
+
+/// Healthy is defined as any_config_received and dangerous_close_to_expiry == 0
+struct HealthManager {
+    signaller: Option<HealthSignaller>,
+    // 0: no config ever received: unhealthy
+    // 1: config received, none dangerous_close_to_expiry
+    // more: config received, at least one dangerous_close_to_expiry
+    dangerous_close_to_expiry_plus_any_config_received: AtomicUsize,
+}
+
+impl std::fmt::Debug for HealthManager {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
+        write!(f, "HealthManager {{ ... }}")
+    }
+}
+
+impl HealthManager {
+    fn new(reporter: &Arc<HealthReporter>) -> Self {
+        Self {
+            signaller: reporter.register("TlsConfig").ok(),
+            dangerous_close_to_expiry_plus_any_config_received: AtomicUsize::new(0),
+        }
+    }
+
+    fn first_report(&self, healthy: bool) {
+        let mut old = self
+            .dangerous_close_to_expiry_plus_any_config_received
+            .load(Ordering::Acquire);
+        if let Some(new_health) = loop {
+            let (new, update) = if old == 0 {
+                // Nobody has reported before.
+                if healthy { (1, Some(true)) } else { (2, None) }
+            } else if healthy {
+                // If old == 1: Nothing to do: still healthy.
+                // If old > 1: Nothing to do: another provider keeps us unhealthy.
+                return;
+            } else {
+                // One more unhealthy provider, update if we're the first.
+                (old + 1, if old == 1 { Some(false) } else { None })
+            };
+            match self
+                .dangerous_close_to_expiry_plus_any_config_received
+                .compare_exchange_weak(old, new, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => {
+                    break update;
+                }
+                Err(updated_old) => {
+                    old = updated_old;
+                }
+            }
+        } {
+            if let Some(s) = &self.signaller {
+                s.set_healthy(new_health);
+            }
+        }
+    }
+
+    fn update(&self, old: bool, new: bool) {
+        if old == new {
+            return;
+        }
+        if new {
+            if self
+                .dangerous_close_to_expiry_plus_any_config_received
+                .fetch_sub(1, Ordering::AcqRel)
+                == 2
+            {
+                if let Some(s) = &self.signaller {
+                    s.set_healthy(true);
+                }
+            }
+        } else if self
+            .dangerous_close_to_expiry_plus_any_config_received
+            .fetch_add(1, Ordering::AcqRel)
+            == 1
+        {
+            if let Some(s) = &self.signaller {
+                s.set_healthy(false);
+            }
+        }
+    }
+}
+
+struct SingleProviderHealthTrackerInner {
+    healthy: bool,
+    expiry: Option<OffsetDateTime>,
+}
+
+struct SingleProviderHealthTracker<C>(Option<SingleProviderHealthTrackerInner>, C);
+
+pin_project! {
+    struct SingleProviderHealthTrackerStream<'a, S, C> {
+        #[pin] inner: S,
+        tracker: SingleProviderHealthTracker<C>,
+        health: &'a HealthManager,
+        #[pin] sleeper: Option<tokio::time::Sleep>,
+    }
+}
+
+fn should_be_healthy<C>(expiry: OffsetDateTime, clock: &C) -> Option<time::Duration>
+where
+    C: Clock,
+{
+    let ttl = expiry - clock.now();
+    if ttl < UNHEALTHY_TTL_THRESHOLD {
+        log::warn!(
+            "TLS identity valid until {} is already expired or very close to expiry",
+            expiry
+        );
+        None
+    } else {
+        Some(ttl)
+    }
+}
+
+impl<C: Clock> SingleProviderHealthTracker<C> {
+    fn new(clock: C) -> Self {
+        Self(None, clock)
+    }
+
+    fn configure(&mut self, health: &HealthManager, contents: &dyn TlsConfigInstance) {
+        let expiry = contents.identity_valid_until();
+        let healthy = expiry
+            .map(|e| should_be_healthy(e, &self.1).is_some())
+            .unwrap_or(true);
+        match self
+            .0
+            .replace(SingleProviderHealthTrackerInner { healthy, expiry })
+        {
+            None => health.first_report(healthy),
+            Some(previous) => {
+                if healthy && !previous.healthy {
+                    log::info!("TLS identity is no longer in danger of expiry");
+                }
+                health.update(previous.healthy, healthy);
+            }
+        }
+    }
+
+    fn mksleep(&mut self, health: &HealthManager) -> Option<tokio::time::Sleep> {
+        let Some(inner) = &mut self.0 else {
+            return None; // will not change until initial config received
+        };
+        match inner {
+            SingleProviderHealthTrackerInner {
+                healthy: false,
+                expiry: _,
+            } => None, // already unhealthy
+            SingleProviderHealthTrackerInner {
+                healthy: _,
+                expiry: None,
+            } => None, // cannot become unhealthy
+            SingleProviderHealthTrackerInner {
+                healthy: true,
+                expiry: Some(e),
+            } => match should_be_healthy(*e, &self.1) {
+                None => {
+                    health.update(true, false);
+                    inner.healthy = false;
+                    None
+                }
+                Some(ttl) => ttl.try_into().ok().map(tokio::time::sleep),
+            },
+        }
+    }
+
+    fn stream<S>(
+        mut self,
+        inner: S,
+        health: &HealthManager,
+    ) -> SingleProviderHealthTrackerStream<S, C> {
+        SingleProviderHealthTrackerStream {
+            sleeper: self.mksleep(health),
+            inner,
+            tracker: self,
+            health,
+        }
+    }
+}
+
+impl<S, I, C> Stream for SingleProviderHealthTrackerStream<'_, S, C>
+where
+    S: Stream<Item = I>,
+    I: AsRef<dyn TlsConfigInstance>,
+    C: Clock,
+{
+    type Item = I;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<I>> {
+        let mut this = self.project();
+        loop {
+            if let Some(sleeper) = this.sleeper.as_mut().as_pin_mut() {
+                if sleeper.poll(cx).is_ready() {
+                    this.sleeper.set(this.tracker.mksleep(this.health));
+                    continue;
+                }
+            }
+            let r = this.inner.poll_next(cx);
+            if let Poll::Ready(Some(x)) = &r {
+                this.tracker.configure(this.health, x.as_ref());
+                this.sleeper.set(this.tracker.mksleep(this.health));
+            }
+            break r;
+        }
+    }
 }
 
 #[derive(Debug)]
-struct TlsConfigInner {
-    reloadable: Vec<ArcSwapOption<Box<dyn TlsConfigInstance>>>,
+struct TlsConfigInnerHeader {
     crypto_provider: Arc<CryptoProvider>,
+    health: OnceLock<HealthManager>,
 }
+
+impl TlsConfigInnerHeader {
+    fn init_health(&self, reporter: &'_ mut Option<Arc<HealthReporter>>) -> &HealthManager {
+        match reporter.take() {
+            Some(h) => self.health.get_or_init(move || HealthManager::new(&h)),
+            None => self.health.get().unwrap(),
+        }
+    }
+
+    fn get_health(&self) -> &HealthManager {
+        self.health.get().unwrap()
+    }
+}
+
+type TlsConfigInner =
+    SliceWithHeader<TlsConfigInnerHeader, ArcSwapOption<Box<dyn TlsConfigInstance>>>;
 
 /// Comprenehsive [`Resource`] for loading a TLS key and certificate.
 ///
@@ -108,6 +379,8 @@ pub struct TlsConfigDependencies {
     crypto_provider: Arc<crate::crypto_provider::RustlsCryptoProvider>,
     #[cfg(feature = "files")]
     _default_built_in_provider: std::marker::PhantomData<crate::files::TlsConfigFiles>,
+    #[cfg(test)]
+    clock: Arc<clock::Clock>,
 }
 
 fn setup(
@@ -115,10 +388,24 @@ fn setup(
     api: &mut AssemblyRuntime<'_>,
     crypto_provider: &Arc<CryptoProvider>,
 ) -> Result<Arc<TlsConfigInner>, ComprehensiveTlsError> {
-    let (providers, reloadable): (Vec<_>, Vec<_>) = d
+    let inner: Arc<TlsConfigInner> = SliceWithHeader::new(
+        TlsConfigInnerHeader {
+            crypto_provider: Arc::clone(crypto_provider),
+            health: OnceLock::new(),
+        },
+        std::iter::repeat_n((), d.providers.len()).map(|_| ArcSwapOption::empty()),
+    );
+    let mut health = Some(d.health);
+    let mut p = d
         .providers
         .into_iter()
-        .filter_map(|provider| {
+        .enumerate()
+        .filter_map(|(i, provider)| {
+            #[cfg(not(test))]
+            let clock = clock::Clock;
+            #[cfg(test)]
+            let clock = Arc::clone(&d.clock);
+            let mut tracker = SingleProviderHealthTracker::new(clock);
             // If the provider has already supplied as initial value, get it now.
             // That is more efficient and potentially less confusing than starting
             // out with empty config and filling it in later. Providers that have
@@ -129,44 +416,31 @@ fn setup(
                 .poll_next_unpin(&mut Context::from_waker(std::task::Waker::noop()));
             match first_delivery {
                 Poll::Ready(Some(snapshot)) => {
-                    Some((provider, ArcSwapOption::from_pointee(snapshot)))
+                    tracker.configure(inner.header.init_health(&mut health), &*snapshot);
+                    inner.slice[i].store(Some(Arc::new(snapshot)));
                 }
                 Poll::Ready(None) => {
                     log::error!("TlsConfig: provider delivered a 0-length stream");
-                    None
+                    return None;
                 }
-                Poll::Pending => Some((provider, ArcSwapOption::empty())),
+                Poll::Pending => {
+                    inner.header.init_health(&mut health);
+                }
             }
+            let inner_for_updating = Arc::clone(&inner);
+            Some(async move {
+                let mut update_stream =
+                    pin!(tracker.stream(provider.stream(), inner_for_updating.header.get_health()));
+                while let Some(update) = update_stream.next().await {
+                    inner_for_updating.slice[i].store(Some(Arc::new(update)));
+                }
+            })
         })
-        .unzip();
-    if reloadable.is_empty() {
+        .peekable();
+    if p.peek().is_none() {
         return Err(ComprehensiveTlsError::NoTlsProvider);
     };
-    let health = if reloadable.iter().any(|p| p.load().is_some()) {
-        None // We are already healthy.
-    } else {
-        // None of the providers gave us settings immediately.
-        Some(Arc::new(AtomicTake::new(d.health.register("TlsConfig")?)))
-    };
-    let inner = Arc::new(TlsConfigInner {
-        reloadable,
-        crypto_provider: Arc::clone(crypto_provider),
-    });
-    let updater =
-        futures::future::join_all(providers.into_iter().enumerate().map(|(i, provider)| {
-            let inner_for_updating = Arc::clone(&inner);
-            let mut health_for_updating = health.as_ref().cloned();
-            async move {
-                let mut update_stream = provider.stream();
-                while let Some(update) = update_stream.next().await {
-                    inner_for_updating.reloadable[i].store(Some(Arc::new(update)));
-                    if let Some(h) = health_for_updating.take().and_then(|h| h.take()) {
-                        h.set_healthy(true);
-                    }
-                }
-            }
-        }));
-    api.set_task(updater.map(|_| Ok(())));
+    api.set_task(futures::future::join_all(p).map(|_| Ok(())));
     Ok(inner)
 }
 
@@ -220,36 +494,35 @@ impl RootHintsSubjetsHolder {
     }
 }
 
-impl TlsConfigInner {
-    fn root_hint_subjects_common<'a>(
-        &self,
-        holder: &'a RootHintsSubjetsHolder,
-        local: Option<&Uri>,
-        remote: Option<&Uri>,
-    ) -> Option<&'a [DistinguishedName]> {
-        self.reloadable
-            .iter()
-            .filter_map(|c| {
+fn root_hint_subjects_common<'a>(
+    inner: &TlsConfigInner,
+    holder: &'a RootHintsSubjetsHolder,
+    local: Option<&Uri>,
+    remote: Option<&Uri>,
+) -> Option<&'a [DistinguishedName]> {
+    inner
+        .slice
+        .iter()
+        .filter_map(|c| {
+            c.load()
+                .as_ref()
+                .and_then(|c| c.choose_root_hint_subjects(local, remote))
+        })
+        .next()
+        .map(|l| holder.intern(l))
+}
+
+fn resolve_common(inner: &TlsConfigInner, hints: &IdentityHints) -> Option<Arc<CertifiedKey>> {
+    [false, true]
+        .into_iter()
+        .flat_map(|try_harder| {
+            inner.slice.iter().filter_map(move |c| {
                 c.load()
                     .as_ref()
-                    .and_then(|c| c.choose_root_hint_subjects(local, remote))
+                    .and_then(|c| c.select_identity(try_harder, hints))
             })
-            .next()
-            .map(|l| holder.intern(l))
-    }
-
-    fn resolve_common(&self, hints: &IdentityHints) -> Option<Arc<CertifiedKey>> {
-        [false, true]
-            .into_iter()
-            .flat_map(|try_harder| {
-                self.reloadable.iter().filter_map(move |c| {
-                    c.load()
-                        .as_ref()
-                        .and_then(|c| c.select_identity(try_harder, hints))
-                })
-            })
-            .next()
-    }
+        })
+        .next()
 }
 
 #[derive(Debug)]
@@ -276,11 +549,11 @@ impl ResolvesClientCert for ClientConfigBackend {
             root_hint_subjects: Some(&dns),
             requested: self.client_identity_hint.as_ref(),
         };
-        self.inner.resolve_common(&hints)
+        resolve_common(&self.inner, &hints)
     }
 
     fn has_certs(&self) -> bool {
-        self.inner.reloadable.iter().any(|c| {
+        self.inner.slice.iter().any(|c| {
             c.load()
                 .as_ref()
                 .map(|c| c.has_any_identity())
@@ -349,7 +622,7 @@ impl ServerCertVerifier for ClientConfigBackend {
         [false, true]
             .into_iter()
             .flat_map(|try_harder| {
-                self.inner.reloadable.iter().filter_map(move |c| {
+                self.inner.slice.iter().filter_map(move |c| {
                     c.load().as_ref().and_then(|c| {
                         c.trust_anchors_for_cert(try_harder, r_end_entity, r_intermediates)
                             .and_then(|roots| {
@@ -418,13 +691,15 @@ impl ServerCertVerifier for ClientConfigBackend {
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
         self.inner
+            .header
             .crypto_provider
             .signature_verification_algorithms
             .supported_schemes()
     }
 
     fn root_hint_subjects(&self) -> Option<&[DistinguishedName]> {
-        self.inner.root_hint_subjects_common(
+        root_hint_subjects_common(
+            &self.inner,
             &self.chosen_root_hint_subjects,
             self.client_identity_hint.as_ref(),
             Some(&self.server_identity),
@@ -448,14 +723,13 @@ impl ResolvesServerCert for ServerConfigBackend {
             root_hint_subjects,
             requested: None,
         };
-        self.inner.resolve_common(&hints)
+        resolve_common(&self.inner, &hints)
     }
 }
 
 impl ClientCertVerifier for ServerConfigBackend {
     fn root_hint_subjects(&self) -> &[DistinguishedName] {
-        self.inner
-            .root_hint_subjects_common(&self.chosen_root_hint_subjects, None, None)
+        root_hint_subjects_common(&self.inner, &self.chosen_root_hint_subjects, None, None)
             .unwrap_or_default()
     }
 
@@ -480,7 +754,7 @@ impl ClientCertVerifier for ServerConfigBackend {
         [false, true]
             .into_iter()
             .flat_map(|try_harder| {
-                self.inner.reloadable.iter().filter_map(move |c| {
+                self.inner.slice.iter().filter_map(move |c| {
                     c.load().as_ref().and_then(|c| {
                         c.trust_anchors_for_cert(try_harder, r_end_entity, r_intermediates)
                             .and_then(|roots| {
@@ -488,7 +762,7 @@ impl ClientCertVerifier for ServerConfigBackend {
                                     Arc::new(RootCertStore {
                                         roots: roots.to_vec(),
                                     }),
-                                    Arc::clone(&self.inner.crypto_provider),
+                                    Arc::clone(&self.inner.header.crypto_provider),
                                 )
                                 .build()
                                 .ok()
@@ -533,6 +807,7 @@ impl ClientCertVerifier for ServerConfigBackend {
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
         self.inner
+            .header
             .crypto_provider
             .signature_verification_algorithms
             .supported_schemes()
@@ -586,7 +861,11 @@ impl TlsConfig {
             inner: Arc::clone(&self.inner),
             server_identity,
             client_identity_hint,
-            supported_algs: self.inner.crypto_provider.signature_verification_algorithms,
+            supported_algs: self
+                .inner
+                .header
+                .crypto_provider
+                .signature_verification_algorithms,
             chosen_root_hint_subjects: RootHintsSubjetsHolder::default(),
         }
     }
@@ -621,7 +900,11 @@ impl TlsConfig {
     fn server_config_backend(&self) -> ServerConfigBackend {
         ServerConfigBackend {
             inner: Arc::clone(&self.inner),
-            supported_algs: self.inner.crypto_provider.signature_verification_algorithms,
+            supported_algs: self
+                .inner
+                .header
+                .crypto_provider
+                .signature_verification_algorithms,
             chosen_root_hint_subjects: RootHintsSubjetsHolder::default(),
         }
     }
@@ -1643,5 +1926,108 @@ mod tests {
                 Action::RootHintSubjects,
             ]
         );
+    }
+
+    #[derive(Debug)]
+    struct ExpiringInstance(Option<OffsetDateTime>);
+
+    impl ExpiringInstance {
+        fn new(secs: i64) -> Box<Self> {
+            Box::new(Self(Some(
+                OffsetDateTime::from_unix_timestamp(secs).unwrap(),
+            )))
+        }
+    }
+
+    impl TlsConfigInstance for ExpiringInstance {
+        fn has_any_identity(&self) -> bool {
+            true
+        }
+
+        fn select_identity(
+            &self,
+            _try_harder: bool,
+            _hints: &IdentityHints<'_>,
+        ) -> Option<Arc<CertifiedKey>> {
+            None
+        }
+
+        fn choose_root_hint_subjects(
+            &self,
+            _local_identity: Option<&Uri>,
+            _remote_identity: Option<&Uri>,
+        ) -> Option<Arc<[DistinguishedName]>> {
+            None
+        }
+
+        fn trust_anchors_for_cert(
+            &self,
+            _try_harder: bool,
+            _end_entity: &X509Certificate<'_>,
+            _intermediates: &[X509Certificate<'_>],
+        ) -> Option<Arc<[TrustAnchor<'static>]>> {
+            None
+        }
+
+        fn verify_expected_identity(
+            &self,
+            _end_entity: &X509Certificate<'_>,
+            _expected_identity: &Uri,
+        ) -> VerifyExpectedIdentityResult {
+            VerifyExpectedIdentityResult::No
+        }
+
+        fn identity_valid_until(&self) -> Option<OffsetDateTime> {
+            self.0
+        }
+    }
+
+    #[derive(ResourceDependencies)]
+    struct ExpiryTopDependencies {
+        _dispatcher: Arc<TlsConfig>,
+        provider: Arc<TestTlsConfig>,
+        health: Arc<HealthReporter>,
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn alive_on_arrival_then_expires_then_renewed() {
+        let argv: Vec<std::ffi::OsString> = vec!["cmd".into(), "--delayed".into()];
+        let a = Assembly::<ExpiryTopDependencies>::new_from_argv(argv).unwrap();
+        let provider = Arc::clone(&a.top.provider);
+        let mut writer = provider.0.writer();
+        tokio::time::advance(Duration::new(1001, 0)).await;
+        let health = Arc::clone(&a.top.health);
+        let mut r = pin!(a.run_with_termination_signal(futures::stream::pending()));
+        assert!(poll!(&mut r).is_pending());
+        assert!(!health.is_healthy());
+
+        let _ = futures::future::select(&mut r, writer.send(ExpiringInstance::new(2000))).await;
+        assert!(poll!(&mut r).is_pending());
+        assert!(health.is_healthy());
+
+        tokio::time::advance(Duration::new(1000, 0)).await;
+        assert!(poll!(&mut r).is_pending());
+        assert!(!health.is_healthy());
+
+        let _ = futures::future::select(&mut r, writer.send(ExpiringInstance::new(3000))).await;
+        assert!(poll!(&mut r).is_pending());
+        assert!(health.is_healthy());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dead_on_arrival() {
+        let argv: Vec<std::ffi::OsString> = vec!["cmd".into(), "--delayed".into()];
+        let a = Assembly::<ExpiryTopDependencies>::new_from_argv(argv).unwrap();
+        let provider = Arc::clone(&a.top.provider);
+        let mut writer = provider.0.writer();
+        tokio::time::advance(Duration::new(1001, 0)).await;
+        let health = Arc::clone(&a.top.health);
+        let mut r = pin!(a.run_with_termination_signal(futures::stream::pending()));
+        assert!(poll!(&mut r).is_pending());
+        assert!(!health.is_healthy());
+
+        let _ = futures::future::select(&mut r, writer.send(ExpiringInstance::new(1000))).await;
+        assert!(poll!(&mut r).is_pending());
+        assert!(!health.is_healthy());
     }
 }

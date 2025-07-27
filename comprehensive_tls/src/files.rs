@@ -25,6 +25,7 @@ use std::sync::Arc;
 use std::task::Context;
 use std::time::SystemTime;
 use thiserror::Error;
+use time::OffsetDateTime;
 use x509_parser::prelude::{FromDer, GeneralName, X509Certificate};
 
 use crate::api::{
@@ -78,6 +79,7 @@ struct Snapshot {
     certified_key: Arc<CertifiedKey>,
     cacert: Option<Arc<[TrustAnchor<'static>]>>,
     names: HashSet<Uri>,
+    soonest_expiration: Option<OffsetDateTime>,
 }
 
 impl Snapshot {
@@ -153,6 +155,10 @@ impl TlsConfigInstance for Snapshot {
     ) -> VerifyExpectedIdentityResult {
         VerifyExpectedIdentityResult::UseWebpki
     }
+
+    fn identity_valid_until(&self) -> Option<OffsetDateTime> {
+        self.soonest_expiration
+    }
 }
 
 fn reload_sentinel(md: std::io::Result<std::fs::Metadata>) -> Option<(u64, SystemTime)> {
@@ -204,26 +210,34 @@ impl Loader {
         let cert =
             rustls_pemfile::certs(&mut Cursor::new(&cert_pem)).collect::<Result<Vec<_>, _>>()?;
 
-        let names = cert
-            .first()
-            .and_then(|end_entity| X509Certificate::from_der(end_entity).ok())
-            .map(|(_, end_entity)| {
-                end_entity
-                    .subject_alternative_name()
-                    .ok()
-                    .flatten()
-                    .map(|ext| ext.value.general_names.iter())
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|san| match san {
-                        GeneralName::URI(s) => s.parse::<Uri>().ok(),
-                        GeneralName::DNSName(s) => inet_name_to_uri(s),
-                        _ => None,
-                    })
-                    .collect::<HashSet<_>>()
+        let mut parsed = cert
+            .iter()
+            .map(|c| X509Certificate::from_der(c).ok())
+            .peekable();
+        let names = parsed
+            .peek()
+            .and_then(|r| {
+                r.as_ref().map(|(_, end_entity)| {
+                    end_entity
+                        .subject_alternative_name()
+                        .ok()
+                        .flatten()
+                        .map(|ext| ext.value.general_names.iter())
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|san| match san {
+                            GeneralName::URI(s) => s.parse::<Uri>().ok(),
+                            GeneralName::DNSName(s) => inet_name_to_uri(s),
+                            _ => None,
+                        })
+                        .collect::<HashSet<_>>()
+                })
             })
             .unwrap_or_default();
         log::info!("Loaded identity with names {:?}", names);
+        let soonest_expiration = parsed
+            .filter_map(|r| r.map(|(_, c)| c.validity().not_after.to_datetime()))
+            .min();
 
         let (cacert, cacert_sentinel) = if let Some(ref path) = self.cacert_path {
             let mut cert_file = File::open(path)?;
@@ -253,6 +267,7 @@ impl Loader {
             certified_key: certified_key.into(),
             cacert,
             names,
+            soonest_expiration,
         }))
     }
 
@@ -560,6 +575,14 @@ mod tests {
             user1_snapshot()
                 .maybe_get_identity(false, Some(&Uri::from_static("https://user1/")), None)
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn expiration() {
+        assert_eq!(
+            user1_snapshot().identity_valid_until().expect("expiration"),
+            OffsetDateTime::from_unix_timestamp(3305274779).unwrap(),
         );
     }
 }

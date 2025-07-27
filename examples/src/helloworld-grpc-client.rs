@@ -21,7 +21,10 @@ struct GreeterInALoopArgs {
 }
 
 #[derive(ResourceDependencies)]
-struct GreeterInALoopDependencies(Arc<Client>);
+struct GreeterInALoopDependencies {
+    client: Arc<Client>,
+    _spiffe: std::marker::PhantomData<comprehensive_spiffe::SpiffeTlsProvider>,
+}
 
 #[resource]
 impl Resource for GreeterInALoop {
@@ -30,7 +33,7 @@ impl Resource for GreeterInALoop {
         a: GreeterInALoopArgs,
         api: &mut AssemblyRuntime<'_>,
     ) -> Result<Arc<Self>, std::convert::Infallible> {
-        let mut client = d.0.client();
+        let mut client = d.client.client();
         api.set_task(async move {
             loop {
                 println!("{:?}", client.greet(tonic::Request::new(())).await);

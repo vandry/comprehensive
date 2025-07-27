@@ -51,6 +51,8 @@ struct TopDependencies {
     _test_service: PhantomData<TestService>,
     // Serves metrics!
     _diag: Arc<comprehensive_http::diag::HttpServer>,
+    // Make SPIFFE available as an option for configuring TLS.
+    _spiffe: std::marker::PhantomData<comprehensive_spiffe::SpiffeTlsProvider>,
 }
 
 #[tokio::main]

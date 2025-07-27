@@ -22,8 +22,11 @@ comprehensive_traits = { path = "../comprehensive_traits", version = "0.2.0", op
 futures = "0.3"
 html-escape = { version = "0.2.13", optional = true }
 http = "1.3.1"
+lazy_static = { version = "1.5", optional = true }
 log = "0.4"
+num = { version = "0.4.3", optional = true, default-features = false }
 pin-project-lite = { version = "0.2", optional = true }
+prometheus = { version = "0.13", optional = true }
 rustls = "0.23"
 rustls-pemfile = { version = "2.1", optional = true }
 rustls-pki-types = "1.12"
@@ -37,10 +40,11 @@ tower-service = {version = "0.3", optional = true }
 x509-parser = "0.17.0"
 
 [features]
-default = ["diag", "dispatch", "files"]
+default = ["diag", "dispatch", "files", "metrics"]
 diag = ["comprehensive_traits/http_diag", "dep:async-stream", "dep:axum-core", "dep:clap", "dep:comprehensive_traits", "dep:tower", "dep:tower-service", "dispatch"]
 dispatch = ["dep:arc-swap", "dep:boxcar", "dep:clap", "dep:pin-project-lite", "dep:slice-dst", "dep:thiserror"]
 files = ["dep:async-stream", "dep:clap", "dep:html-escape", "dep:rustls-pemfile", "dep:rustls-webpki", "dep:thiserror", "dep:tokio"]
+metrics = ["dep:lazy_static", "dep:num", "dep:prometheus"]
 
 [dev-dependencies]
 futures = "0.3"

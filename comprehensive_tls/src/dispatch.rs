@@ -386,6 +386,33 @@ pub struct TlsConfigDependencies {
     clock: Arc<clock::Clock>,
 }
 
+#[cfg(feature = "metrics")]
+mod metrics {
+    use lazy_static::lazy_static;
+    use num::NumCast;
+    use prometheus::register_gauge;
+
+    lazy_static! {
+        static ref TLS_CERTIFICATE_EXPIRATION: prometheus::Gauge = register_gauge!(
+            "tls_certificate_valid_until",
+            "Earliest expiration time of a configured TLS certificate",
+        )
+        .unwrap();
+    }
+
+    pub(super) fn update(inner: &super::TlsConfigInner) {
+        TLS_CERTIFICATE_EXPIRATION.set(
+            inner
+                .slice
+                .iter()
+                .filter_map(|c| c.load().as_ref().and_then(|i| i.identity_valid_until()))
+                .min()
+                .and_then(|exp| <f64 as NumCast>::from(exp.unix_timestamp()))
+                .unwrap_or_default(),
+        )
+    }
+}
+
 fn setup(
     d: TlsConfigDependencies,
     api: &mut AssemblyRuntime<'_>,
@@ -430,12 +457,16 @@ fn setup(
                     inner.header.init_health(&mut health);
                 }
             }
+            #[cfg(feature = "metrics")]
+            metrics::update(&inner);
             let inner_for_updating = Arc::clone(&inner);
             Some(async move {
                 let mut update_stream =
                     pin!(tracker.stream(provider.stream(), inner_for_updating.header.get_health()));
                 while let Some(update) = update_stream.next().await {
                     inner_for_updating.slice[i].store(Some(Arc::new(update)));
+                    #[cfg(feature = "metrics")]
+                    metrics::update(&inner_for_updating);
                 }
             })
         })

@@ -19,17 +19,15 @@ use tower_service::Service;
 
 use crate::dispatch::TlsConfig;
 
+const HEADER: &str = r#"
+    <html><head>
+        <title>Debug: TLS configuration</title>
+    </head>
+    <body><h2><a href="https://docs.rs/comprehensive_tls/latest/comprehensive_tls/">TLS configuration</a>"#;
+
 fn respond(tlsc: Arc<TlsConfig>) -> impl Stream<Item = Result<String, Infallible>> {
     stream! {
-        yield Ok(format!(
-            r#"
-                <html><head>
-                    <title>Debug: TLS configuration</title>
-                </head>
-                <body><h2><a href="https://docs.rs/comprehensive_tls/latest/comprehensive_tls/">TLS configuration</a> available from {} providers</h2>
-                <ul>
-            "#, tlsc.count_for_diag(),
-        ));
+        yield Ok(format!("{} available from {} providers</h2><ul>", HEADER, tlsc.count_for_diag()));
         for x in tlsc.iter_for_diag() {
             yield Ok(x);
         }
@@ -37,27 +35,37 @@ fn respond(tlsc: Arc<TlsConfig>) -> impl Stream<Item = Result<String, Infallible
     }
 }
 
-struct DiagServiceFuture(Option<Arc<TlsConfig>>);
+enum DiagServiceFuture {
+    WrongPath,
+    NotConfigured,
+    Normal(Arc<TlsConfig>),
+}
 
 impl Future for DiagServiceFuture {
     type Output = Result<http::Response<axum_core::body::Body>, Infallible>;
 
-    fn poll(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Self::Output> {
-        Poll::Ready(Ok(match self.0.take() {
-            None => http::Response::builder()
-                .status(http::StatusCode::NOT_FOUND)
-                .body("".into())
-                .unwrap(),
-            Some(tlsc) => http::Response::builder()
-                .header("Content-Type", "text/html")
-                .body(axum_core::body::Body::from_stream(respond(tlsc)))
-                .unwrap(),
-        }))
+    fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Self::Output> {
+        Poll::Ready(Ok(
+            match std::mem::replace(Pin::into_inner(self), DiagServiceFuture::NotConfigured) {
+                Self::WrongPath => http::Response::builder()
+                    .status(http::StatusCode::NOT_FOUND)
+                    .body("".into())
+                    .unwrap(),
+                Self::NotConfigured => http::Response::builder()
+                    .header("Content-Type", "text/html")
+                    .body(format!("{} failed to configure</h2></body></html>\n", HEADER).into())
+                    .unwrap(),
+                Self::Normal(tlsc) => http::Response::builder()
+                    .header("Content-Type", "text/html")
+                    .body(axum_core::body::Body::from_stream(respond(tlsc)))
+                    .unwrap(),
+            },
+        ))
     }
 }
 
 #[derive(Clone)]
-struct DiagService(Arc<TlsConfig>);
+struct DiagService(Option<Arc<TlsConfig>>);
 
 impl<B> Service<http::Request<B>> for DiagService {
     type Response = http::Response<axum_core::body::Body>;
@@ -69,11 +77,14 @@ impl<B> Service<http::Request<B>> for DiagService {
     }
 
     fn call(&mut self, request: http::Request<B>) -> Self::Future {
-        DiagServiceFuture(if request.uri().path() == "/" {
-            Some(Arc::clone(&self.0))
+        if request.uri().path() == "/" {
+            self.0
+                .as_ref()
+                .map(|c| DiagServiceFuture::Normal(Arc::clone(c)))
+                .unwrap_or(DiagServiceFuture::NotConfigured)
         } else {
-            None
-        })
+            DiagServiceFuture::WrongPath
+        }
     }
 }
 
@@ -87,7 +98,7 @@ pub struct Args {
 
 #[doc(hidden)]
 #[derive(ResourceDependencies)]
-pub struct Dependencies(Arc<TlsConfig>);
+pub struct Dependencies(Option<Arc<TlsConfig>>);
 
 /// Diagnostics introspection HTTP handler for [`TlsConfig`].
 ///
@@ -120,7 +131,7 @@ impl HttpDiagHandler for TlsConfigDiag {
         if !self.1.tls_diag_path.is_empty() {
             installer.nest_service(
                 &self.1.tls_diag_path,
-                BoxCloneSyncService::new(DiagService(Arc::clone(&self.0.0))),
+                BoxCloneSyncService::new(DiagService(self.0.0.as_ref().map(Arc::clone))),
             );
         }
     }

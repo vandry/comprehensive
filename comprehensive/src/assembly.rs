@@ -108,7 +108,7 @@ impl ResourceInstantiationError {
                     write!(f, "{}", name)?;
                 }
                 if !chain.is_empty() {
-                    for (i, n) in chain.iter().enumerate() {
+                    for (i, n) in chain.iter().rev().enumerate() {
                         if i == 0 {
                             write!(f, " (required by {}", n)?;
                         } else {

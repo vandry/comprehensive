@@ -22,6 +22,8 @@
 
 pub mod api;
 pub mod crypto_provider;
+#[cfg(feature = "diag")]
+pub mod diag;
 #[cfg(feature = "dispatch")]
 pub mod dispatch;
 #[cfg(feature = "files")]

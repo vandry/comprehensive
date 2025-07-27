@@ -212,6 +212,13 @@ pub trait TlsConfigInstance: Send + Sync + std::fmt::Debug {
     fn identity_valid_until(&self) -> Option<OffsetDateTime> {
         None
     }
+
+    /// Produce diagnostic output about this configuration in HTML
+    /// format. The output will be rendered inside a `<ul>` block
+    /// alongside other instances.
+    fn diag(&self) -> Option<String> {
+        None
+    }
 }
 
 #[derive(Default)]

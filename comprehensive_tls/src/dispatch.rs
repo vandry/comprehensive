@@ -50,6 +50,7 @@ use rustls::server::{
 use rustls::sign::CertifiedKey;
 use rustls::{CertificateError, ConfigBuilder, DistinguishedName, RootCertStore};
 use slice_dst::SliceWithHeader;
+use std::marker::PhantomData;
 use std::pin::{Pin, pin};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -378,7 +379,9 @@ pub struct TlsConfigDependencies {
     health: Arc<HealthReporter>,
     crypto_provider: Arc<crate::crypto_provider::RustlsCryptoProvider>,
     #[cfg(feature = "files")]
-    _default_built_in_provider: std::marker::PhantomData<crate::files::TlsConfigFiles>,
+    _default_built_in_provider: PhantomData<crate::files::TlsConfigFiles>,
+    #[cfg(feature = "diag")]
+    _diag: PhantomData<crate::diag::TlsConfigDiag>,
     #[cfg(test)]
     clock: Arc<clock::Clock>,
 }
@@ -921,6 +924,21 @@ impl TlsConfig {
         let backend = Arc::new(self.server_config_backend());
         CA::configure_client_auth(&backend, self.server_config_builder.clone())
             .with_cert_resolver(backend)
+    }
+
+    #[cfg(feature = "diag")]
+    pub(crate) fn count_for_diag(&self) -> usize {
+        self.inner.slice.len()
+    }
+
+    #[cfg(feature = "diag")]
+    pub(crate) fn iter_for_diag(&self) -> impl Iterator<Item = String> {
+        self.inner.slice.iter().map(|c| match c.load().as_ref() {
+            None => "<li><i>Empty</i></li>\n".into(),
+            Some(i) => i
+                .diag()
+                .unwrap_or_else(|| "<li><i>Diagnostic output not supported</i></li>\n".into()),
+        })
     }
 }
 

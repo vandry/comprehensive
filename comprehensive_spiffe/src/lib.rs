@@ -228,6 +228,42 @@ impl SpiffeConfig {
     }
 }
 
+struct InstanceDiag<'a>(&'a SpiffeConfig);
+
+impl std::fmt::Display for InstanceDiag<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "<li><b>SpiffeTlsProvider</b> identity<ul>")?;
+        for single in &self.0.svids {
+            write!(
+                f,
+                "<li>{}<ul>",
+                html_escape::encode_text(&format!("{}", single.bundle.id))
+            )?;
+            if let Some(exp) = &single.soonest_expiration {
+                write!(f, "<li>expires at {}</li>", exp)?;
+            }
+            write!(
+                f,
+                "<li>with {} trust anchors</li></ul></li>",
+                single.bundle.trust_anchors.len()
+            )?;
+        }
+        for bundle in &self.0.federated {
+            write!(
+                f,
+                "<li>federated with: {}<ul>",
+                html_escape::encode_text(&format!("{}", bundle.id))
+            )?;
+            write!(
+                f,
+                "<li>with {} trust anchors</li></ul></li>",
+                bundle.trust_anchors.len()
+            )?;
+        }
+        writeln!(f, "</ul></li>")
+    }
+}
+
 impl TlsConfigInstance for SpiffeConfig {
     fn has_any_identity(&self) -> bool {
         !self.svids.is_empty()
@@ -302,6 +338,10 @@ impl TlsConfigInstance for SpiffeConfig {
 
     fn identity_valid_until(&self) -> Option<OffsetDateTime> {
         self.soonest_expiration
+    }
+
+    fn diag(&self) -> Option<String> {
+        Some(format!("{}", InstanceDiag(self)))
     }
 }
 

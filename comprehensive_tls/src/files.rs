@@ -114,6 +114,35 @@ fn inet_name_to_uri(n: &str) -> Option<Uri> {
         .ok()
 }
 
+struct SnapshotDiag<'a>(&'a Snapshot);
+
+impl std::fmt::Display for SnapshotDiag<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "<li><b>TlsConfigFiles</b> identity<ul><li>with names:<ul>"
+        )?;
+        let mut names = self
+            .0
+            .names
+            .iter()
+            .map(|u| format!("{}", u))
+            .collect::<Vec<_>>();
+        names.sort();
+        for n in names {
+            write!(f, "<li>{}</li>", html_escape::encode_text(&n))?;
+        }
+        write!(f, "</ul></li>")?;
+        if let Some(exp) = &self.0.soonest_expiration {
+            write!(f, "<li>expires at {}</li>", exp)?;
+        }
+        if let Some(ta) = &self.0.cacert {
+            write!(f, "<li>with {} trust anchors</li>", ta.len())?;
+        }
+        writeln!(f, "</ul></li>")
+    }
+}
+
 impl TlsConfigInstance for Snapshot {
     fn has_any_identity(&self) -> bool {
         true
@@ -158,6 +187,10 @@ impl TlsConfigInstance for Snapshot {
 
     fn identity_valid_until(&self) -> Option<OffsetDateTime> {
         self.soonest_expiration
+    }
+
+    fn diag(&self) -> Option<String> {
+        Some(format!("{}", SnapshotDiag(self)))
     }
 }
 

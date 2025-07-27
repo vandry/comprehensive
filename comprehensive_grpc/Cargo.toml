@@ -1,6 +1,6 @@
 [package]
 name = "comprehensive_grpc"
-version = "0.7.0"
+version = "0.7.1"
 edition = "2024"
 repository = "https://github.com/vandry/comprehensive.git"
 homepage = "https://github.com/vandry/comprehensive"
@@ -31,7 +31,7 @@ prost-types = "0.13"
 thiserror = "2.0.12"
 tokio = "1.40"
 tokio-rustls = { version = "0.26", optional = true }
-tokio-stream = { version = "0.1", optional = true }
+tokio-stream = "0.1"
 tonic = "0.12"
 tonic-health = "0.12"
 tonic-reflection = "0.12"
@@ -42,7 +42,8 @@ tower-service = "0.3.3"
 warm_channels = { version = "0.2", features = ["grpc", "metrics"] }
 
 [features]
-tls = ["dep:comprehensive_tls", "dep:pin-project-lite", "dep:tokio-rustls", "dep:tokio-stream", "tonic/tls", "warm_channels/tls"]
+experimental = []
+tls = ["dep:comprehensive_tls", "dep:pin-project-lite", "dep:tokio-rustls", "tonic/tls", "warm_channels/tls"]
 
 [build-dependencies]
 tonic-build = "0.12"

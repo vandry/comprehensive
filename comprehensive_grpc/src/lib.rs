@@ -177,7 +177,6 @@ fn tonic_prometheus_layer_use_default_registry() {
 #[derive(Debug, Error)]
 pub enum ComprehensiveGrpcError {
     /// Wrapper for [`std::io::Error`].
-    #[cfg(feature = "tls")]
     #[error("{0}")]
     IOError(#[from] std::io::Error),
     /// An error from [`tonic`].

@@ -27,7 +27,6 @@ async fn end_to_end() {
         "--grpc-bind-addr=::1".into(),
         format!("--client-uri=http://[::1]:{}/", port).into(),
     ];
-    let _ = tokio_rustls::rustls::crypto::aws_lc_rs::default_provider().install_default();
     let a =
         Assembly::<EndToEnd<Client, { Client::RESOURCE_VARIETY }>>::new_from_argv(argv).unwrap();
     let tester_rx = a.top.tester.rx.take().unwrap();
@@ -36,7 +35,8 @@ async fn end_to_end() {
     let j = tokio::spawn(async move {
         let _ = a
             .run_with_termination_signal(futures::stream::once(term_rx.map(|_| ())))
-            .await;
+            .await
+            .expect("normal termination");
     });
     let msg = tester_rx.await.unwrap();
     let _ = term_tx.send(());

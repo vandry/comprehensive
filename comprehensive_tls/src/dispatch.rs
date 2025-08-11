@@ -45,7 +45,8 @@ use rustls::crypto::{
 use rustls::pki_types::CertificateDer;
 use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
 use rustls::server::{
-    ClientHello, ParsedCertificate, ResolvesServerCert, ServerConfig, WebPkiClientVerifier,
+    ClientHello, ParsedCertificate, ResolvesServerCert, ServerConfig, ServerSessionMemoryCache,
+    WebPkiClientVerifier,
 };
 use rustls::sign::CertifiedKey;
 use rustls::{CertificateError, ConfigBuilder, DistinguishedName, RootCertStore};
@@ -369,6 +370,7 @@ pub struct TlsConfig {
     inner: Arc<TlsConfigInner>,
     client_config_builder: rustls::ConfigBuilder<ClientConfig, rustls::WantsVerifier>,
     server_config_builder: rustls::ConfigBuilder<ServerConfig, rustls::WantsVerifier>,
+    session_storage: Arc<dyn rustls::server::StoresServerSessions>,
 }
 
 #[doc(hidden)]
@@ -499,6 +501,7 @@ impl Resource for TlsConfig {
             inner,
             client_config_builder,
             server_config_builder,
+            session_storage: ServerSessionMemoryCache::new(256),
         }))
     }
 }
@@ -953,8 +956,10 @@ impl TlsConfig {
     /// should be regenerated before each handshake, or at least at intervals.
     pub fn server_config<CA: ClientAuthMode>(&self) -> ServerConfig {
         let backend = Arc::new(self.server_config_backend());
-        CA::configure_client_auth(&backend, self.server_config_builder.clone())
-            .with_cert_resolver(backend)
+        let mut sc = CA::configure_client_auth(&backend, self.server_config_builder.clone())
+            .with_cert_resolver(backend);
+        sc.session_storage = Arc::clone(&self.session_storage);
+        sc
     }
 
     #[cfg(feature = "diag")]

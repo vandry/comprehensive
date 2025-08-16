@@ -20,9 +20,9 @@ use clap::{Args, FromArgMatches};
 use pin_project_lite::pin_project;
 use std::error::Error;
 use std::future::{Future, IntoFuture};
-use std::pin::Pin;
+use std::pin::{Pin, pin};
 use std::sync::Arc;
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, ready};
 
 use crate::ResourceDependencies;
 use crate::assembly::sealed::{DependencyTest, ResourceBase, TraitRegisterContext};
@@ -43,6 +43,81 @@ impl Future for StopSignal {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
         Pin::new(&mut self.get_mut().0).poll(cx).map(|_| ())
     }
+}
+
+/// Model for a pair of asynchronous tasks: one to run first and until there
+/// is an external indication to stop and another one to run instead after
+/// that. For use with [`AssemblyRuntime::set_task_with_cleanup`].
+///
+/// Usage:
+///
+/// ```
+/// use comprehensive::v1::{AssemblyRuntime, Resource, TaskWithCleanup, resource};
+/// use std::sync::Arc;
+///
+/// struct NeedsToTakeActionOnShutdownTask {
+///     private_state: i32,
+/// }
+///
+/// impl TaskWithCleanup for NeedsToTakeActionOnShutdownTask {
+///     #[allow(refining_impl_trait)]
+///     async fn main_task(&mut self) -> Result<(), std::convert::Infallible> {
+///         loop {
+///             // THIS CODE MUST BE CANCEL-SAFE
+///             // [...]
+///         }
+///     }
+///
+///     #[allow(refining_impl_trait)]
+///     async fn cleanup(self) -> Result<(), std::convert::Infallible> {
+///         // [...]
+///         Ok(())
+///     }
+/// }
+///
+/// struct NeedsToTakeActionOnShutdown;
+///
+/// #[resource]
+/// impl Resource for NeedsToTakeActionOnShutdown {
+///     fn new(
+///         _: comprehensive::NoDependencies,
+///         a: comprehensive::NoArgs,
+///         api: &mut AssemblyRuntime<'_>,
+///     ) -> Result<Arc<Self>, std::convert::Infallible> {
+///         api.set_task_with_cleanup(NeedsToTakeActionOnShutdownTask {
+///             private_state: 42,
+///         });
+///         Ok(Arc::new(Self))
+///     }
+/// }
+/// ```
+pub trait TaskWithCleanup: Sized + Send + 'static {
+    /// Main task from a main+cleanup pair. This task runs when the assembly
+    /// first starts running and continues either until it returns or until
+    /// a signal to shut down the assembly is received and all of the resources
+    /// that depend on this one have already shut down.
+    ///
+    /// This task must be cancel-safe because it will be dropped immediately
+    /// when it is time to run the cleanup task instead!
+    ///
+    /// If this returns an error then the entire [`Assembly`] will exit.
+    ///
+    /// [`Assembly`]: crate::Assembly
+    fn main_task(&mut self) -> impl Future<Output = Result<(), impl Error + 'static>> + Send;
+
+    /// Cleanup task from a main+cleanup pair. This task runs after the
+    /// assembly has received a shutdown signal and the main task has been
+    /// dropped. It should do work necessary to sanitise state before quitting
+    /// but should not count on being allowed to run for too long.
+    ///
+    /// If the main task returns successfully before any shutdown signal is
+    /// received then we assume there is no cleanup required, and this will
+    /// not run at all.
+    ///
+    /// If this returns an error then the entire [`Assembly`] will exit.
+    ///
+    /// [`Assembly`]: crate::Assembly
+    fn cleanup(self) -> impl Future<Output = Result<(), impl Error + 'static>> + Send;
 }
 
 /// Interface for interacting with an [`Assembly`] when
@@ -115,6 +190,25 @@ impl AssemblyRuntime<'_> {
         F::IntoFuture: Send,
     {
         self.task = Some(Box::new(TaskImpl(task)));
+    }
+
+    /// Configure a main asynchronous task and a shutdown handler to run in
+    /// connection with this [`Resource`]. The main task will run until the
+    /// [`Assembly`] is signalled to shut down, at which time the cleanup task
+    /// will run instead.
+    ///
+    /// The pair of tasks are given as 2 methods on a trait. Mutable state
+    /// can be shared between the 2 tasks by storing it in the object that
+    /// implements the trait.
+    ///
+    /// This is a convenience method. The same effect can be achieved with
+    /// the use of [`AssemblyRuntime::self_stop`] and
+    /// [`AssemblyRuntime::set_task`] with a task that switches
+    /// modes upon receiving the shutdown notification.
+    ///
+    /// [`Assembly`]: crate::Assembly
+    pub fn set_task_with_cleanup<T: TaskWithCleanup>(&mut self, task: T) {
+        self.task = Some(Box::new(TaskWithCleanupImpl(task)));
     }
 }
 
@@ -409,6 +503,71 @@ where
         } else {
             Box::pin(SelfStopTask::new(self.0, stopper, keepalive))
         }
+    }
+}
+
+struct TaskWithCleanupImpl<T>(T);
+
+enum CleanupFollowup {
+    MainExited,
+    ShutdownRequested(crate::shutdown::ShutdownSignalForwarder, Sentinel),
+}
+
+pin_project! {
+    struct TaskWithCleanupMain<'a, F> {
+        stopper: Pin<&'a mut ShutdownSignalParticipant>,
+        #[pin] main_task: F,
+        keepalive: Option<Sentinel>,
+    }
+}
+
+impl<F, E> Future for TaskWithCleanupMain<'_, F>
+where
+    F: Future<Output = Result<(), E>>,
+    E: 'static,
+{
+    type Output = Result<CleanupFollowup, E>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.project();
+        Poll::Ready(match this.stopper.as_mut().poll(cx) {
+            Poll::Ready(forwarder) => Ok(CleanupFollowup::ShutdownRequested(
+                forwarder,
+                this.keepalive.take().unwrap(),
+            )),
+            Poll::Pending => ready!(this.main_task.poll(cx)).map(|()| CleanupFollowup::MainExited),
+        })
+    }
+}
+
+impl<T> Task for TaskWithCleanupImpl<T>
+where
+    T: TaskWithCleanup,
+{
+    fn into_task(
+        mut self: Box<Self>,
+        stopper: ShutdownSignalParticipant,
+        keepalive: Sentinel,
+        _: bool,
+    ) -> ResourceFut {
+        Box::pin(async move {
+            let mut stopper = pin!(stopper);
+            let a = TaskWithCleanupMain {
+                stopper: stopper.as_mut(),
+                main_task: self.0.main_task(),
+                keepalive: Some(keepalive),
+            }
+            .await?;
+            match a {
+                CleanupFollowup::MainExited => stopper.await,
+                CleanupFollowup::ShutdownRequested(forwarder, _keepalive) => {
+                    self.0.cleanup().await?;
+                    forwarder
+                }
+            }
+            .propagate();
+            Ok(())
+        })
     }
 }
 
@@ -816,5 +975,132 @@ mod tests {
         assert_eq!(assembly.top.0.0.len(), 1);
         assert_eq!(assembly.top.0.1.len(), 1);
         let _ = Arc::clone(&assembly.top.1);
+    }
+
+    #[derive(Debug, Eq, PartialEq)]
+    enum Action {
+        LogQuit,
+        MainTaskStart,
+        MainTaskEnd,
+        Cleanup,
+    }
+
+    #[derive(Debug)]
+    struct GlobalActionLog(std::sync::Mutex<Vec<Action>>);
+
+    #[resource]
+    impl Resource for GlobalActionLog {
+        fn new(
+            _: comprehensive::NoDependencies,
+            _: comprehensive::NoArgs,
+            api: &mut AssemblyRuntime<'_>,
+        ) -> Result<Arc<Self>, std::convert::Infallible> {
+            let shared = Arc::new(Self(std::sync::Mutex::new(Vec::new())));
+            let shared2 = Arc::clone(&shared);
+            let stopper = api.self_stop();
+            api.set_task(async move {
+                stopper.await;
+                shared2.0.lock().unwrap().push(Action::LogQuit);
+                Ok(())
+            });
+            Ok(shared)
+        }
+    }
+
+    struct ResourceWithTaskWithCleanup;
+
+    #[derive(ResourceDependencies)]
+    struct ResourceWithTaskWithCleanupDependencies(Arc<GlobalActionLog>);
+
+    #[derive(clap::Args)]
+    #[group(skip)]
+    struct ResourceWithTaskWithCleanupArgs {
+        #[arg(long)]
+        complete_immediately: bool,
+    }
+
+    struct TestTaskWithCleanup {
+        log: Arc<GlobalActionLog>,
+        complete_immediately: bool,
+    }
+
+    impl TaskWithCleanup for TestTaskWithCleanup {
+        #[allow(refining_impl_trait)]
+        async fn main_task(&mut self) -> Result<(), std::convert::Infallible> {
+            self.log.0.lock().unwrap().push(Action::MainTaskStart);
+            if !self.complete_immediately {
+                std::future::pending::<()>().await;
+            }
+            self.log.0.lock().unwrap().push(Action::MainTaskEnd);
+            Ok(())
+        }
+
+        #[allow(refining_impl_trait)]
+        async fn cleanup(self) -> Result<(), std::convert::Infallible> {
+            self.log.0.lock().unwrap().push(Action::Cleanup);
+            Ok(())
+        }
+    }
+
+    #[resource]
+    impl Resource for ResourceWithTaskWithCleanup {
+        fn new(
+            d: ResourceWithTaskWithCleanupDependencies,
+            a: ResourceWithTaskWithCleanupArgs,
+            api: &mut AssemblyRuntime<'_>,
+        ) -> Result<Arc<Self>, std::convert::Infallible> {
+            api.set_task_with_cleanup(TestTaskWithCleanup {
+                log: d.0,
+                complete_immediately: a.complete_immediately,
+            });
+            Ok(Arc::new(Self))
+        }
+    }
+
+    #[derive(ResourceDependencies)]
+    struct TaskWithCleanupTop(Arc<ResourceWithTaskWithCleanup>, Arc<GlobalActionLog>);
+    #[test]
+    fn task_with_cleanup_long_running() {
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        //let argv: Vec<std::ffi::OsString> = vec!["cmd".into(), "--skip-task".into()];
+        let assembly = Assembly::<TaskWithCleanupTop>::new_from_argv(EMPTY).unwrap();
+        let _ = assembly.top.0;
+        let log = Arc::clone(&assembly.top.1);
+        let mut r = pin!(
+            assembly.run_with_termination_signal(tokio_stream::wrappers::ReceiverStream::new(rx))
+        );
+        let mut e = TestExecutor::default();
+        assert!(e.poll(&mut r).is_pending());
+        assert_eq!(&*log.0.lock().unwrap(), &[Action::MainTaskStart]);
+        let _ = tx.try_send(()).unwrap();
+        assert!(e.poll(&mut r).is_ready());
+        assert_eq!(
+            &*log.0.lock().unwrap(),
+            &[Action::MainTaskStart, Action::Cleanup, Action::LogQuit,]
+        );
+    }
+
+    #[test]
+    fn task_with_cleanup_short_running() {
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let argv: Vec<std::ffi::OsString> = vec!["cmd".into(), "--complete-immediately".into()];
+        let assembly = Assembly::<TaskWithCleanupTop>::new_from_argv(argv).unwrap();
+        let _ = assembly.top.0;
+        let log = Arc::clone(&assembly.top.1);
+        let mut r = pin!(
+            assembly.run_with_termination_signal(tokio_stream::wrappers::ReceiverStream::new(rx))
+        );
+        let mut e = TestExecutor::default();
+        assert!(e.poll(&mut r).is_pending());
+        assert_eq!(
+            &*log.0.lock().unwrap(),
+            &[Action::MainTaskStart, Action::MainTaskEnd,]
+        );
+        let _ = tx.try_send(()).unwrap();
+        assert!(e.poll(&mut r).is_ready());
+        assert_eq!(
+            &*log.0.lock().unwrap(),
+            &[Action::MainTaskStart, Action::MainTaskEnd, Action::LogQuit,]
+        );
     }
 }

@@ -1008,9 +1008,7 @@ where
             futures::select! {
                 task_result = tasks.next() => {
                     if let Some(result) = task_result {
-                        if result.is_err() {
-                            return result;
-                        }
+                        result?;
                     } else {
                         break;
                     }
@@ -1030,9 +1028,7 @@ where
         if !tasks.is_terminated() {
             // Return any errors immediately available.
             while let Poll::Ready(Some(r)) = poll!(tasks.next()) {
-                if r.is_err() {
-                    return r;
-                }
+                r?;
             }
         }
         Ok(())

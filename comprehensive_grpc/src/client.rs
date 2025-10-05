@@ -463,8 +463,9 @@ mod deps {
 
         fn connector(
             &self,
-            _: &Uri,
-            _: Option<&Uri>,
+            main_uri: &Uri,
+            server_identity: Option<&Uri>,
+            client_identity: Option<&Uri>,
         ) -> Result<Self::Connector, Box<dyn std::error::Error>>;
     }
 
@@ -474,19 +475,22 @@ mod deps {
 
         fn connector(
             &self,
-            server_identity: &Uri,
+            main_uri: &Uri,
+            server_identity: Option<&Uri>,
             client_identity: Option<&Uri>,
         ) -> Result<Self::Connector, Box<dyn std::error::Error>> {
             let tls_config = self
                 .tls_config
                 .as_ref()
-                .map(|tlsc| tlsc.client_config(server_identity, client_identity))
+                .map(|tlsc| {
+                    tlsc.client_config(server_identity.unwrap_or(main_uri), client_identity)
+                })
                 .transpose()?;
             Ok(TLSConnector::new(
                 StreamConnector::default(),
                 // This determines whether or not TLS will be done, and if so,
                 // whether or not SNI will be done, and if so, the SNI name.
-                server_identity,
+                main_uri,
                 tls_config.as_ref(),
             )?)
         }
@@ -498,6 +502,7 @@ mod deps {
         fn connector(
             &self,
             _: &Uri,
+            _: Option<&Uri>,
             _: Option<&Uri>,
         ) -> Result<Self::Connector, Box<dyn std::error::Error>> {
             Ok(StreamConnector::default())
@@ -554,17 +559,16 @@ where
             return Ok((None, ClientWorker::empty()));
         }
         // Omiting the main URI only works if the server_identity is given
-        // which is only useful with TLS so use a https placeholder.
-        (None, Some(c), Some(i)) => (Uri::from_static("https://_/"), Some(c), Some(i)),
+        // which is only useful with TLS so use a placeholder that is a
+        // SPIFFE URI since that will signal TLSConnector to use HTTPS but
+        // not SNI.
+        (None, Some(c), Some(i)) => (Uri::from_static("spiffe://_/"), Some(c), Some(i)),
         // Main URI stands in for the other 2.
         (Some(u), maybe_c, maybe_i) => (u, maybe_c, maybe_i),
     };
     super::tonic_prometheus_layer_use_default_registry();
 
-    let connector = d.connector(
-        server_identity.as_ref().unwrap_or(&uri),
-        a.client_identity.as_ref(),
-    )?;
+    let connector = d.connector(&uri, server_identity.as_ref(), a.client_identity.as_ref())?;
     let d: deps::OtherDependencies = d.into();
     let signaller = if propagate_health {
         Some(d.health.register(name)?)

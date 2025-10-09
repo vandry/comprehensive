@@ -286,7 +286,7 @@ pub trait Resource: Send + Sync + Sized + 'static {
 
     /// Type of error returned by `new`. If returned, the creation of the
     /// whole assembly will be aborted.
-    type CreationError: Into<Box<(dyn Error + 'static)>>;
+    type CreationError: Into<Box<dyn Error + 'static>>;
 
     /// The name of this resource. Used in logs and resource graph
     /// diagnostics.

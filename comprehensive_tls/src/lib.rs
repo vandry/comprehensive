@@ -19,6 +19,9 @@
 //! files named on the command line. Others exist in other crates.
 
 #![warn(missing_docs)]
+// Would impose a requirement for rustc 1.88
+// https://github.com/rust-lang/rust/pull/132833
+#![allow(clippy::collapsible_if)]
 
 pub mod api;
 pub mod crypto_provider;

@@ -326,7 +326,7 @@ impl Future for ShutdownSignalParticipant {
                     .map(|w| !w.will_wake(cx.waker()))
                     .unwrap_or(true);
                 if park {
-                    std::mem::replace(&mut *maybe_waker, Some(cx.waker().clone()))
+                    maybe_waker.replace(cx.waker().clone())
                 } else {
                     None
                 }

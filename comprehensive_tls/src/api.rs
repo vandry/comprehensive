@@ -256,7 +256,7 @@ impl Stream for Reader<'_> {
             .map(|w| !w.will_wake(cx.waker()))
             .unwrap_or(true);
         if park {
-            let old = std::mem::replace(&mut inner.waker, Some(cx.waker().clone()));
+            let old = inner.waker.replace(cx.waker().clone());
             if let Some(w) = old {
                 w.wake();
             }

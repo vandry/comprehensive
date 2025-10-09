@@ -2,6 +2,9 @@
 //! from SPIFFE by contacting the local agent using the workload API.
 
 #![warn(missing_docs)]
+// Would impose a requirement for rustc 1.88
+// https://github.com/rust-lang/rust/pull/132833
+#![allow(clippy::collapsible_if)]
 
 use backoff::ExponentialBackoffBuilder;
 use backoff::backoff::Backoff;

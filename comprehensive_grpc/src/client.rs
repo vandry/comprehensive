@@ -487,7 +487,7 @@ mod deps {
                 })
                 .transpose()?;
             Ok(TLSConnector::new(
-                StreamConnector::default(),
+                StreamConnector,
                 // This determines whether or not TLS will be done, and if so,
                 // whether or not SNI will be done, and if so, the SNI name.
                 main_uri,
@@ -505,7 +505,7 @@ mod deps {
             _: Option<&Uri>,
             _: Option<&Uri>,
         ) -> Result<Self::Connector, Box<dyn std::error::Error>> {
-            Ok(StreamConnector::default())
+            Ok(StreamConnector)
         }
     }
 }
@@ -536,6 +536,7 @@ where
 }
 
 #[doc(hidden)]
+#[allow(clippy::type_complexity)]
 pub fn new<I, D>(
     a: GrpcClientArgs<I>,
     name: &'static str,

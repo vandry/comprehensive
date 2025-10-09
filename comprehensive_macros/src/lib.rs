@@ -2,6 +2,10 @@
 //!
 //! [`comprehensive`]: https://docs.rs/comprehensive/latest/comprehensive/
 
+// Would impose a requirement for rustc 1.88
+// https://github.com/rust-lang/rust/pull/132833
+#![allow(clippy::collapsible_if)]
+
 extern crate proc_macro;
 use convert_case::{Case, Casing};
 use proc_macro2::{Span, TokenStream};

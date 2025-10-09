@@ -296,7 +296,7 @@ impl<C: Clock> SingleProviderHealthTracker<C> {
         mut self,
         inner: S,
         health: &HealthManager,
-    ) -> SingleProviderHealthTrackerStream<S, C> {
+    ) -> SingleProviderHealthTrackerStream<'_, S, C> {
         SingleProviderHealthTrackerStream {
             sleeper: self.mksleep(health),
             inner,
@@ -1506,8 +1506,8 @@ mod tests {
     }
 
     async fn run_2_instances(a: Assembly<MultiDependencies>, i: TestInstance) {
-        let mut writer0 = Arc::clone(&a.top.provider0);
-        let mut writer1 = Arc::clone(&a.top.provider1);
+        let writer0 = Arc::clone(&a.top.provider0);
+        let writer1 = Arc::clone(&a.top.provider1);
         let mut r = pin!(a.run_with_termination_signal(futures::stream::pending()));
         let mut writer = pin!(async move {
             let _ = writer0.0.writer().send(Box::new(i.clone())).await;

@@ -112,7 +112,11 @@ impl Builder {
     }
 
     pub fn into_stream(self) -> DropStream {
-        DropStream { inner: self.0, cursor: 0, len: self.1.count_ones(..) }
+        DropStream {
+            inner: self.0,
+            cursor: 0,
+            len: self.1.count_ones(..),
+        }
     }
 }
 
@@ -136,7 +140,7 @@ impl Stream for DropStream {
                 .map(|w| !w.will_wake(cx.waker()))
                 .unwrap_or(true);
             if park {
-                let old = std::mem::replace(&mut *maybe_waker, Some(cx.waker().clone()));
+                let old = maybe_waker.replace(cx.waker().clone());
                 if let Some(w) = old {
                     w.wake();
                 }

@@ -1,6 +1,6 @@
 [package]
 name = "comprehensive_macros"
-version = "0.4.10"
+version = "0.5.0"
 edition = "2024"
 repository = "https://github.com/vandry/comprehensive.git"
 homepage = "https://github.com/vandry/comprehensive"
@@ -15,11 +15,12 @@ rustdoc-args = ["--cfg", "docsrs"]
 proc-macro = true
 
 [dependencies]
-convert_case = "0.7"
+convert_case = "0.8"
 proc-macro2 = "1.0"
 quote = "1.0"
 syn = { version = "2.0", features = ["full"] }
 
 [dev-dependencies]
-comprehensive = { path = "../comprehensive", version = "0.7" }
-comprehensive_grpc = { path = "../comprehensive_grpc", version = "0.7" }
+# https://github.com/rust-lang/cargo/issues/4242
+comprehensive = { path = "../comprehensive", version = "<0.9.0, >=0.7.4" }
+comprehensive_grpc = { path = "../comprehensive_grpc", version = "<0.9.0, >=0.7.2" }

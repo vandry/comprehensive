@@ -1,6 +1,6 @@
 [package]
 name = "comprehensive_grpc"
-version = "0.7.2"
+version = "0.8.0"
 edition = "2024"
 repository = "https://github.com/vandry/comprehensive.git"
 homepage = "https://github.com/vandry/comprehensive"
@@ -15,11 +15,11 @@ rustdoc-args = ["--cfg", "docsrs"]
 atomic-take = "1.1"
 clap = { version = "4.5", features = ["derive"] }
 clap_builder = { version = "4.5", features = ["string"] }
-comprehensive = { path = "../comprehensive", version = "0.7" }
-comprehensive_dns = { path = "../comprehensive_dns", version = "0.2" }
-comprehensive_macros = { path = "../comprehensive_macros", version = "0.4.9" }
-comprehensive_tls = { path = "../comprehensive_tls", version = "0.3", optional = true }
-comprehensive_warm_channels = { path = "../comprehensive_warm_channels", version = "0.3" }
+comprehensive = { path = "../comprehensive", version = "0.8" }
+comprehensive_dns = { path = "../comprehensive_dns", version = "0.3" }
+comprehensive_macros = { path = "../comprehensive_macros", version = "0.5" }
+comprehensive_tls = { path = "../comprehensive_tls", version = "0.4", optional = true }
+comprehensive_warm_channels = { path = "../comprehensive_warm_channels", version = "0.4" }
 futures = "0.3"
 http = "1.1"
 humantime = "2.1"
@@ -49,11 +49,11 @@ tls = ["dep:comprehensive_tls", "dep:pin-project-lite", "dep:tokio-rustls", "ton
 tonic-build = "0.12"
 
 [dev-dependencies]
-comprehensive_http = { path = "../comprehensive_http", version = "0.2.0" }
+comprehensive_http = { path = "../comprehensive_http", version = "0.3" }
 delegate = "0.13.3"
 http-body-util = "0.1"
 hyper-util = "0.1.14"
-rand = "0.8"
+rand = "0.9"
 rustls-pemfile = "2.1"
 rustls-webpki = "0.103.3"
 test-log = "0.2"

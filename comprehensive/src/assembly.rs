@@ -42,6 +42,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use topological_sort::TopologicalSort;
 
+use crate::dependencies::ResourceDependencies;
 use crate::drop_stream::{DropStream, Sentinel};
 use crate::matrix::DepMatrix;
 use crate::shutdown::{ShutdownSignal, ShutdownSignalForwarder, ShutdownSignalParticipantCreator};
@@ -538,66 +539,6 @@ impl<T> Registrar<T> {
     }
 }
 
-/// This trait expresses the collection of types of other resources that a
-/// Resource depends on. It is also used to list the top-level resource
-/// types at the roots of the [`Assembly`] graph.
-///
-/// This must be implemented on a struct containing zero or more fields
-/// representing dependencies requested. On that structure, the trait
-/// should be [derived](macro@ResourceDependencies).
-///
-/// ```
-/// use comprehensive::{NoArgs, NoDependencies, ResourceDependencies};
-/// use std::sync::Arc;
-///
-/// # struct OtherResource;
-/// # impl comprehensive::v0::Resource for OtherResource {
-/// #     type Args = NoArgs;
-/// #     type Dependencies = NoDependencies;
-/// #     const NAME: &str = "other resource";
-/// #
-/// #     fn new(_: NoDependencies, _: NoArgs) -> Result<Self, Box<dyn std::error::Error>> {
-/// #         Ok(Self)
-/// #     }
-/// # }
-/// # type ImportantResource = OtherResource;
-/// # trait ProviderOfSomething {}
-/// #
-/// #[derive(ResourceDependencies)]
-/// struct DependenciesOfSomeResource {
-///     other_resource: Arc<OtherResource>,
-///     i_need_this: Arc<ImportantResource>,
-///     i_can_use_things: Vec<Arc<dyn ProviderOfSomething>>,
-/// }
-/// ```
-///
-/// **On the use of [`Arc`]**: During initialisation, a Resource might
-/// reasonably desire mutable references to its dependencies, but this is
-/// not available since the dependencies are supplied as [`Arc<T>`].
-/// Resources can get around this by offering interior mutability APIs
-/// (such as [`std::sync::Mutex`]) to their consumers. This was a design
-/// tradeoff. An alternative design was considered where the dependencies
-/// were supplied as `&'a mut T` (where `'a` is the lifetime of the
-/// [`Assembly`]) but that arguably had worse issues since resources could
-/// not retain those references outside of [`crate::v0::Resource::new`]
-/// (since the reference needs to be available to another consumer).
-/// Solutions are possible in case more longer-lived access is required,
-/// but these are arguably not better than the [`Arc`] solution.
-///
-/// [`Resource`]: crate::v1::Resource
-/// [`v1::resource`]: crate::v1::resource
-pub trait ResourceDependencies: Sized {
-    /// Opaque method used in the implementation of the
-    /// [`ResourceDependencies`] trait, which should be derived.
-    fn register(cx: &mut RegisterContext);
-
-    /// Opaque method used in the implementation of the
-    /// [`ResourceDependencies`] trait, which should be derived.
-    fn produce(cx: &mut ProduceContext) -> Result<Self, Box<dyn Error>>;
-}
-
-pub use comprehensive_macros::ResourceDependencies;
-
 /// Main entry point for a Comprehensive server.
 ///
 /// ```
@@ -1071,13 +1012,6 @@ where
     }
 }
 
-/// Convenience type that can be used as the `Dependencies` associated
-/// type on any leaf [`Resource`].
-///
-/// [`Resource`]: [`crate::v0::Resource`]
-#[derive(ResourceDependencies)]
-pub struct NoDependencies;
-
 /// Convenience type that can be used as the `Args` associated type on
 /// any [`Resource`] that takes no command line arguments.
 ///
@@ -1100,6 +1034,9 @@ pub(crate) fn log_resource_result<T, U: std::fmt::Display>(r: &Result<T, U>, nam
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::AnyResource;
+    use crate::dependencies::sealed::AvailableResource;
+    use crate::dependencies::{MayFail, NoDependencies};
     use crate::shutdown::ShutdownSignalParticipant;
     use crate::testutil::TestExecutor;
 
@@ -1264,6 +1201,24 @@ mod tests {
         }
     }
 
+    pub struct TestResourceProvider<T>(std::marker::PhantomData<T>);
+
+    impl<T: TestResource> AvailableResource for TestResourceProvider<T> {
+        type ResourceType = T;
+
+        fn register(cx: &mut RegisterContext) {
+            Registrar::<T>::register(cx);
+        }
+
+        fn register_without_dependency(cx: &mut RegisterContext) {
+            Registrar::<T>::register_without_dependency(cx);
+        }
+
+        fn produce(cx: &mut ProduceContext) -> Result<Arc<T>, Box<dyn std::error::Error>> {
+            Registrar::<T>::produce(cx)
+        }
+    }
+
     struct Leaf1 {}
 
     impl TestResource for Leaf1 {
@@ -1273,6 +1228,10 @@ mod tests {
         fn new(_: NoDependencies) -> Result<Self, Box<dyn std::error::Error>> {
             Ok(Self {})
         }
+    }
+
+    impl AnyResource for Leaf1 {
+        type Target = TestResourceProvider<Self>;
     }
 
     #[derive(Debug)]
@@ -1285,6 +1244,10 @@ mod tests {
         fn new(_: NoDependencies) -> Result<Self, Box<dyn std::error::Error>> {
             Ok(Self {})
         }
+    }
+
+    impl AnyResource for Leaf2 {
+        type Target = TestResourceProvider<Self>;
     }
 
     #[derive(ResourceDependencies)]
@@ -1301,6 +1264,10 @@ mod tests {
         fn new(deps: MidDependencies) -> Result<Self, Box<dyn std::error::Error>> {
             Ok(Self { deps })
         }
+    }
+
+    impl AnyResource for Mid {
+        type Target = TestResourceProvider<Self>;
     }
 
     #[derive(ResourceDependencies)]
@@ -1385,7 +1352,7 @@ mod tests {
     }
 
     #[derive(ResourceDependencies)]
-    struct CyclicDependencies(Arc<CyclicResource>);
+    struct CyclicDependencies(#[old_style] Arc<CyclicResource>);
 
     #[derive(Debug)]
     struct CyclicResource {}
@@ -1420,6 +1387,10 @@ mod tests {
         }
     }
 
+    impl AnyResource for CyclicResource1 {
+        type Target = TestResourceProvider<Self>;
+    }
+
     #[derive(Debug)]
     struct CyclicResourceLeaf;
 
@@ -1435,6 +1406,7 @@ mod tests {
     #[derive(ResourceDependencies)]
     struct CyclicDependencies2 {
         _cr1: Arc<CyclicResource1>,
+        #[old_style]
         _crl: Arc<CyclicResourceLeaf>,
     }
 
@@ -1448,6 +1420,10 @@ mod tests {
         fn new(_: CyclicDependencies2) -> Result<Self, Box<dyn std::error::Error>> {
             Ok(Self)
         }
+    }
+
+    impl AnyResource for CyclicResource2 {
+        type Target = TestResourceProvider<Self>;
     }
 
     #[derive(ResourceDependencies)]
@@ -1484,6 +1460,10 @@ mod tests {
         }
     }
 
+    impl AnyResource for FailsToCreate {
+        type Target = TestResourceProvider<Self>;
+    }
+
     #[derive(Debug)]
     struct AlsoFailsToCreate;
 
@@ -1494,6 +1474,10 @@ mod tests {
         fn new(_: NoDependencies) -> Result<Self, Box<dyn std::error::Error>> {
             Err("init problem 2".into())
         }
+    }
+
+    impl AnyResource for AlsoFailsToCreate {
+        type Target = TestResourceProvider<Self>;
     }
 
     #[derive(Debug)]
@@ -1512,6 +1496,10 @@ mod tests {
         fn new(_: DependsOnFailsToCreateDependencies) -> Result<Self, Box<dyn std::error::Error>> {
             Ok(Self)
         }
+    }
+
+    impl AnyResource for DependsOnFailsToCreate {
+        type Target = TestResourceProvider<Self>;
     }
 
     #[derive(ResourceDependencies)]
@@ -1584,6 +1572,10 @@ mod tests {
         }
     }
 
+    impl AnyResource for HalfDependsOnFailsToCreate {
+        type Target = TestResourceProvider<Self>;
+    }
+
     #[derive(ResourceDependencies)]
     struct HalfDependsOnFailsToCreateTop {
         _d0: Arc<HalfDependsOnFailsToCreate>,
@@ -1643,6 +1635,10 @@ mod tests {
         ) -> Result<Self, Box<dyn std::error::Error>> {
             Ok(Self)
         }
+    }
+
+    impl AnyResource for DependsOptionallyOnFailsToCreate {
+        type Target = TestResourceProvider<Self>;
     }
 
     #[derive(ResourceDependencies)]
@@ -1822,6 +1818,26 @@ mod tests {
         }
     }
 
+    impl AvailableResource for RunUntilSignaled {
+        type ResourceType = Self;
+
+        fn register(cx: &mut RegisterContext) {
+            Registrar::<Self>::register(cx);
+        }
+
+        fn register_without_dependency(cx: &mut RegisterContext) {
+            Registrar::<Self>::register_without_dependency(cx);
+        }
+
+        fn produce(cx: &mut ProduceContext) -> Result<Arc<Self>, Box<dyn std::error::Error>> {
+            Registrar::<Self>::produce(cx)
+        }
+    }
+
+    impl AnyResource for RunUntilSignaled {
+        type Target = Self;
+    }
+
     #[derive(ResourceDependencies)]
     struct RunUntilSignaledTop {
         r: Arc<RunUntilSignaled>,
@@ -1891,6 +1907,26 @@ mod tests {
         }
     }
 
+    impl AvailableResource for CleanShutdown {
+        type ResourceType = Self;
+
+        fn register(cx: &mut RegisterContext) {
+            Registrar::<Self>::register(cx);
+        }
+
+        fn register_without_dependency(cx: &mut RegisterContext) {
+            Registrar::<Self>::register_without_dependency(cx);
+        }
+
+        fn produce(cx: &mut ProduceContext) -> Result<Arc<Self>, Box<dyn std::error::Error>> {
+            Registrar::<Self>::produce(cx)
+        }
+    }
+
+    impl AnyResource for CleanShutdown {
+        type Target = Self;
+    }
+
     #[derive(ResourceDependencies)]
     struct CleanShutdownTop(Arc<CleanShutdown>);
 
@@ -1920,6 +1956,10 @@ mod tests {
         }
     }
 
+    impl AnyResource for Fail2 {
+        type Target = TestResourceProvider<Self>;
+    }
+
     #[derive(ResourceDependencies)]
     struct Fail1Dependencies(Option<Arc<Fail2>>);
 
@@ -1933,6 +1973,10 @@ mod tests {
             assert!(d.0.is_none());
             Err("fail1".into())
         }
+    }
+
+    impl AnyResource for Fail1 {
+        type Target = TestResourceProvider<Self>;
     }
 
     #[derive(ResourceDependencies)]
@@ -1984,6 +2028,26 @@ mod tests {
         }
     }
 
+    impl AvailableResource for InertResource {
+        type ResourceType = Self;
+
+        fn register(cx: &mut RegisterContext) {
+            Registrar::<Self>::register(cx);
+        }
+
+        fn register_without_dependency(cx: &mut RegisterContext) {
+            Registrar::<Self>::register_without_dependency(cx);
+        }
+
+        fn produce(cx: &mut ProduceContext) -> Result<Arc<Self>, Box<dyn std::error::Error>> {
+            Registrar::<Self>::produce(cx)
+        }
+    }
+
+    impl AnyResource for InertResource {
+        type Target = Self;
+    }
+
     struct FailLeaveOrphan;
 
     #[derive(ResourceDependencies)]
@@ -1997,6 +2061,10 @@ mod tests {
             let _ = d.0;
             Err("fail leave orphan".into())
         }
+    }
+
+    impl AnyResource for FailLeaveOrphan {
+        type Target = TestResourceProvider<Self>;
     }
 
     #[derive(ResourceDependencies)]
@@ -2058,9 +2126,29 @@ mod tests {
         }
     }
 
+    impl AvailableResource for RequiresDyn {
+        type ResourceType = Self;
+
+        fn register(cx: &mut RegisterContext) {
+            Registrar::<Self>::register(cx);
+        }
+
+        fn register_without_dependency(cx: &mut RegisterContext) {
+            Registrar::<Self>::register_without_dependency(cx);
+        }
+
+        fn produce(cx: &mut ProduceContext) -> Result<Arc<Self>, Box<dyn std::error::Error>> {
+            Registrar::<Self>::produce(cx)
+        }
+    }
+
+    impl AnyResource for RequiresDyn {
+        type Target = Self;
+    }
+
     #[derive(ResourceDependencies)]
     struct RequiresDynMayFailDependencies(
-        #[may_fail] Vec<Arc<dyn TestTrait>>,
+        MayFail<Vec<Arc<dyn TestTrait>>>,
         #[may_fail] Vec<Arc<dyn NobodyImplements>>,
     );
 
@@ -2101,6 +2189,26 @@ mod tests {
                 Ok(())
             })
         }
+    }
+
+    impl AvailableResource for RequiresDynMayFail {
+        type ResourceType = Self;
+
+        fn register(cx: &mut RegisterContext) {
+            Registrar::<Self>::register(cx);
+        }
+
+        fn register_without_dependency(cx: &mut RegisterContext) {
+            Registrar::<Self>::register_without_dependency(cx);
+        }
+
+        fn produce(cx: &mut ProduceContext) -> Result<Arc<Self>, Box<dyn std::error::Error>> {
+            Registrar::<Self>::produce(cx)
+        }
+    }
+
+    impl AnyResource for RequiresDynMayFail {
+        type Target = Self;
     }
 
     struct ProvidesDyn;
@@ -2161,6 +2269,26 @@ mod tests {
         }
     }
 
+    impl AvailableResource for ProvidesDyn {
+        type ResourceType = Self;
+
+        fn register(cx: &mut RegisterContext) {
+            Registrar::<Self>::register(cx);
+        }
+
+        fn register_without_dependency(cx: &mut RegisterContext) {
+            Registrar::<Self>::register_without_dependency(cx);
+        }
+
+        fn produce(cx: &mut ProduceContext) -> Result<Arc<Self>, Box<dyn std::error::Error>> {
+            Registrar::<Self>::produce(cx)
+        }
+    }
+
+    impl AnyResource for ProvidesDyn {
+        type Target = Self;
+    }
+
     struct AlsoProvidesDyn;
 
     impl TestTrait for AlsoProvidesDyn {}
@@ -2200,6 +2328,26 @@ mod tests {
         }
     }
 
+    impl AvailableResource for AlsoProvidesDyn {
+        type ResourceType = Self;
+
+        fn register(cx: &mut RegisterContext) {
+            Registrar::<Self>::register(cx);
+        }
+
+        fn register_without_dependency(cx: &mut RegisterContext) {
+            Registrar::<Self>::register_without_dependency(cx);
+        }
+
+        fn produce(cx: &mut ProduceContext) -> Result<Arc<Self>, Box<dyn std::error::Error>> {
+            Registrar::<Self>::produce(cx)
+        }
+    }
+
+    impl AnyResource for AlsoProvidesDyn {
+        type Target = Self;
+    }
+
     struct ProvidesDynButFails;
 
     impl TestTrait for ProvidesDynButFails {}
@@ -2229,6 +2377,26 @@ mod tests {
         fn task(_: ()) -> Pin<Box<dyn Future<Output = Result<(), Box<dyn Error>>> + Send>> {
             unreachable!();
         }
+    }
+
+    impl AvailableResource for ProvidesDynButFails {
+        type ResourceType = Self;
+
+        fn register(cx: &mut RegisterContext) {
+            Registrar::<Self>::register(cx);
+        }
+
+        fn register_without_dependency(cx: &mut RegisterContext) {
+            Registrar::<Self>::register_without_dependency(cx);
+        }
+
+        fn produce(cx: &mut ProduceContext) -> Result<Arc<Self>, Box<dyn std::error::Error>> {
+            Registrar::<Self>::produce(cx)
+        }
+    }
+
+    impl AnyResource for ProvidesDynButFails {
+        type Target = Self;
     }
 
     #[derive(ResourceDependencies)]
@@ -2358,6 +2526,26 @@ mod tests {
         }
     }
 
+    impl AvailableResource for Ant {
+        type ResourceType = Self;
+
+        fn register(cx: &mut RegisterContext) {
+            Registrar::<Self>::register(cx);
+        }
+
+        fn register_without_dependency(cx: &mut RegisterContext) {
+            Registrar::<Self>::register_without_dependency(cx);
+        }
+
+        fn produce(cx: &mut ProduceContext) -> Result<Arc<Self>, Box<dyn std::error::Error>> {
+            Registrar::<Self>::produce(cx)
+        }
+    }
+
+    impl AnyResource for Ant {
+        type Target = Self;
+    }
+
     impl sealed::ResourceBase<{ crate::ResourceVariety::Test as usize }> for Dec {
         const NAME: &str = "Dec";
         type Production = ();
@@ -2387,6 +2575,26 @@ mod tests {
         fn task(_: ()) -> Pin<Box<dyn Future<Output = Result<(), Box<dyn Error>>> + Send>> {
             unreachable!();
         }
+    }
+
+    impl AvailableResource for Dec {
+        type ResourceType = Self;
+
+        fn register(cx: &mut RegisterContext) {
+            Registrar::<Self>::register(cx);
+        }
+
+        fn register_without_dependency(cx: &mut RegisterContext) {
+            Registrar::<Self>::register_without_dependency(cx);
+        }
+
+        fn produce(cx: &mut ProduceContext) -> Result<Arc<Self>, Box<dyn std::error::Error>> {
+            Registrar::<Self>::produce(cx)
+        }
+    }
+
+    impl AnyResource for Dec {
+        type Target = Self;
     }
 
     #[derive(ResourceDependencies)]

@@ -28,8 +28,9 @@
 
 #![warn(missing_docs)]
 
-use comprehensive::health::{HealthReporter, HealthSignaller};
-use comprehensive::{Resource, ResourceDependencies};
+use comprehensive::ResourceDependencies;
+use comprehensive::health::HealthReporter;
+use comprehensive::v1::{AssemblyRuntime, Resource, resource};
 #[doc(hidden)]
 pub use const_format;
 use futures::future::Either;
@@ -114,19 +115,21 @@ where
     I: BucketInstanceDescriptor + Sync + Send + 'static,
 {
     bucket: Box<Bucket>,
-    health_signaller: HealthSignaller,
     _i: PhantomData<I>,
 }
 
+#[resource]
 impl<I> Resource for BucketResource<I>
 where
     I: BucketInstanceDescriptor + Sync + Send + 'static,
 {
-    type Args = Args<I>;
-    type Dependencies = Dependencies;
     const NAME: &str = I::NAME;
 
-    fn new(d: Dependencies, args: Args<I>) -> Result<Self, Box<dyn std::error::Error>> {
+    fn new(
+        d: Dependencies,
+        args: Args<I>,
+        api: &mut AssemblyRuntime<'_>,
+    ) -> Result<Arc<Self>, Box<dyn std::error::Error>> {
         let cred = Credentials::default().unwrap();
         let region = match args.endpoint {
             Some(ep) => Region::Custom {
@@ -135,36 +138,37 @@ where
             },
             None => args.region_name.parse()?,
         };
-        Ok(Self {
+        let health_signaller = d.0.register(I::NAME)?;
+        let shared = Arc::new(Self {
             bucket: Bucket::new(&args.bucket_name, region, cred)?,
-            health_signaller: d.0.register(I::NAME)?,
             _i: PhantomData,
-        })
-    }
-
-    async fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let mut healthy = false;
-        let mut notified = None;
-        loop {
-            if let Err(e) = probe(self.bucket.as_ref()).await {
-                let complain = match notified {
-                    None => true,
-                    Some(n) => Instant::now().duration_since(n) >= REMIND_INTERVAL,
-                };
-                if complain {
-                    log::error!("S3 probe failed: {}", e);
-                    notified = Some(Instant::now());
+        });
+        let shared2 = Arc::clone(&shared);
+        api.set_task(async move {
+            let mut healthy = false;
+            let mut notified = None;
+            loop {
+                if let Err(e) = probe(shared2.bucket.as_ref()).await {
+                    let complain = match notified {
+                        None => true,
+                        Some(n) => Instant::now().duration_since(n) >= REMIND_INTERVAL,
+                    };
+                    if complain {
+                        log::error!("S3 probe failed: {}", e);
+                        notified = Some(Instant::now());
+                    }
+                    if healthy {
+                        health_signaller.set_healthy(false);
+                        healthy = false;
+                    }
+                } else if !healthy {
+                    health_signaller.set_healthy(true);
+                    healthy = true;
                 }
-                if healthy {
-                    self.health_signaller.set_healthy(false);
-                    healthy = false;
-                }
-            } else if !healthy {
-                self.health_signaller.set_healthy(true);
-                healthy = true;
+                sleep(PROBE_INTERVAL).await;
             }
-            sleep(PROBE_INTERVAL).await;
-        }
+        });
+        Ok(shared)
     }
 }
 

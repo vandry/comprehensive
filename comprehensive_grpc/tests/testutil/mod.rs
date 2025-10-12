@@ -70,24 +70,24 @@ impl pb::comprehensive::test_server::Test for HelloService {
     }
 }
 
-pub trait EndToEndClient<const U: usize>: AnyResource<U> + Send + Sync + 'static {
+pub trait EndToEndClient: AnyResource + Send + Sync + 'static {
     fn test_client(&self) -> pb::comprehensive::test_client::TestClient<Channel>;
 }
 
 #[derive(ResourceDependencies)]
-pub struct EndToEndTesterDependencies<T: EndToEndClient<U>, const U: usize>(Arc<T>);
+pub struct EndToEndTesterDependencies<T: EndToEndClient>(Arc<T>);
 
 type Msg = Result<tonic::Response<GreetResponse>, tonic::Status>;
 
-pub struct EndToEndTester<T: EndToEndClient<U>, const U: usize> {
+pub struct EndToEndTester<T: EndToEndClient> {
     pub rx: AtomicTake<tokio::sync::oneshot::Receiver<Msg>>,
     _t: PhantomData<T>,
 }
 
 #[resource]
-impl<T: EndToEndClient<U>, const U: usize> Resource for EndToEndTester<T, U> {
+impl<T: EndToEndClient> Resource for EndToEndTester<T> {
     fn new(
-        d: EndToEndTesterDependencies<T, U>,
+        d: EndToEndTesterDependencies<T>,
         _: NoArgs,
         api: &mut AssemblyRuntime<'_>,
     ) -> Result<Arc<Self>, std::convert::Infallible> {
@@ -105,8 +105,8 @@ impl<T: EndToEndClient<U>, const U: usize> Resource for EndToEndTester<T, U> {
 }
 
 #[derive(ResourceDependencies)]
-pub struct EndToEnd<T: EndToEndClient<U>, const U: usize> {
+pub struct EndToEnd<T: EndToEndClient> {
     _s: Arc<HelloService>,
-    pub tester: Arc<EndToEndTester<T, U>>,
+    pub tester: Arc<EndToEndTester<T>>,
     _server: Arc<comprehensive_grpc::server::GrpcServer>,
 }

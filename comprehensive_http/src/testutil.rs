@@ -32,24 +32,24 @@ pub(crate) async fn wait_until_serving(addr: &SocketAddr) {
 
 #[cfg(feature = "tls")]
 pub(crate) mod tls {
+    use comprehensive::v1::{AssemblyRuntime, Resource, resource};
     use comprehensive_tls::api::rustls;
     use rustls::pki_types::pem::PemObject;
     use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+    use std::sync::Arc;
 
     use crate::tls_testdata;
 
     pub(crate) struct MockTlsConfig;
 
-    impl comprehensive::Resource for MockTlsConfig {
-        type Args = comprehensive::NoArgs;
-        type Dependencies = comprehensive::NoDependencies;
-        const NAME: &str = "Mock TlsConfig for tests";
-
+    #[resource]
+    impl Resource for MockTlsConfig {
         fn new(
-            _: comprehensive::NoDependencies,
+            _: (),
             _: comprehensive::NoArgs,
-        ) -> Result<Self, Box<dyn std::error::Error>> {
-            Ok(Self)
+            _: &mut AssemblyRuntime<'_>,
+        ) -> Result<Arc<Self>, std::convert::Infallible> {
+            Ok(Arc::new(Self))
         }
     }
 

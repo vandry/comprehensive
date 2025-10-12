@@ -1,4 +1,4 @@
-use comprehensive::{AnyResource, Assembly};
+use comprehensive::Assembly;
 use comprehensive_grpc::GrpcClient;
 use comprehensive_grpc::client::Channel;
 use futures::FutureExt;
@@ -12,7 +12,7 @@ use testutil::pb::comprehensive::test_client::TestClient;
 #[no_propagate_health]
 struct Client(TestClient<Channel>);
 
-impl testutil::EndToEndClient<{ Client::RESOURCE_VARIETY }> for Client {
+impl testutil::EndToEndClient for Client {
     fn test_client(&self) -> TestClient<Channel> {
         self.client()
     }
@@ -27,8 +27,7 @@ async fn end_to_end() {
         "--grpc-bind-addr=::1".into(),
         format!("--client-uri=http://[::1]:{}/", port).into(),
     ];
-    let a =
-        Assembly::<EndToEnd<Client, { Client::RESOURCE_VARIETY }>>::new_from_argv(argv).unwrap();
+    let a = Assembly::<EndToEnd<Client>>::new_from_argv(argv).unwrap();
     let tester_rx = a.top.tester.rx.take().unwrap();
 
     let (term_tx, term_rx) = tokio::sync::oneshot::channel();

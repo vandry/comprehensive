@@ -40,7 +40,8 @@
 
 #![warn(missing_docs)]
 
-use comprehensive::{NoArgs, NoDependencies, Resource};
+use comprehensive::v1::{AssemblyRuntime, Resource, resource};
+use comprehensive::{NoArgs, NoDependencies};
 use hickory_resolver::name_server::TokioConnectionProvider;
 use hickory_resolver::system_conf::read_system_conf;
 use hickory_resolver::{Resolver, TokioResolver};
@@ -68,18 +69,21 @@ impl DNSResolver {
     }
 }
 
+#[resource]
 impl Resource for DNSResolver {
-    type Args = NoArgs;
-    type Dependencies = NoDependencies;
     const NAME: &str = "hickory-resolver";
 
-    fn new(_: NoDependencies, _: NoArgs) -> Result<Self, Box<dyn std::error::Error>> {
+    fn new(
+        _: NoDependencies,
+        _: NoArgs,
+        _: &mut AssemblyRuntime<'_>,
+    ) -> Result<Arc<Self>, std::io::Error> {
         let (resolver_config, mut resolver_opts) = read_system_conf()?;
         resolver_opts.ip_strategy = hickory_resolver::config::LookupIpStrategy::Ipv4AndIpv6;
-        Ok(Self(
+        Ok(Arc::new(Self(
             Resolver::builder_with_config(resolver_config, TokioConnectionProvider::default())
                 .with_options(resolver_opts)
                 .build(),
-        ))
+        )))
     }
 }

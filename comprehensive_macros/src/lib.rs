@@ -21,6 +21,7 @@ enum DependencyType<'a> {
     Concrete(&'a Type, bool),
     Trait(&'a Type, bool),
     Weak(&'a Type),
+    NewStyle(&'a Type),
 }
 
 enum DependencyLabel {
@@ -43,9 +44,8 @@ impl DependencyLabel {
     fn into_dependency_type<'a>(
         self,
         ty: &'a Type,
-        attrs: &[Attribute],
+        may_fail: bool,
     ) -> Result<DependencyType<'a>, Span> {
-        let may_fail = attrs.iter().any(|a| a.path().is_ident("may_fail"));
         let (expect_trait, result) = match self {
             Self::Arc => (false, DependencyType::Concrete(ty, false)),
             Self::Option => (false, DependencyType::Concrete(ty, true)),
@@ -94,6 +94,11 @@ fn find_dependency_type<'a>(
     orig_ty: &'a Type,
     attrs: &[Attribute],
 ) -> Result<DependencyType<'a>, Span> {
+    let may_fail = attrs.iter().any(|a| a.path().is_ident("may_fail"));
+    let old_style = attrs.iter().any(|a| a.path().is_ident("old_style"));
+    if !old_style && !may_fail {
+        return Ok(DependencyType::NewStyle(orig_ty));
+    }
     // We accept:
     // Arc<T>
     // Option<Arc<T>>
@@ -107,7 +112,7 @@ fn find_dependency_type<'a>(
         }
         ty = inner_ty;
     }
-    dep_type.into_dependency_type(ty, attrs)
+    dep_type.into_dependency_type(ty, may_fail)
 }
 
 fn produce_concrete(
@@ -130,6 +135,14 @@ fn produce_concrete(
                     quote! { let #temp = cx.produce_trait::< #ty >(); }
                 } else {
                     quote! { let #temp = cx.produce_trait_fallible::< #ty >(); }
+                })
+            }
+            Ok(DependencyType::NewStyle(ty)) => {
+                let temp = format_ident!("dep_{}", i);
+                Some(if for_optional {
+                    quote! { let #temp = < #ty as ::comprehensive::dependencies::ResourceDependency >::produce_late(cx, #temp ); }
+                } else {
+                    quote! { let #temp = < #ty as ::comprehensive::dependencies::ResourceDependency >::produce_early(cx); }
                 })
             }
             _ => None,
@@ -163,6 +176,9 @@ fn derive_r_d_struct(name: &Ident, generics: &Generics, fields: &Fields) -> Toke
         Ok(DependencyType::Weak(ty)) => quote! {
             ::comprehensive::assembly::Registrar::< #ty >::register_without_dependency(cx);
         },
+        Ok(DependencyType::NewStyle(ty)) => quote! {
+            < #ty as ::comprehensive::dependencies::ResourceDependency >::register(cx);
+        },
         Err(ts) => ts.clone(),
     });
     // Produce all of the required dependencies, collecting the errors.
@@ -174,6 +190,10 @@ fn derive_r_d_struct(name: &Ident, generics: &Generics, fields: &Fields) -> Toke
             Some(quote! { let #temp = #temp ?; })
         }
         Ok(DependencyType::Trait(_, false)) => {
+            let temp = format_ident!("dep_{}", i);
+            Some(quote! { let #temp = #temp ?; })
+        }
+        Ok(DependencyType::NewStyle(_)) => {
             let temp = format_ident!("dep_{}", i);
             Some(quote! { let #temp = #temp ?; })
         }
@@ -206,6 +226,10 @@ fn derive_r_d_struct(name: &Ident, generics: &Generics, fields: &Fields) -> Toke
                             Ok(DependencyType::Weak(_)) => {
                                 quote! { #name: ::std::marker::PhantomData, }
                             }
+                            Ok(DependencyType::NewStyle(_)) => {
+                                let temp = format_ident!("dep_{}", i);
+                                quote! { #name: #temp ?, }
+                            }
                             Err(ts) => ts.clone(),
                         }
                     });
@@ -229,6 +253,10 @@ fn derive_r_d_struct(name: &Ident, generics: &Generics, fields: &Fields) -> Toke
                 }
                 Ok(DependencyType::Weak(_)) => {
                     quote! { ::std::marker::PhantomData, }
+                }
+                Ok(DependencyType::NewStyle(_)) => {
+                    let temp = format_ident!("dep_{}", i);
+                    quote! { #temp ?, }
                 }
                 Err(ts) => ts.clone(),
             });
@@ -311,7 +339,7 @@ fn derive_r_d_struct(name: &Ident, generics: &Generics, fields: &Fields) -> Toke
 /// See
 /// [`ResourceDependencies`](https://docs.rs/comprehensive/latest/comprehensive/assembly/trait.ResourceDependencies.html)
 /// for usage information.
-#[proc_macro_derive(ResourceDependencies, attributes(may_fail))]
+#[proc_macro_derive(ResourceDependencies, attributes(may_fail, old_style))]
 pub fn derive_resource_dependencies(item: proc_macro::TokenStream) -> proc_macro::TokenStream {
     let input: DeriveInput = parse_macro_input!(item);
     match input.data {
@@ -661,7 +689,7 @@ fn derive_grpc_client_struct(
 
     let resource = if let Some(get1) = maybe_get1 {
         quote! {
-            impl #impl_generics ::comprehensive::Resource for #name #ty_generics #where_clause {
+            impl #impl_generics ::comprehensive::v0::Resource for #name #ty_generics #where_clause {
                 type Args = ::comprehensive_grpc::client::GrpcClientArgs<Self>;
                 type Dependencies = ::comprehensive_grpc::client:: #deps ;
                 const NAME: &'static str = #name_lit ;
@@ -675,6 +703,10 @@ fn derive_grpc_client_struct(
                     #get1 .go().await;
                     Ok(())
                 }
+            }
+
+            impl #impl_generics ::comprehensive::AnyResource for #name #ty_generics #where_clause {
+                type Target = ::comprehensive::v0::ResourceProvider< #name #ty_generics >;
             }
         }
     } else {
@@ -694,6 +726,10 @@ fn derive_grpc_client_struct(
                     api.set_task(async move { worker.go().await; Ok(()) });
                     Ok(::std::sync::Arc::new( #builder ))
                 }
+            }
+
+            impl #impl_generics ::comprehensive::AnyResource for #name #ty_generics #where_clause {
+                type Target = ::comprehensive::v1::ResourceProvider< #name #ty_generics >;
             }
         }
     };
@@ -1010,12 +1046,12 @@ pub fn v1resource(
             _ => None,
         })
         .peekable();
+    let (impl_generics, _, where_clause) = block.generics.split_for_impl();
+    let self_ty = &block.self_ty;
     let grpc_derive = if grpc_exports.peek().is_some() || grpc_descriptors.peek().is_some() {
-        let (impl_generics, ty_generics, where_clause) = block.generics.split_for_impl();
-        let self_ty = &block.self_ty;
-        Some(quote! {
+        quote! {
             #[automatically_derived]
-            impl #impl_generics ::comprehensive_grpc::GrpcService for #self_ty #ty_generics #where_clause {
+            impl #impl_generics ::comprehensive_grpc::GrpcService for #self_ty #where_clause {
                 fn add_to_server(
                     self: Arc<Self>,
                     server: &mut ::comprehensive_grpc::server::GrpcServiceAdder,
@@ -1025,9 +1061,9 @@ pub fn v1resource(
                     Ok(())
                 }
             }
-        })
+        }
     } else {
-        None
+        quote! {}
     };
     let mut exports = ours.into_iter().filter_map(|ono| match ono {
         ExportType::General(Ok(ty)) => Some(quote_spanned! {
@@ -1052,9 +1088,15 @@ pub fn v1resource(
     for e in errors {
         block.items.push(syn::ImplItem::Verbatim(e));
     }
-    let mut ts = block.into_token_stream();
-    if let Some(d) = grpc_derive {
-        ts.extend(d);
+    quote! {
+        #block
+
+        #[automatically_derived]
+        impl #impl_generics ::comprehensive::AnyResource for #self_ty #where_clause {
+            type Target = ::comprehensive::v1::ResourceProvider< #self_ty >;
+        }
+
+        #grpc_derive
     }
-    ts.into()
+    .into()
 }

@@ -338,6 +338,7 @@ pub struct HttpServerDependencies<I>
 where
     I: HttpServingInstance,
 {
+    #[old_style]
     instance: Arc<I>,
     http: Arc<insecure_server::InsecureHttpServer<I>>,
     #[cfg(feature = "tls")]

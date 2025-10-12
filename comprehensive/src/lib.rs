@@ -42,6 +42,7 @@
 #![warn(missing_docs)]
 
 pub mod assembly;
+pub mod dependencies;
 pub mod health;
 pub mod v0;
 pub mod v1;
@@ -50,7 +51,8 @@ mod drop_stream;
 mod matrix;
 mod shutdown;
 
-pub use assembly::{Assembly, NoArgs, NoDependencies, ResourceDependencies};
+pub use assembly::{Assembly, NoArgs};
+pub use dependencies::{MayFail, NoDependencies, ResourceDependencies, ResourceDependency};
 pub use v0::{Resource, ShutdownNotify};
 
 // This is necessary for using the macros defined in comprehensive_macros
@@ -74,17 +76,13 @@ pub enum ResourceVariety {
 /// A requirement for a resource of any variety may be expressed as:
 ///
 /// ```
-/// struct ContainsAResource<T: comprehensive::AnyResource<U>, const U: usize> {
+/// struct ContainsAResource<T: comprehensive::AnyResource> {
 ///     resource: std::sync::Arc<T>,
 /// }
 /// ```
-pub trait AnyResource<const T: usize>: assembly::sealed::ResourceBase<T> {
-    /// The name of this resource. Used in logs and diagnostics.
-    const NAME: &str;
-    /// The const generic parameter of this Resource. Occasionally
-    /// necessary for hinting whicg variety of Resource is being supplied
-    /// to meet a `T: AnyResource<U>` bound.
-    const RESOURCE_VARIETY: usize = T;
+pub trait AnyResource {
+    #[doc(hidden)]
+    type Target: dependencies::sealed::AvailableResource<ResourceType = Self>;
 }
 
 /// Error type returned by various Comprehensive functions

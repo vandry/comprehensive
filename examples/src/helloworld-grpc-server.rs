@@ -1,5 +1,4 @@
 use comprehensive::v1::{AssemblyRuntime, Resource, resource};
-use comprehensive::{NoDependencies, ResourceDependencies};
 use std::marker::PhantomData;
 use std::sync::Arc;
 
@@ -22,7 +21,7 @@ struct TestService;
 #[proto_descriptor(pb::FILE_DESCRIPTOR_SET)]
 impl Resource for TestService {
     fn new(
-        _: NoDependencies,
+        _: (),
         args: ServiceImplementationArgs,
         _: &mut AssemblyRuntime<'_>,
     ) -> Result<Arc<Self>, std::convert::Infallible> {
@@ -43,18 +42,6 @@ impl pb::test_server::Test for TestService {
     }
 }
 
-#[derive(ResourceDependencies)]
-struct TopDependencies {
-    // Request a server (HTTPS or HTTP or both) to run.
-    _server: Arc<comprehensive_grpc::server::GrpcServer>,
-    // Including this causes the gRPC server to run.
-    _test_service: PhantomData<TestService>,
-    // Serves metrics!
-    _diag: Arc<comprehensive_http::diag::HttpServer>,
-    // Make SPIFFE available as an option for configuring TLS.
-    _spiffe: std::marker::PhantomData<comprehensive_spiffe::SpiffeTlsProvider>,
-}
-
 #[tokio::main]
 pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
@@ -64,8 +51,17 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Will start a gRPC server with or without TLS depending on flags,
     // with extra features such as server reflection, and also serve
     // HTTP and/or HTTPS (again, depending on flags) at least for metrics.
-    comprehensive::Assembly::<TopDependencies>::new()?
-        .run()
-        .await?;
+    comprehensive::Assembly::<(
+        // Request a server (HTTPS or HTTP or both) to run.
+        Arc<comprehensive_grpc::server::GrpcServer>,
+        // Including this causes the gRPC server to run.
+        PhantomData<TestService>,
+        // Serves metrics!
+        Arc<comprehensive_http::diag::HttpServer>,
+        // Make SPIFFE available as an option for configuring TLS.
+        std::marker::PhantomData<comprehensive_spiffe::SpiffeTlsProvider>,
+    )>::new()?
+    .run()
+    .await?;
     Ok(())
 }

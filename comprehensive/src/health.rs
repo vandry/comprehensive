@@ -274,6 +274,10 @@ impl Resource for HealthReporter {
     }
 }
 
+impl crate::AnyResource for HealthReporter {
+    type Target = crate::v0::ResourceProvider<HealthReporter>;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

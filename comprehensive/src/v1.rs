@@ -27,6 +27,7 @@ use std::task::{Context, Poll, ready};
 use crate::ResourceDependencies;
 use crate::assembly::sealed::{DependencyTest, ResourceBase, TraitRegisterContext};
 use crate::assembly::{ProduceContext, RegisterContext, ResourceFut};
+use crate::dependencies::sealed::AvailableResource;
 use crate::drop_stream::Sentinel;
 use crate::shutdown::{ShutdownSignalParticipant, ShutdownSignalParticipantCreator};
 
@@ -644,8 +645,23 @@ impl<T: Resource> ResourceBase<{ crate::ResourceVariety::V1 as usize }> for T {
     }
 }
 
-impl<T: Resource> crate::AnyResource<{ crate::ResourceVariety::V1 as usize }> for T {
-    const NAME: &str = T::NAME;
+#[doc(hidden)]
+pub struct ResourceProvider<T>(std::marker::PhantomData<T>);
+
+impl<T: Resource> AvailableResource for ResourceProvider<T> {
+    type ResourceType = T;
+
+    fn register(cx: &mut RegisterContext) {
+        crate::assembly::Registrar::<T>::register(cx);
+    }
+
+    fn register_without_dependency(cx: &mut RegisterContext) {
+        crate::assembly::Registrar::<T>::register_without_dependency(cx);
+    }
+
+    fn produce(cx: &mut ProduceContext) -> Result<Arc<T>, Box<dyn std::error::Error>> {
+        crate::assembly::Registrar::<T>::produce(cx)
+    }
 }
 
 #[cfg(test)]

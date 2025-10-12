@@ -1,4 +1,3 @@
-use comprehensive::ResourceDependencies;
 use comprehensive::v1::{AssemblyRuntime, Resource, resource};
 use comprehensive_grpc::GrpcClient;
 use std::sync::Arc;
@@ -20,20 +19,17 @@ struct GreeterInALoopArgs {
     greet_interval: Duration,
 }
 
-#[derive(ResourceDependencies)]
-struct GreeterInALoopDependencies {
-    client: Arc<Client>,
-    _spiffe: std::marker::PhantomData<comprehensive_spiffe::SpiffeTlsProvider>,
-}
-
 #[resource]
 impl Resource for GreeterInALoop {
     fn new(
-        d: GreeterInALoopDependencies,
+        (client_resource, _): (
+            Arc<Client>,
+            std::marker::PhantomData<comprehensive_spiffe::SpiffeTlsProvider>,
+        ),
         a: GreeterInALoopArgs,
         api: &mut AssemblyRuntime<'_>,
     ) -> Result<Arc<Self>, std::convert::Infallible> {
-        let mut client = d.client.client();
+        let mut client = client_resource.client();
         api.set_task(async move {
             loop {
                 println!("{:?}", client.greet(tonic::Request::new(())).await);
@@ -44,14 +40,6 @@ impl Resource for GreeterInALoop {
     }
 }
 
-#[derive(ResourceDependencies)]
-struct TopDependencies {
-    // Including this causes the greeter-in-a-loop to run.
-    _greeter: Arc<GreeterInALoop>,
-    // Serves metrics!
-    _diag: Arc<comprehensive_http::diag::HttpServer>,
-}
-
 #[tokio::main]
 pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
@@ -59,8 +47,13 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Will send gRPC greetings at regular intervals using a gRPC client
     // with or without TLS depending on flags, and also serve HTTP and/or
     // HTTPS (again, depending on flags) at least for metrics.
-    comprehensive::Assembly::<TopDependencies>::new()?
-        .run()
-        .await?;
+    comprehensive::Assembly::<(
+        // Including this causes the greeter-in-a-loop to run.
+        Arc<GreeterInALoop>,
+        // Serves metrics!
+        Arc<comprehensive_http::diag::HttpServer>,
+    )>::new()?
+    .run()
+    .await?;
     Ok(())
 }

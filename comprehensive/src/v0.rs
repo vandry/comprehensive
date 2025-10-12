@@ -44,6 +44,7 @@ use tokio::sync::{Notify, futures::Notified};
 use crate::ResourceDependencies;
 use crate::assembly::sealed::ResourceBase;
 use crate::assembly::{ProduceContext, RegisterContext};
+use crate::dependencies::sealed::AvailableResource;
 use crate::drop_stream::Sentinel;
 use crate::shutdown::{ShutdownSignalParticipant, ShutdownSignalParticipantCreator};
 
@@ -260,8 +261,23 @@ impl<T: Resource> ResourceBase<{ crate::ResourceVariety::V0 as usize }> for T {
     }
 }
 
-impl<T: Resource> crate::AnyResource<{ crate::ResourceVariety::V0 as usize }> for T {
-    const NAME: &str = T::NAME;
+#[doc(hidden)]
+pub struct ResourceProvider<T>(std::marker::PhantomData<T>);
+
+impl<T: Resource> AvailableResource for ResourceProvider<T> {
+    type ResourceType = T;
+
+    fn register(cx: &mut RegisterContext) {
+        crate::assembly::Registrar::<T>::register(cx);
+    }
+
+    fn register_without_dependency(cx: &mut RegisterContext) {
+        crate::assembly::Registrar::<T>::register_without_dependency(cx);
+    }
+
+    fn produce(cx: &mut ProduceContext) -> Result<Arc<T>, Box<dyn std::error::Error>> {
+        crate::assembly::Registrar::<T>::produce(cx)
+    }
 }
 
 #[cfg(test)]
@@ -332,7 +348,7 @@ mod tests {
 
     #[allow(dead_code)]
     #[derive(ResourceDependencies)]
-    struct MidDependencies(Arc<Leaf1>, Arc<Leaf2>);
+    struct MidDependencies(#[old_style] Arc<Leaf1>, #[old_style] Arc<Leaf2>);
 
     struct Mid;
 
@@ -352,7 +368,9 @@ mod tests {
 
     #[derive(ResourceDependencies)]
     struct TopDependencies {
+        #[old_style]
         _mid: Arc<Mid>,
+        #[old_style]
         _l2: Arc<Leaf2>,
     }
 
@@ -409,7 +427,7 @@ mod tests {
     }
 
     #[derive(ResourceDependencies)]
-    struct RunUntilSignaledTop(Arc<RunUntilSignaled>);
+    struct RunUntilSignaledTop(#[old_style] Arc<RunUntilSignaled>);
 
     #[test]
     fn runs_until_resource_quits() {
@@ -455,7 +473,7 @@ mod tests {
     }
 
     #[derive(ResourceDependencies)]
-    struct RunStubbornlyTop(Arc<RunStubbornly>);
+    struct RunStubbornlyTop(#[old_style] Arc<RunStubbornly>);
 
     #[tokio::test]
     async fn needs_2_sigterms() {
@@ -487,7 +505,7 @@ mod tests {
     }
 
     #[derive(ResourceDependencies)]
-    struct PropagatesShutdownTop(Arc<DoesNothing>);
+    struct PropagatesShutdownTop(#[old_style] Arc<DoesNothing>);
 
     #[test]
     fn idle_resource_propagates_shutdown() {

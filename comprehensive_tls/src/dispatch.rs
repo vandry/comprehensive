@@ -59,6 +59,7 @@ use std::task::{Context, Poll};
 use std::time::SystemTime;
 use thiserror::Error;
 use time::OffsetDateTime;
+use tracing::{error, info, warn};
 use x509_parser::certificate::X509Certificate;
 use x509_parser::prelude::FromDer;
 
@@ -231,7 +232,7 @@ where
 {
     let ttl = expiry - clock.now();
     if ttl < UNHEALTHY_TTL_THRESHOLD {
-        log::warn!(
+        warn!(
             "TLS identity valid until {} is already expired or very close to expiry",
             expiry
         );
@@ -258,7 +259,7 @@ impl<C: Clock> SingleProviderHealthTracker<C> {
             None => health.first_report(healthy),
             Some(previous) => {
                 if healthy && !previous.healthy {
-                    log::info!("TLS identity is no longer in danger of expiry");
+                    info!("TLS identity is no longer in danger of expiry");
                 }
                 health.update(previous.healthy, healthy);
             }
@@ -452,7 +453,7 @@ fn setup(
                     inner.slice[i].store(Some(Arc::new(snapshot)));
                 }
                 Poll::Ready(None) => {
-                    log::error!("TlsConfig: provider delivered a 0-length stream");
+                    error!("TlsConfig: provider delivered a 0-length stream");
                     return None;
                 }
                 Poll::Pending => {

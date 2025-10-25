@@ -45,6 +45,7 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
+use tracing::error;
 
 const PROBE_TIMEOUT: Duration = Duration::from_millis(5000);
 const PROBE_INTERVAL: Duration = Duration::from_millis(15000);
@@ -154,7 +155,7 @@ where
                         Some(n) => Instant::now().duration_since(n) >= REMIND_INTERVAL,
                     };
                     if complain {
-                        log::error!("S3 probe failed: {}", e);
+                        error!("S3 probe failed: {}", e);
                         notified = Some(Instant::now());
                     }
                     if healthy {

@@ -1,6 +1,6 @@
 [package]
 name = "comprehensive_s3"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 repository = "https://github.com/vandry/comprehensive.git"
 homepage = "https://github.com/vandry/comprehensive"
@@ -17,6 +17,6 @@ comprehensive = { path = "../comprehensive", version = "0.8" }
 const_format = "0.2"
 futures = "0.3"
 gensym = "0.1"
-log = "0.4"
 rust-s3 = "0.37"
 tokio = "1.40"
+tracing = "0.1.41"

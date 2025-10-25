@@ -23,6 +23,8 @@ use std::future::{Future, IntoFuture};
 use std::pin::{Pin, pin};
 use std::sync::Arc;
 use std::task::{Context, Poll, ready};
+use tracing::instrument::Instrument as _;
+use tracing::{Level, span};
 
 use crate::ResourceDependencies;
 use crate::assembly::sealed::{DependencyTest, ResourceBase, TraitRegisterContext};
@@ -483,6 +485,7 @@ trait Task: Send {
         stopper: ShutdownSignalParticipant,
         keepalive: Sentinel,
         auto_stop: bool,
+        name: &str,
     ) -> ResourceFut;
 }
 
@@ -498,11 +501,13 @@ where
         stopper: ShutdownSignalParticipant,
         keepalive: Sentinel,
         auto_stop: bool,
+        name: &str,
     ) -> ResourceFut {
+        let span = span!(Level::INFO, "Comprehensive", resource = name);
         if auto_stop {
-            Box::pin(AutoStopTask::new(self.0, stopper, keepalive))
+            Box::pin(AutoStopTask::new(self.0, stopper, keepalive).instrument(span))
         } else {
-            Box::pin(SelfStopTask::new(self.0, stopper, keepalive))
+            Box::pin(SelfStopTask::new(self.0, stopper, keepalive).instrument(span))
         }
     }
 }
@@ -550,25 +555,30 @@ where
         stopper: ShutdownSignalParticipant,
         keepalive: Sentinel,
         _: bool,
+        name: &str,
     ) -> ResourceFut {
-        Box::pin(async move {
-            let mut stopper = pin!(stopper);
-            let a = TaskWithCleanupMain {
-                stopper: stopper.as_mut(),
-                main_task: self.0.main_task(),
-                keepalive: Some(keepalive),
-            }
-            .await?;
-            match a {
-                CleanupFollowup::MainExited => stopper.await,
-                CleanupFollowup::ShutdownRequested(forwarder, _keepalive) => {
-                    self.0.cleanup().await?;
-                    forwarder
+        let span = span!(Level::INFO, "Comprehensive", resource = name);
+        Box::pin(
+            async move {
+                let mut stopper = pin!(stopper);
+                let a = TaskWithCleanupMain {
+                    stopper: stopper.as_mut(),
+                    main_task: self.0.main_task(),
+                    keepalive: Some(keepalive),
                 }
+                .await?;
+                match a {
+                    CleanupFollowup::MainExited => stopper.await,
+                    CleanupFollowup::ShutdownRequested(forwarder, _keepalive) => {
+                        self.0.cleanup().await?;
+                        forwarder
+                    }
+                }
+                .propagate();
+                Ok(())
             }
-            .propagate();
-            Ok(())
-        })
+            .instrument(span),
+        )
     }
 }
 
@@ -636,7 +646,7 @@ impl<T: Resource> ResourceBase<{ crate::ResourceVariety::V1 as usize }> for T {
         p: Self::Production,
     ) -> Pin<Box<dyn Future<Output = Result<(), Box<dyn Error>>> + Send>> {
         match p.task {
-            Some(t) => t.into_task(p.stopper, p.keepalive, p.auto_stop),
+            Some(t) => t.into_task(p.stopper, p.keepalive, p.auto_stop, Self::NAME),
             None => Box::pin(async move {
                 p.stopper.await.propagate();
                 Ok(())

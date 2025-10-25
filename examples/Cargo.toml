@@ -19,12 +19,12 @@ comprehensive = { path = "../comprehensive", version = "0.8" }
 comprehensive_grpc = { path = "../comprehensive_grpc", version = "0.8", features = ["tls"] }
 comprehensive_http = { path = "../comprehensive_http", version = "0.3", features = ["tls"] }
 comprehensive_spiffe = { path = "../comprehensive_spiffe", version = "0.3" }
-env_logger = "0.11"
 humantime = "2.1"
 prost = "0.13"
 tokio = { version = "1.40", features = ["rt-multi-thread", "macros"] }
 tokio-rustls = "0.26"
 tonic = "0.12"
+tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 
 [build-dependencies]
 tonic-build = "0.12"

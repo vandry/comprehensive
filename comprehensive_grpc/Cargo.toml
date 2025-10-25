@@ -1,6 +1,6 @@
 [package]
 name = "comprehensive_grpc"
-version = "0.8.0"
+version = "0.8.1"
 edition = "2024"
 repository = "https://github.com/vandry/comprehensive.git"
 homepage = "https://github.com/vandry/comprehensive"
@@ -23,7 +23,6 @@ comprehensive_warm_channels = { path = "../comprehensive_warm_channels", version
 futures = "0.3"
 http = "1.1"
 humantime = "2.1"
-log = "0.4"
 pin-project-lite = { version = "0.2", optional = true }
 prometheus = "0.13"
 prost = "0.13"
@@ -39,6 +38,7 @@ tonic_prometheus_layer = "0.1"
 tower = "0.5"
 tower-layer = "0.3"
 tower-service = "0.3.3"
+tracing = "0.1.41"
 warm_channels = { version = "0.2", features = ["grpc", "metrics"] }
 
 [features]

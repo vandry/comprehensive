@@ -63,6 +63,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::watch;
+use tracing::{info, warn};
 
 use crate::{NoArgs, NoDependencies, Resource};
 
@@ -196,7 +197,7 @@ impl HealthReporter {
             let deadline = tokio::time::Instant::now() + STARTUP_ANNOUNCE_INTERVAL;
             loop {
                 if *rx.borrow_and_update() {
-                    log::info!(
+                    info!(
                         "After {}s, monitoring {} signals, all healthy",
                         std::time::Instant::now()
                             .duration_since(start)
@@ -214,7 +215,7 @@ impl HealthReporter {
                 }
             }
             let (list, count) = self.unhealthy_list();
-            log::warn!(
+            warn!(
                 "After {}s, {} signals are still unhealthy: {}",
                 std::time::Instant::now()
                     .duration_since(start)
@@ -237,13 +238,13 @@ impl HealthReporter {
         while !*rx.borrow_and_update() {
             let (list, count) = self.unhealthy_list();
             if count != last_count || list != last_list {
-                log::warn!("{} unhealthy signal: {}", count, list);
+                warn!("{} unhealthy signal: {}", count, list);
                 last_count = count;
                 last_list = list;
             }
             let _ = rx.changed().await;
         }
-        log::info!("All {} signals are healthy again", self.signals.count());
+        info!("All {} signals are healthy again", self.signals.count());
     }
 }
 
@@ -262,7 +263,7 @@ impl Resource for HealthReporter {
 
     async fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
         if self.signals.is_empty() {
-            log::info!("No health signals registered. Server is trivially always healthy.");
+            info!("No health signals registered. Server is trivially always healthy.");
             return Ok(());
         }
         let mut rx = self.watch.subscribe();

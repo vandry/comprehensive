@@ -41,6 +41,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use topological_sort::TopologicalSort;
+use tracing::{Level, error, info, instrument, span, warn};
 
 use crate::dependencies::ResourceDependencies;
 use crate::drop_stream::{DropStream, Sentinel};
@@ -57,6 +58,7 @@ enum ResourceInstantiationErrorUnderlying {
 
 #[derive(Debug)]
 struct ResourceInstantiationError {
+    tracing_span: Option<tracing::Span>,
     node_name: Option<&'static str>,
     underlying: ResourceInstantiationErrorUnderlying,
 }
@@ -75,8 +77,10 @@ impl ResourceInstantiationError {
         e: Box<dyn Error>,
         cx: &mut ProduceContext<'_>,
         node_name: Option<&'static str>,
+        tracing_span: Option<tracing::Span>,
     ) -> Self {
         Self {
+            tracing_span,
             node_name,
             underlying: match e.downcast::<ErrorIsInProduceContext>() {
                 Ok(_) => ResourceInstantiationErrorUnderlying::FailedDependencies(std::mem::take(
@@ -92,6 +96,7 @@ impl ResourceInstantiationError {
         node_name: Option<&'static str>,
     ) -> Self {
         Self {
+            tracing_span: None,
             node_name,
             underlying: ResourceInstantiationErrorUnderlying::FailedDependencies(e.collect()),
         }
@@ -186,15 +191,25 @@ impl<T: sealed::ResourceBase<U>, const U: usize> NodeTrait for Node<T, U> {
         keepalive: MakeSentinel<'_>,
         dependency_test: sealed::DependencyTest,
     ) {
+        let span = span!(Level::INFO, "Comprehensive", resource = T::NAME);
         let _ = self.production.set(
-            <T as sealed::ResourceBase<U>>::make(
-                cx,
-                arg_matches,
-                stoppers,
-                keepalive.make(),
-                dependency_test,
-            )
-            .map_err(|e| Rc::new(ResourceInstantiationError::new(e, cx, Some(T::NAME)))),
+            span.in_scope(|| {
+                <T as sealed::ResourceBase<U>>::make(
+                    cx,
+                    arg_matches,
+                    stoppers,
+                    keepalive.make(),
+                    dependency_test,
+                )
+            })
+            .map_err(|e| {
+                Rc::new(ResourceInstantiationError::new(
+                    e,
+                    cx,
+                    Some(T::NAME),
+                    Some(span),
+                ))
+            }),
         );
         cx.make_errors.clear();
     }
@@ -602,12 +617,12 @@ impl<T: Stream> Future for TerminationSignal<T> {
                 let _ = ready!(s.poll_next(cx));
                 match this.shutdown_notify.take() {
                     Some(n) => {
-                        log::warn!("SIGTERM received; shutting down");
+                        warn!("SIGTERM received; shutting down");
                         n.propagate();
                         continue;
                     }
                     None => {
-                        log::warn!("SIGTERM received again; quitting immediately.");
+                        warn!("SIGTERM received again; quitting immediately.");
                     }
                 }
             }
@@ -717,12 +732,8 @@ fn log_failures(
 ) -> impl Iterator<Item = usize> {
     ConsumeReady(task_quits).inspect(move |failed_i| {
         if let Some(e) = nodes[*failed_i].error() {
-            log::warn!(
-                "{} {} failed to initialise: {}",
-                msg,
-                nodes[*failed_i].name(),
-                e
-            );
+            let _enter = e.tracing_span.as_ref().map(tracing::Span::enter);
+            warn!("{} failed to initialise: {}", msg, e);
         }
     })
 }
@@ -792,6 +803,8 @@ where
         I: IntoIterator<Item = A>,
         A: Into<std::ffi::OsString> + Clone,
     {
+        let span = span!(Level::INFO, "Assembly::new");
+        let enter = span.enter();
         let AssemblySetup {
             nodes,
             type_map,
@@ -839,8 +852,8 @@ where
         let mut task_quits = task_quits_gen.into_stream();
         let top = T::produce(&mut cx).map_err(|e| {
             let _ = log_failures("Resource", &mut task_quits, &nodes).last();
-            let e = ResourceInstantiationError::new(e, &mut cx, None);
-            log::error!("Failed to construct assembly: {}", e);
+            let e = ResourceInstantiationError::new(e, &mut cx, None, None);
+            error!("Failed to construct assembly: {}", e);
             e
         })?;
         let root_participant_iter = participants
@@ -864,9 +877,9 @@ where
             .iter()
             .map(|n| if n.created() { Some(n.name()) } else { None })
             .collect();
+        drop(enter);
         let tasks = nodes.into_iter().filter_map(|n| n.task()).collect();
         shutdown_notify.accept_dep_matrix(dep_matrix);
-
         Ok(Self {
             tasks,
             names,
@@ -893,6 +906,7 @@ where
     ///
     /// Callers should usually use [`Assembly::run`] instead, which installs a
     /// `SIGTERM` handler and then calls this with it.
+    #[instrument(name = "Assembly", skip_all)]
     pub async fn run_with_termination_signal(
         self,
         termination_signal: impl Stream<Item = ()> + Unpin,
@@ -904,7 +918,7 @@ where
             mut task_quits,
             top: _,
         } = self;
-        log::info!(
+        info!(
             "Comprehensive starting with {} resources: {}",
             names.iter().filter(|n| n.is_some()).count(),
             active_list(&names)
@@ -930,7 +944,7 @@ where
                 Poll::Pending => false,
             };
             if tasks.is_terminated() || task_quits.is_terminated() {
-                log::info!("After startup, no resources remain running. Quit.");
+                info!("After startup, no resources remain running. Quit.");
                 return Ok(());
             }
             if !progress1 && !progress2 {
@@ -939,7 +953,7 @@ where
         }
 
         // Blocking loop for the rest of time.
-        log::info!(
+        info!(
             "After startup, {} resources are running: {}",
             names.iter().filter(|n| n.is_some()).count(),
             active_list(&names)
@@ -1019,17 +1033,6 @@ where
 #[derive(clap::Args, Debug, Default)]
 #[group(skip)]
 pub struct NoArgs {}
-
-pub(crate) fn log_resource_result<T, U: std::fmt::Display>(r: &Result<T, U>, name: &str) {
-    match r {
-        Err(e) => {
-            log::error!("{} failed: {}", name, e);
-        }
-        Ok(_) => {
-            log::info!("{} exited successfully", name);
-        }
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -1516,6 +1519,7 @@ mod tests {
             .downcast::<ResourceInstantiationError>()
             .expect("ResourceInstantiationError");
         let ResourceInstantiationError {
+            tracing_span: None,
             node_name: None,
             underlying: ResourceInstantiationErrorUnderlying::FailedDependencies(v),
         } = *make_error
@@ -1524,6 +1528,7 @@ mod tests {
         };
         assert_eq!(v.len(), 1, "expect 2 error: {:?}", v);
         let ResourceInstantiationError {
+            tracing_span: Some(_),
             node_name: Some(n),
             underlying: ResourceInstantiationErrorUnderlying::FailedDependencies(ref d),
         } = *v[0]
@@ -1533,6 +1538,7 @@ mod tests {
         assert_eq!(n, "DependsOnFailsToCreate");
         assert_eq!(d.len(), 2, "expect 2 error: {:?}", d);
         let ResourceInstantiationError {
+            tracing_span: Some(_),
             node_name: Some(n1),
             underlying: ResourceInstantiationErrorUnderlying::Leaf(ref l1),
         } = *d[0]
@@ -1542,6 +1548,7 @@ mod tests {
         assert_eq!(n1, "FailsToCreate");
         assert_eq!(l1.to_string(), "init problem 1");
         let ResourceInstantiationError {
+            tracing_span: Some(_),
             node_name: Some(n2),
             underlying: ResourceInstantiationErrorUnderlying::Leaf(ref l2),
         } = *d[1]
@@ -1590,6 +1597,7 @@ mod tests {
             .downcast::<ResourceInstantiationError>()
             .expect("ResourceInstantiationError");
         let ResourceInstantiationError {
+            tracing_span: None,
             node_name: None,
             underlying: ResourceInstantiationErrorUnderlying::FailedDependencies(v),
         } = *make_error
@@ -1598,6 +1606,7 @@ mod tests {
         };
         assert_eq!(v.len(), 1, "expect 2 error: {:?}", v);
         let ResourceInstantiationError {
+            tracing_span: Some(_),
             node_name: Some(n),
             underlying: ResourceInstantiationErrorUnderlying::FailedDependencies(ref d),
         } = *v[0]
@@ -1607,6 +1616,7 @@ mod tests {
         assert_eq!(n, "HalfDependsOnFailsToCreate");
         assert_eq!(d.len(), 1, "expect 1 error: {:?}", d);
         let ResourceInstantiationError {
+            tracing_span: Some(_),
             node_name: Some(n1),
             underlying: ResourceInstantiationErrorUnderlying::Leaf(ref l1),
         } = *d[0]

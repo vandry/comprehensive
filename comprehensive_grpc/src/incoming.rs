@@ -17,6 +17,7 @@ use tokio_rustls::server::TlsStream;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::server::{TcpConnectInfo, TlsConnectInfo};
 use tower_service::Service;
+use tracing::warn;
 
 type StreamResult<S> = std::io::Result<TlsStream<S>>;
 
@@ -72,7 +73,7 @@ where
                 Poll::Ready(None) => (),
                 // Pending TLS handshake JoinError (panic?)
                 Poll::Ready(Some(Err(e))) => {
-                    log::warn!("TLS accept task error: {}", e);
+                    warn!("TLS accept task error: {}", e);
                     continue;
                 }
                 // TLS handshake succeeded

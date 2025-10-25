@@ -40,6 +40,8 @@ use std::pin::{Pin, pin};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio::sync::{Notify, futures::Notified};
+use tracing::instrument::Instrument as _;
+use tracing::{Level, error, info, span};
 
 use crate::ResourceDependencies;
 use crate::assembly::sealed::ResourceBase;
@@ -145,7 +147,6 @@ pin_project! {
     struct NotifyInner<F> {
         #[pin] fut: F,
         task_running: Sentinel,
-        name: &'static str,
     }
 }
 
@@ -162,15 +163,10 @@ impl<F> NotifyHelper<F> {
         notify: Arc<Notify>,
         sub: ShutdownSignalParticipant,
         task_running: Sentinel,
-        name: &'static str,
     ) -> Self {
         Self {
             forward: Some(NotifyForward { notify, sub }),
-            inner: Some(NotifyInner {
-                fut,
-                task_running,
-                name,
-            }),
+            inner: Some(NotifyInner { fut, task_running }),
         }
     }
 }
@@ -198,10 +194,15 @@ where
         if let Some(inner) = this.inner.as_mut().as_pin_mut() {
             let inner = inner.project();
             let r = ready!(inner.fut.poll(cx));
-            crate::assembly::log_resource_result(&r, inner.name);
             this.inner.set(None);
-            if r.is_err() {
-                return Poll::Ready(r);
+            match r {
+                Err(e) => {
+                    error!("failed: {}", e);
+                    return Poll::Ready(Err(e));
+                }
+                Ok(_) => {
+                    info!("exited successfully");
+                }
             }
         }
         if this.forward.is_none() && this.inner.is_none() {
@@ -246,18 +247,21 @@ impl<T: Resource> ResourceBase<{ crate::ResourceVariety::V0 as usize }> for T {
     ) -> Pin<Box<dyn Future<Output = Result<(), Box<dyn Error>>> + Send>> {
         let notify = Arc::new(Notify::new());
         let notify2 = Arc::clone(&notify);
-        Box::pin(NotifyHelper::new(
-            async move {
-                let shutdown_notify = ShutdownNotify::new(&notify2);
-                user_task
-                    .run_with_termination_signal(&shutdown_notify)
-                    .await
-            },
-            notify,
-            shutdown_participant,
-            task_running,
-            T::NAME,
-        ))
+        let span = span!(Level::INFO, "Comprehensive", resource = T::NAME);
+        Box::pin(
+            NotifyHelper::new(
+                async move {
+                    let shutdown_notify = ShutdownNotify::new(&notify2);
+                    user_task
+                        .run_with_termination_signal(&shutdown_notify)
+                        .await
+                },
+                notify,
+                shutdown_participant,
+                task_running,
+            )
+            .instrument(span),
+        )
     }
 }
 

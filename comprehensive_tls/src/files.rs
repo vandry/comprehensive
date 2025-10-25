@@ -26,6 +26,7 @@ use std::task::Context;
 use std::time::SystemTime;
 use thiserror::Error;
 use time::OffsetDateTime;
+use tracing::{info, warn};
 use x509_parser::prelude::{FromDer, GeneralName, X509Certificate};
 
 use crate::api::{
@@ -267,7 +268,7 @@ impl Loader {
                 })
             })
             .unwrap_or_default();
-        log::info!("Loaded identity with names {:?}", names);
+        info!("Loaded identity with names {:?}", names);
         let soonest_expiration = parsed
             .filter_map(|r| r.map(|(_, c)| c.validity().not_after.to_datetime()))
             .min();
@@ -281,7 +282,7 @@ impl Loader {
                 .map(|der| Ok(webpki::anchor_from_trusted_cert(&der?)?.to_owned()))
                 .collect::<Result<Arc<[_]>, TlsConfigFilesError>>()?;
             if cert.is_empty() {
-                log::warn!("No root certificates loaded from file {}", path.display());
+                warn!("No root certificates loaded from file {}", path.display());
             }
             (Some(cert), cert_sentinel)
         } else {
@@ -328,7 +329,7 @@ impl Loader {
                         }
                         Err(e) => {
                             if let Some(ref path) = self.cacert_path {
-                                log::warn!(
+                                warn!(
                                     "Could not reload TLS key and cert from {}, {}, and {}: {}",
                                     self.key_path.display(),
                                     self.cert_path.display(),
@@ -336,7 +337,7 @@ impl Loader {
                                     e
                                 );
                             } else {
-                                log::warn!(
+                                warn!(
                                     "Could not reload TLS key and cert from {} and {}: {}",
                                     self.key_path.display(),
                                     self.cert_path.display(),

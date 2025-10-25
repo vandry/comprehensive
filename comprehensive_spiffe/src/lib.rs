@@ -29,6 +29,7 @@ use std::collections::hash_map::Entry;
 use std::sync::Arc;
 use thiserror::Error;
 use time::OffsetDateTime;
+use tracing::{error, info, warn};
 use x509_parser::certificate::X509Certificate;
 
 mod pb {
@@ -395,7 +396,7 @@ impl TryFrom<(pb::X509svidResponse, &'_ CryptoProvider)> for SpiffeConfig {
                 match conf.domain_index.entry(host.to_owned()) {
                     Entry::Occupied(other) => {
                         let other = *other.get();
-                        log::warn!(
+                        warn!(
                             "SPIFFE ids {} and {} have the same domain. Will provide root_hint_subjects only for the first one when expecting servers in that domain.",
                             conf.get_bundle(other).map(|b| &b.id).unwrap(),
                             bundle.id
@@ -410,7 +411,7 @@ impl TryFrom<(pb::X509svidResponse, &'_ CryptoProvider)> for SpiffeConfig {
                 match conf.root_index.entry(subject.as_ref().to_vec()) {
                     Entry::Occupied(other) => {
                         let other = *other.get();
-                        log::warn!(
+                        warn!(
                             "SPIFFE ids {} and {} share a trust root. Will select only the first identity when that trust root is received through root_hint_subjects.",
                             conf.get_bundle(other).map(|b| &b.id).unwrap(),
                             bundle.id
@@ -424,7 +425,7 @@ impl TryFrom<(pb::X509svidResponse, &'_ CryptoProvider)> for SpiffeConfig {
             if matches!(i, SvidReference::Native(_)) {
                 match conf.uri_index.entry(bundle.id.clone()) {
                     Entry::Occupied(_) => {
-                        log::warn!(
+                        warn!(
                             "SPIFFE id {} is duplicated. Only one of them will be selectable as a requested local ID.",
                             bundle.id
                         );
@@ -435,7 +436,7 @@ impl TryFrom<(pb::X509svidResponse, &'_ CryptoProvider)> for SpiffeConfig {
                 }
             }
         }
-        log::info!(
+        info!(
             "{} local SPIFFE identities loaded: {}",
             conf.svids.len(),
             conf.svids
@@ -455,7 +456,7 @@ fn grpc_client_defaults() -> GrpcClientResourceDefaults {
                 d.connect_uri = Some(format!("unix:/{}", path).into());
                 d.uri = Some("http://localhost/".into());
             } else {
-                log::warn!("Only unix:///path is supported for $SPIFFE_ENDPOINT_SOCKET");
+                warn!("Only unix:///path is supported for $SPIFFE_ENDPOINT_SOCKET");
             }
         }
         Err(_) => {
@@ -554,11 +555,11 @@ async fn handle_stream<S, E, B>(
                     backoff.reset();
                 }
                 Err(e) => {
-                    log::error!("X509SVIDResponse: {}", e);
+                    error!("X509SVIDResponse: {}", e);
                 }
             },
             Err(e) => {
-                log::error!("Error requesting SPIFFE X.509 SVID: {}", e);
+                error!("Error requesting SPIFFE X.509 SVID: {}", e);
             }
         }
     }
@@ -596,7 +597,7 @@ impl Resource for SpiffeTlsProvider {
                             .await
                     }
                     Err(e) => {
-                        log::error!("FetchX509SVID: {:?}", e);
+                        error!("FetchX509SVID: {:?}", e);
                     }
                 }
                 match backoff.next_backoff() {

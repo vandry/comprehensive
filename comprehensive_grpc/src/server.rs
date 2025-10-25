@@ -47,12 +47,16 @@ use std::collections::HashSet;
 use std::convert::Infallible;
 use std::net::IpAddr;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::body::BoxBody;
 use tonic::server::NamedService;
 use tonic::service::Routes;
 use tonic_prometheus_layer::MetricsLayer;
+use tower_layer::{Layer, Stack};
 use tower_service::Service;
+use tracing::Instrument as _;
+use tracing::{error, info};
 
 use super::{ComprehensiveGrpcError, GrpcService};
 
@@ -101,7 +105,7 @@ impl GrpcServiceAdder {
                     r.fds.push(fds);
                 }
                 Err(e) => {
-                    log::error!("Error deserialising fdset (ignoring): {}", e);
+                    error!("Error deserialising fdset (ignoring): {}", e);
                 }
             }
         }
@@ -153,11 +157,44 @@ impl GrpcServiceAdder {
                     routes = routes.add_service(svc);
                 }
                 Err(e) => {
-                    log::error!("Error creating gRPC reflection service: {}", e);
+                    error!("Error creating gRPC reflection service: {}", e);
                 }
             }
         }
         (routes, self.relay)
+    }
+}
+
+#[derive(Clone)]
+struct SpannedService<S>(S, tracing::Span);
+
+impl<R, S: Service<R>> Service<R> for SpannedService<S> {
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = tracing::instrument::Instrumented<S::Future>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        let _g = self.1.enter();
+        self.0.poll_ready(cx)
+    }
+
+    fn call(&mut self, r: R) -> Self::Future {
+        {
+            let _g = self.1.enter();
+            self.0.call(r)
+        }
+        .instrument(self.1.clone())
+    }
+}
+
+#[derive(Clone)]
+struct PropagateTracingSpanLayer;
+
+impl<S> Layer<S> for PropagateTracingSpanLayer {
+    type Service = SpannedService<S>;
+
+    fn layer(&self, inner: S) -> SpannedService<S> {
+        SpannedService(inner, tracing::Span::current())
     }
 }
 
@@ -170,12 +207,14 @@ fn tonic_prometheus_layer_use_default_registry() {
     );
 }
 
-type Layer = tower_layer::Stack<MetricsLayer, tower_layer::Identity>;
+type BaseLayer = Stack<MetricsLayer, Stack<PropagateTracingSpanLayer, tower_layer::Identity>>;
 
-fn new_base_layer() -> tonic::transport::Server<Layer> {
+fn new_base_layer() -> tonic::transport::Server<BaseLayer> {
     tonic_prometheus_layer_use_default_registry();
     let metrics_layer = tonic_prometheus_layer::MetricsLayer::new();
-    tonic::transport::Server::builder().layer(metrics_layer)
+    tonic::transport::Server::builder()
+        .layer(PropagateTracingSpanLayer)
+        .layer(metrics_layer)
 }
 
 mod routes {
@@ -276,7 +315,7 @@ mod insecure_server {
                         listener.set_nonblocking(true)?;
                         let incoming =
                             TcpListenerStream::new(tokio::net::TcpListener::from_std(listener)?);
-                        log::info!("Insecure gRPC server listening on {}", addr);
+                        info!("Insecure gRPC server listening on {}", addr);
                         Ok::<_, crate::ComprehensiveGrpcError>(AtomicTake::new(incoming))
                     })
                     .transpose()?
@@ -319,7 +358,7 @@ mod insecure_server {
                     .add_routes(d.routes.routes())
                     .serve_with_incoming_shutdown(listener, api.self_stop());
                 api.set_task(async move {
-                    tokio::spawn(server).await??;
+                    tokio::spawn(server.in_current_span()).await??;
                     Ok(())
                 });
             }
@@ -384,7 +423,7 @@ mod secure_server {
                         };
                         let addr = (args.grpcs_bind_addr, port).into();
                         let incoming = crate::incoming::tls_over_tcp(addr, tlsc)?;
-                        log::info!("Secure gRPC server listening on {}", addr);
+                        info!("Secure gRPC server listening on {}", addr);
                         Ok(AtomicTake::new(incoming))
                     })
                     .transpose()?
@@ -430,7 +469,7 @@ mod secure_server {
                     .add_routes(d.routes.routes())
                     .serve_with_incoming_shutdown(listener, api.self_stop());
                 api.set_task(async move {
-                    tokio::spawn(server).await??;
+                    tokio::spawn(server.in_current_span()).await??;
                     Ok(())
                 });
             }

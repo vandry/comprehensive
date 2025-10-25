@@ -61,9 +61,79 @@ use comprehensive::v1::{AssemblyRuntime, Resource, StopSignal, resource};
 use comprehensive::{NoArgs, NoDependencies, ResourceDependencies};
 use futures::future::Either;
 use futures::pin_mut;
+use pin_project_lite::pin_project;
 use std::marker::PhantomData;
 use std::net::IpAddr;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
+use tower_service::Service;
+use tracing::instrument::Instrument as _;
+use tracing::{Span, info, warn};
+
+#[derive(Clone)]
+struct SpannedService<S>(S, Span);
+
+impl<R, S: Service<R>> Service<R> for SpannedService<S> {
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = tracing::instrument::Instrumented<S::Future>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        let _g = self.1.enter();
+        self.0.poll_ready(cx)
+    }
+
+    fn call(&mut self, r: R) -> Self::Future {
+        {
+            let _g = self.1.enter();
+            self.0.call(r)
+        }
+        .instrument(self.1.clone())
+    }
+}
+
+pin_project! {
+    struct MakeSpannedService<F> {
+        #[pin] inner: F,
+        span: Span,
+    }
+}
+
+impl<F, S, E> Future for MakeSpannedService<F>
+where
+    F: Future<Output = Result<S, E>>,
+{
+    type Output = Result<SpannedService<S>, E>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.project();
+        match this.inner.poll(cx) {
+            Poll::Ready(Ok(s)) => Poll::Ready(Ok(SpannedService(s, this.span.clone()))),
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+struct MakeService<S>(S, Span);
+
+impl<R, S: Service<R>> Service<R> for MakeService<S> {
+    type Response = SpannedService<S::Response>;
+    type Error = S::Error;
+    type Future = MakeSpannedService<S::Future>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.0.poll_ready(cx)
+    }
+
+    fn call(&mut self, r: R) -> Self::Future {
+        MakeSpannedService {
+            inner: self.0.call(r),
+            span: self.1.clone(),
+        }
+    }
+}
 
 async fn run_in_task<A>(
     b: axum_server::Server<A>,
@@ -71,15 +141,21 @@ async fn run_in_task<A>(
     router: Router,
 ) -> Result<(), Box<dyn std::error::Error>>
 where
-    A: axum_server::accept::Accept<tokio::net::TcpStream, Router> + Clone + Send + Sync + 'static,
+    A: axum_server::accept::Accept<tokio::net::TcpStream, SpannedService<Router>>
+        + Clone
+        + Send
+        + Sync
+        + 'static,
     A::Stream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
     A::Service: axum_server::service::SendService<http::Request<hyper::body::Incoming>> + Send,
     A::Future: Send,
 {
     let handle = axum_server::Handle::new();
     let handle_for_task = handle.clone();
-    let make_service = router.into_make_service();
-    let task = tokio::spawn(async move { b.handle(handle_for_task).serve(make_service).await });
+    let make_service = MakeService(router.into_make_service(), Span::current());
+    let task = tokio::spawn(
+        async move { b.handle(handle_for_task).serve(make_service).await }.in_current_span(),
+    );
     pin_mut!(term);
     pin_mut!(task);
     match futures::future::select(term, task).await {
@@ -210,7 +286,7 @@ mod insecure_server {
                 Some(port) => {
                     let addr = (args.http_bind_addr, port).into();
                     let server = axum_server::bind(addr);
-                    log::info!("{}: Insecure HTTP server listening on {}", I::NAME, addr);
+                    info!("{}: Insecure HTTP server listening on {}", I::NAME, addr);
                     let shared = Arc::new(Self {
                         conf: Some(Conveyor::new()),
                         _i: PhantomData,
@@ -314,7 +390,7 @@ mod secure_server {
             sc.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
             let config = RustlsConfig::from_config(Arc::new(sc));
             let server = axum_server::bind_rustls(addr, config);
-            log::info!("{}: Secure HTTP server listening on {}", I::NAME, addr);
+            info!("{}: Secure HTTP server listening on {}", I::NAME, addr);
             let shared = Arc::new(Self {
                 conf: Some(Conveyor::new()),
                 _i: PhantomData,
@@ -406,7 +482,7 @@ impl<I: HttpServingInstance> IntoFuture for ConfigureServers<I> {
     fn into_future(self) -> Self::IntoFuture {
         #[cfg(not(feature = "tls"))]
         if self.deps.http.conf.is_none() {
-            log::warn!(
+            warn!(
                 "{}: No insecure HTTP listener, and secure HTTP is not available because feature \"tls\" is not built.",
                 I::NAME
             );
@@ -415,7 +491,7 @@ impl<I: HttpServingInstance> IntoFuture for ConfigureServers<I> {
 
         #[cfg(feature = "tls")]
         if self.deps.http.conf.is_none() && self.deps.https.conf.is_none() {
-            log::warn!("{}: No insecure or secure HTTP listener.", I::NAME);
+            warn!("{}: No insecure or secure HTTP listener.", I::NAME);
             return NoTask;
         }
 

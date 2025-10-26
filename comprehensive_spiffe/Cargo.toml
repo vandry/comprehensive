@@ -1,6 +1,6 @@
 [package]
 name = "comprehensive_spiffe"
-version = "0.3.1"
+version = "0.4.0"
 edition = "2024"
 repository = "https://github.com/vandry/comprehensive.git"
 homepage = "https://github.com/vandry/comprehensive"
@@ -14,24 +14,25 @@ rustdoc-args = ["--cfg", "docsrs"]
 [dependencies]
 backoff = "0.4.0"
 clap = { version = "4.5", features = ["derive"] }
-comprehensive = { path = "../comprehensive", version = "0.8" }
-comprehensive_grpc = { path = "../comprehensive_grpc", version = "0.8" }
-comprehensive_tls = { path = "../comprehensive_tls", version = "0.4", default-features = false }
+comprehensive = { path = "../comprehensive", version = "0.9" }
+comprehensive_grpc = { path = "../comprehensive_grpc", version = "0.9" }
+comprehensive_tls = { path = "../comprehensive_tls", version = "0.5", default-features = false }
 futures = "0.3"
 html-escape = "0.2.13"
 http = "1.3.1"
 itertools = "0.14.0"
-prost = "0.13"
-prost-types = "0.13.5"
+prost = "0.14.1"
+prost-types = "0.14.1"
 rustls-webpki = "0.103.3"
 thiserror = "2.0.12"
 time = "0.3.41"
 tokio = { version = "1.40", features = ["time"] }
-tonic = "0.12"
+tonic = "0.14.1"
+tonic-prost = "0.14.2"
 tracing = "0.1.41"
 
 [build-dependencies]
-tonic-build = "0.12"
+tonic-prost-build = "0.14.1"
 
 [dev-dependencies]
 hex-literal = "1.0.0"

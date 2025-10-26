@@ -1,6 +1,6 @@
 [package]
 name = "comprehensive_http"
-version = "0.3.1"
+version = "0.4.0"
 edition = "2024"
 repository = "https://github.com/vandry/comprehensive.git"
 homepage = "https://github.com/vandry/comprehensive"
@@ -16,15 +16,15 @@ rustdoc-args = ["--cfg", "docsrs"]
 axum = "0.7"
 axum-server = "0.7"
 clap = { version = "4.5", features = ["derive"] }
-comprehensive = { path = "../comprehensive", version = "0.8" }
+comprehensive = { path = "../comprehensive", version = "0.9" }
 comprehensive_macros = { path = "../comprehensive_macros", version = "0.5" }
-comprehensive_tls = { path = "../comprehensive_tls", version = "0.4", optional = true }
+comprehensive_tls = { path = "../comprehensive_tls", version = "0.5", optional = true }
 comprehensive_traits = { path = "../comprehensive_traits", version = "0.2", features = ["http_diag"] }
 futures = "0.3"
 http = "1.1"
 hyper = "1.4"
 pin-project-lite = "0.2.16"
-prometheus = "0.13"
+prometheus = "0.14"
 thiserror = "2.0.12"
 tokio = { version = "1.40", features = ["macros", "rt-multi-thread", "signal"] }
 tower-service = "0.3"

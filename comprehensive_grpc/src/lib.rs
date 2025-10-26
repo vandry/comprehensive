@@ -166,15 +166,6 @@ pub trait GrpcService {
     ) -> Result<(), ComprehensiveGrpcError>;
 }
 
-fn tonic_prometheus_layer_use_default_registry() {
-    let _ = tonic_prometheus_layer::metrics::try_init_settings(
-        tonic_prometheus_layer::metrics::GlobalSettings {
-            registry: prometheus::default_registry().clone(), // Arc
-            ..Default::default()
-        },
-    );
-}
-
 /// Error type returned by various Comprehensive gRPC functions
 #[derive(Debug, Error)]
 pub enum ComprehensiveGrpcError {

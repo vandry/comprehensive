@@ -49,7 +49,7 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio_stream::wrappers::TcpListenerStream;
-use tonic::body::BoxBody;
+use tonic::body::Body;
 use tonic::server::NamedService;
 use tonic::service::Routes;
 use tower_layer::{Layer, Stack};
@@ -123,10 +123,11 @@ impl GrpcServiceAdder {
     /// trait, this is called automatically.
     pub fn add_service<S>(&mut self, svc: S) -> Result<(), ComprehensiveGrpcError>
     where
-        S: Service<http::Request<BoxBody>, Response = http::Response<BoxBody>, Error = Infallible>
+        S: Service<http::Request<Body>, Response = http::Response<Body>, Error = Infallible>
             + NamedService
             + Clone
             + Send
+            + Sync
             + 'static,
         S::Future: Send + 'static,
         S::Error: Into<Box<dyn std::error::Error + Send + Sync>> + Send,

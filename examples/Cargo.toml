@@ -15,16 +15,17 @@ path = "src/helloworld-grpc-client.rs"
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
-comprehensive = { path = "../comprehensive", version = "0.8" }
-comprehensive_grpc = { path = "../comprehensive_grpc", version = "0.8", features = ["tls"] }
-comprehensive_http = { path = "../comprehensive_http", version = "0.3", features = ["tls"] }
-comprehensive_spiffe = { path = "../comprehensive_spiffe", version = "0.3" }
+comprehensive = { path = "../comprehensive", version = "0.9" }
+comprehensive_grpc = { path = "../comprehensive_grpc", version = "0.9", features = ["tls"] }
+comprehensive_http = { path = "../comprehensive_http", version = "0.4", features = ["tls"] }
+comprehensive_spiffe = { path = "../comprehensive_spiffe", version = "0.4" }
 humantime = "2.1"
-prost = "0.13"
+prost = "0.14.1"
 tokio = { version = "1.40", features = ["rt-multi-thread", "macros"] }
 tokio-rustls = "0.26"
-tonic = "0.12"
+tonic = "0.14.2"
+tonic-prost = "0.14.2"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 
 [build-dependencies]
-tonic-build = "0.12"
+tonic-prost-build = "0.14.2"

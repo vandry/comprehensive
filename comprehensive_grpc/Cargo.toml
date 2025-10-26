@@ -1,6 +1,6 @@
 [package]
 name = "comprehensive_grpc"
-version = "0.8.1"
+version = "0.9.0"
 edition = "2024"
 repository = "https://github.com/vandry/comprehensive.git"
 homepage = "https://github.com/vandry/comprehensive"
@@ -15,41 +15,40 @@ rustdoc-args = ["--cfg", "docsrs"]
 atomic-take = "1.1"
 clap = { version = "4.5", features = ["derive"] }
 clap_builder = { version = "4.5", features = ["string"] }
-comprehensive = { path = "../comprehensive", version = "0.8" }
-comprehensive_dns = { path = "../comprehensive_dns", version = "0.3" }
+comprehensive = { path = "../comprehensive", version = "0.9" }
+comprehensive_dns = { path = "../comprehensive_dns", version = "0.4" }
 comprehensive_macros = { path = "../comprehensive_macros", version = "0.5" }
-comprehensive_tls = { path = "../comprehensive_tls", version = "0.4", optional = true }
-comprehensive_warm_channels = { path = "../comprehensive_warm_channels", version = "0.4" }
+comprehensive_tls = { path = "../comprehensive_tls", version = "0.5", optional = true }
+comprehensive_warm_channels = { path = "../comprehensive_warm_channels", version = "0.5", features = ["grpc", "metrics"] }
 futures = "0.3"
 http = "1.1"
 humantime = "2.1"
 pin-project-lite = "0.2"
-prometheus = "0.13"
-prost = "0.13"
-prost-types = "0.13"
+prometheus = "0.14.0"
+prost = "0.14.1"
+prost-types = "0.14.1"
 thiserror = "2.0.12"
 tokio = "1.40"
 tokio-rustls = { version = "0.26", optional = true }
 tokio-stream = "0.1"
-tonic = "0.12"
-tonic-health = "0.12"
-tonic-reflection = "0.12"
-tonic_prometheus_layer = "0.1"
+tonic = "0.14.2"
+tonic-health = "0.14.2"
+tonic-prost = "0.14.2"
+tonic-reflection = "0.14.2"
 tower = "0.5"
 tower-layer = "0.3"
 tower-service = "0.3.3"
 tracing = "0.1.41"
-warm_channels = { version = "0.2", features = ["grpc", "metrics"] }
 
 [features]
 experimental = []
-tls = ["dep:comprehensive_tls", "dep:tokio-rustls", "tonic/tls", "warm_channels/tls"]
+tls = ["dep:comprehensive_tls", "dep:tokio-rustls", "tonic/tls-aws-lc", "comprehensive_warm_channels/tls"]
 
 [build-dependencies]
-tonic-build = "0.12"
+tonic-prost-build = "0.14.2"
 
 [dev-dependencies]
-comprehensive_http = { path = "../comprehensive_http", version = "0.3" }
+comprehensive_http = { path = "../comprehensive_http", version = "0.4" }
 delegate = "0.13.3"
 http-body-util = "0.1"
 hyper-util = "0.1.14"

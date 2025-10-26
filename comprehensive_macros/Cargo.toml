@@ -22,5 +22,5 @@ syn = { version = "2.0", features = ["full"] }
 
 [dev-dependencies]
 # https://github.com/rust-lang/cargo/issues/4242
-comprehensive = { path = "../comprehensive", version = "<0.9.0, >=0.7.4" }
-comprehensive_grpc = { path = "../comprehensive_grpc", version = "<0.9.0, >=0.7.2" }
+comprehensive = { path = "../comprehensive", version = "<0.10.0, >=0.7.4" }
+comprehensive_grpc = { path = "../comprehensive_grpc", version = "<0.10.0, >=0.7.2" }

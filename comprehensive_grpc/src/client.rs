@@ -21,7 +21,7 @@ use clap::{Arg, ArgGroup, ArgMatches, Args, Command, FromArgMatches, value_parse
 use comprehensive::ResourceDependencies;
 use comprehensive::health::HealthReporter;
 use comprehensive_dns::DNSResolver;
-use comprehensive_warm_channels::WarmChannelsDiag;
+use comprehensive_warm_channels::{WarmChannelsDiag, warm_channels};
 use futures::{Stream, StreamExt, TryStreamExt};
 use http::Uri;
 use humantime::{format_duration, parse_duration};
@@ -567,7 +567,6 @@ where
         // Main URI stands in for the other 2.
         (Some(u), maybe_c, maybe_i) => (u, maybe_c, maybe_i),
     };
-    super::tonic_prometheus_layer_use_default_registry();
 
     let connector = d.connector(&uri, server_identity.as_ref(), a.client_identity.as_ref())?;
     let d: deps::OtherDependencies = d.into();

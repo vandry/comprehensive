@@ -1,6 +1,7 @@
 use comprehensive::{Assembly, ResourceDependencies};
 use comprehensive_grpc::client::Channel;
 use comprehensive_grpc::GrpcClient;
+use comprehensive_warm_channels::warm_channels;
 use futures::future::Either;
 use futures::{pin_mut, FutureExt};
 use http_body_util::BodyExt;

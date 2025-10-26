@@ -20,6 +20,8 @@ use tower::util::BoxCloneSyncService;
 use tower_service::Service;
 use warm_channels::ChannelDiagService;
 
+pub use warm_channels;
+
 #[doc(hidden)]
 #[derive(clap::Args, Debug)]
 #[group(skip)]

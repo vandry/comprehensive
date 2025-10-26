@@ -20,4 +20,4 @@ tower = { version = "0.5", optional = true }
 http_diag = ["dep:axum-core", "dep:http", "dep:tower", "tower/util"]
 
 [dev-dependencies]
-comprehensive = { path = "../comprehensive", version = "0.8" }
+comprehensive = { path = "../comprehensive", version = "0.9" }

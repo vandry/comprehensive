@@ -142,6 +142,8 @@ use thiserror::Error;
 pub mod client;
 pub mod server;
 
+mod metrics;
+
 #[cfg(feature = "tls")]
 mod incoming;
 #[cfg(all(test, feature = "tls"))]

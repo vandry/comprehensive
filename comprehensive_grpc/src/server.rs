@@ -52,13 +52,13 @@ use tokio_stream::wrappers::TcpListenerStream;
 use tonic::body::BoxBody;
 use tonic::server::NamedService;
 use tonic::service::Routes;
-use tonic_prometheus_layer::MetricsLayer;
 use tower_layer::{Layer, Stack};
 use tower_service::Service;
 use tracing::Instrument as _;
 use tracing::{error, info};
 
 use super::{ComprehensiveGrpcError, GrpcService};
+use crate::metrics::MetricsLayer;
 
 /// Interface for installing services into a gRPC server. See the
 /// [`GrpcService`] trait for where one of these comes from.
@@ -198,23 +198,12 @@ impl<S> Layer<S> for PropagateTracingSpanLayer {
     }
 }
 
-fn tonic_prometheus_layer_use_default_registry() {
-    let _ = tonic_prometheus_layer::metrics::try_init_settings(
-        tonic_prometheus_layer::metrics::GlobalSettings {
-            registry: prometheus::default_registry().clone(), // Arc
-            ..Default::default()
-        },
-    );
-}
-
 type BaseLayer = Stack<MetricsLayer, Stack<PropagateTracingSpanLayer, tower_layer::Identity>>;
 
 fn new_base_layer() -> tonic::transport::Server<BaseLayer> {
-    tonic_prometheus_layer_use_default_registry();
-    let metrics_layer = tonic_prometheus_layer::MetricsLayer::new();
     tonic::transport::Server::builder()
         .layer(PropagateTracingSpanLayer)
-        .layer(metrics_layer)
+        .layer(MetricsLayer)
 }
 
 mod routes {
@@ -523,7 +512,7 @@ impl HealthRelay {
 /// The server automatically provides some features above a standard [`tonic`]
 /// server:
 ///
-/// * RPC count metrics, courtesy or [`tonic_prometheus_layer`]
+/// * RPC count metrics
 /// * gRPC reflection
 /// * graceful shutdown
 /// * health reporting

@@ -1,9 +1,9 @@
 use comprehensive::{Assembly, ResourceDependencies};
-use comprehensive_grpc::client::Channel;
 use comprehensive_grpc::GrpcClient;
+use comprehensive_grpc::client::Channel;
 use comprehensive_warm_channels::warm_channels;
 use futures::future::Either;
-use futures::{pin_mut, FutureExt};
+use futures::{FutureExt, pin_mut};
 use http_body_util::BodyExt;
 use std::net::{IpAddr, Ipv6Addr};
 use std::pin::pin;
@@ -49,9 +49,11 @@ async fn health_and_metrics() {
 
     let (_, health_service) = tonic_health::server::health_reporter();
     let localhost = IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1));
-    let standalone_server = pin!(tonic::transport::Server::builder()
-        .add_service(health_service)
-        .serve((localhost, port).into()));
+    let standalone_server = pin!(
+        tonic::transport::Server::builder()
+            .add_service(health_service)
+            .serve((localhost, port).into())
+    );
 
     let (term_tx, term_rx) = tokio::sync::oneshot::channel();
     let j = tokio::spawn(async move {
@@ -78,20 +80,21 @@ async fn health_and_metrics() {
         futures::stream::once(futures::future::ready(Ok::<
             Vec<std::net::SocketAddr>,
             std::convert::Infallible,
-        >(vec![(
-            localhost, diag_port,
-        )
-            .into()]))),
+        >(vec![
+            (localhost, diag_port).into(),
+        ]))),
     );
     let req = http::request::Builder::new()
         .method("GET")
         .uri("http://localhost/metrics")
         .body(http_body_util::Empty::<&[u8]>::new())
         .unwrap();
-    let get_metrics = pin!(http_client
-        .ready()
-        .then(move |c| c.unwrap().call(req))
-        .then(|r| r.expect("successful GET /metrics").into_body().collect()));
+    let get_metrics = pin!(
+        http_client
+            .ready()
+            .then(move |c| c.unwrap().call(req))
+            .then(|r| r.expect("successful GET /metrics").into_body().collect())
+    );
     pin_mut!(worker);
     let body = match futures::future::select(get_metrics, worker).await {
         Either::Left((rx, _)) => rx,

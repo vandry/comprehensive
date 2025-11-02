@@ -31,7 +31,7 @@ use futures::stream::{FusedStream, FuturesUnordered};
 use futures::{Stream, StreamExt, poll, ready};
 use pin_project_lite::pin_project;
 use std::any::{Any, TypeId};
-use std::cell::OnceCell;
+use std::cell::{Ref, RefCell};
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::error::Error;
@@ -54,6 +54,7 @@ pub(crate) type ResourceFut = Pin<Box<dyn Future<Output = Result<(), Box<dyn Err
 enum ResourceInstantiationErrorUnderlying {
     Leaf(Box<dyn Error>),
     FailedDependencies(Vec<Rc<ResourceInstantiationError>>),
+    WrongInitialisationOrder,
 }
 
 #[derive(Debug)]
@@ -102,6 +103,14 @@ impl ResourceInstantiationError {
         }
     }
 
+    const fn empty(node_name: &'static str) -> Self {
+        Self {
+            tracing_span: None,
+            node_name: Some(node_name),
+            underlying: ResourceInstantiationErrorUnderlying::WrongInitialisationOrder,
+        }
+    }
+
     fn fmt_problems(
         &self,
         f: &mut std::fmt::Formatter<'_>,
@@ -136,19 +145,22 @@ impl ResourceInstantiationError {
                     chain.pop();
                 }
             }
+            ResourceInstantiationErrorUnderlying::WrongInitialisationOrder => {
+                write!(f, "\n  Internal error: Resource requested before make")?;
+            }
         }
         Ok(())
     }
 }
 
 struct Node<T: sealed::ResourceBase<U>, const U: usize> {
-    production: OnceCell<Result<T::Production, Rc<ResourceInstantiationError>>>,
+    production: RefCell<Result<T::Production, Rc<ResourceInstantiationError>>>,
 }
 
 impl<T: sealed::ResourceBase<U>, const U: usize> Default for Node<T, U> {
     fn default() -> Self {
         Self {
-            production: OnceCell::new(),
+            production: RefCell::new(Err(Rc::new(ResourceInstantiationError::empty(T::NAME)))),
         }
     }
 }
@@ -164,10 +176,11 @@ trait NodeTrait: Any {
         stoppers: ShutdownSignalParticipantCreator,
         keepalive: MakeSentinel<'_>,
         dependency_test: sealed::DependencyTest,
+        ref_count: usize,
     );
     fn task(self: Box<Self>) -> Option<ResourceFut>;
     fn created(&self) -> bool;
-    fn error(&self) -> Option<&Rc<ResourceInstantiationError>>;
+    fn error(&self) -> Option<std::cell::Ref<'_, Rc<ResourceInstantiationError>>>;
 }
 
 impl<T: sealed::ResourceBase<U>, const U: usize> NodeTrait for Node<T, U> {
@@ -190,9 +203,10 @@ impl<T: sealed::ResourceBase<U>, const U: usize> NodeTrait for Node<T, U> {
         stoppers: ShutdownSignalParticipantCreator,
         keepalive: MakeSentinel<'_>,
         dependency_test: sealed::DependencyTest,
+        ref_count: usize,
     ) {
         let span = span!(Level::INFO, "Comprehensive", resource = T::NAME);
-        let _ = self.production.set(
+        let _ = self.production.replace(
             span.in_scope(|| {
                 <T as sealed::ResourceBase<U>>::make(
                     cx,
@@ -200,6 +214,7 @@ impl<T: sealed::ResourceBase<U>, const U: usize> NodeTrait for Node<T, U> {
                     stoppers,
                     keepalive.make(),
                     dependency_test,
+                    ref_count,
                 )
             })
             .map_err(|e| {
@@ -214,18 +229,19 @@ impl<T: sealed::ResourceBase<U>, const U: usize> NodeTrait for Node<T, U> {
         cx.make_errors.clear();
     }
 
-    fn task(mut self: Box<Self>) -> Option<ResourceFut> {
+    fn task(self: Box<Self>) -> Option<ResourceFut> {
         self.production
-            .take()
-            .and_then(|p| p.ok().map(|p| <T as sealed::ResourceBase<U>>::task(p)))
+            .into_inner()
+            .ok()
+            .map(|p| <T as sealed::ResourceBase<U>>::task(p))
     }
 
     fn created(&self) -> bool {
-        matches!(self.production.get(), Some(Ok(_)))
+        self.production.borrow().is_ok()
     }
 
-    fn error(&self) -> Option<&Rc<ResourceInstantiationError>> {
-        self.production.get().and_then(|p| p.as_ref().err())
+    fn error(&self) -> Option<std::cell::Ref<'_, Rc<ResourceInstantiationError>>> {
+        Ref::filter_map(self.production.borrow(), |r| r.as_ref().err()).ok()
     }
 }
 
@@ -271,6 +287,7 @@ impl TraitGraphNode {
         _: ShutdownSignalParticipantCreator,
         _: MakeSentinel<'_>,
         _: sealed::DependencyTest,
+        _: usize,
     ) {
     }
 
@@ -282,7 +299,7 @@ impl TraitGraphNode {
         false
     }
 
-    fn error(&self) -> Option<&Rc<ResourceInstantiationError>> {
+    fn error(&self) -> Option<Ref<'_, Rc<ResourceInstantiationError>>> {
         None
     }
 }
@@ -307,10 +324,11 @@ impl GraphNode {
                 stoppers: ShutdownSignalParticipantCreator,
                 keepalive: MakeSentinel<'_>,
                 dependency_test: sealed::DependencyTest,
+                ref_count: usize,
             );
             fn task(self) -> Option<ResourceFut>;
             fn created(&self) -> bool;
-            fn error(&self) -> Option<&Rc<ResourceInstantiationError>>;
+            fn error(&self) -> Option<Ref<'_, Rc<ResourceInstantiationError>>>;
         }
     }
 
@@ -388,7 +406,7 @@ pub struct ProduceContext<'a> {
     type_map: HashMap<TypeId, usize>,
     nodes: &'a Vec<GraphNode>,
     trait_productions: Box<[Option<TraitProduction>]>,
-    dep_matrix: &'a DepMatrix,
+    dep_matrix: &'a mut DepMatrix,
     make_errors: Vec<Rc<ResourceInstantiationError>>,
 }
 
@@ -434,7 +452,8 @@ impl ProduceContext<'_> {
                     return Err(ResourceInstantiationError::new_from_list(
                         self.dep_matrix
                             .iter_row(*i)
-                            .filter_map(|j| self.nodes[j].error().cloned()),
+                            .filter_map(|j| self.nodes[j].error())
+                            .map(|e| e.clone()),
                         Some(self.nodes[*i].name()),
                     ));
                 }
@@ -483,8 +502,9 @@ pub(crate) mod sealed {
             stoppers: ShutdownSignalParticipantCreator,
             keepalive: Sentinel,
             dependency_test: DependencyTest,
+            ref_count: usize,
         ) -> Result<Self::Production, Box<dyn Error>>;
-        fn shared(re: &Self::Production) -> Arc<Self>;
+        fn shared(re: &mut Self::Production) -> Arc<Self>;
         fn task(re: Self::Production) -> ResourceFut;
     }
 
@@ -535,21 +555,20 @@ impl<T> Registrar<T> {
             panic!("not a Resource");
         };
         let n: &dyn Any = gn.as_ref();
+        let mut production = n
+            .downcast_ref::<Node<T, U>>()
+            .expect("bad downcast")
+            .production
+            .borrow_mut();
         Ok(<T as sealed::ResourceBase<U>>::shared(
-            n.downcast_ref::<Node<T, U>>()
-                .expect("bad downcast")
-                .production
-                .get()
-                .unwrap()
-                .as_ref()
-                .map_err(|e| {
-                    // Move the error into an accumulator so we can collect all
-                    // the errors associated with producing the current set of
-                    // dependencies, then return a marker error that will
-                    // later signal us to return all the errors in bulk.
-                    cx.make_errors.push(Rc::clone(e));
-                    ErrorIsInProduceContext
-                })?,
+            production.as_mut().map_err(|e| {
+                // Move the error into an accumulator so we can collect all
+                // the errors associated with producing the current set of
+                // dependencies, then return a marker error that will
+                // later signal us to return all the errors in bulk.
+                cx.make_errors.push(Rc::clone(e));
+                ErrorIsInProduceContext
+            })?,
         ))
     }
 }
@@ -826,27 +845,30 @@ where
             std::process::exit(0);
         }
 
-        let mut cx = ProduceContext {
-            type_map,
-            nodes: &nodes,
-            trait_productions: std::iter::repeat_n((), n_traits).map(|_| None).collect(),
-            dep_matrix: &dep_matrix,
-            make_errors: Vec::new(),
-        };
         let participants_iter =
             ShutdownSignal::new(nodes.iter().map(|gn| gn.is_inert()), &dep_matrix);
         let mut task_quits_gen = crate::drop_stream::Builder::new(nodes.len());
         let mut participants = participants_iter.collect::<Vec<_>>();
+        let mut cx = ProduceContext {
+            type_map,
+            nodes: &nodes,
+            trait_productions: std::iter::repeat_n((), n_traits).map(|_| None).collect(),
+            dep_matrix: &mut dep_matrix,
+            make_errors: Vec::new(),
+        };
         for i in build_order {
             let participant_creator = participants[i]
                 .take()
                 .expect("same index appears twice or deleted index in build order");
+            // Subtract 1 because each node has a reference to itself.
+            let ref_count = cx.dep_matrix.refcount(i) - 1;
             nodes[i].make(
                 &mut cx,
                 &mut arg_matches,
                 participant_creator,
                 MakeSentinel(&mut task_quits_gen, i),
                 sealed::DependencyTest(i),
+                ref_count,
             );
         }
         let mut task_quits = task_quits_gen.into_stream();
@@ -1161,6 +1183,7 @@ mod tests {
             stoppers: ShutdownSignalParticipantCreator,
             up: Sentinel,
             _: sealed::DependencyTest,
+            _: usize,
         ) -> Result<Self::Production, Box<dyn Error>> {
             if arg_matches
                 .get_one::<bool>("count")
@@ -1184,7 +1207,7 @@ mod tests {
             ))
         }
 
-        fn shared(re: &Self::Production) -> Arc<Self> {
+        fn shared(re: &mut Self::Production) -> Arc<Self> {
             Arc::clone(&re.0)
         }
 
@@ -1806,6 +1829,7 @@ mod tests {
             _: ShutdownSignalParticipantCreator,
             notifier: Sentinel,
             _: sealed::DependencyTest,
+            _: usize,
         ) -> Result<RunUntilSignaledProduction, Box<dyn Error>> {
             let (tx, rx) = tokio::sync::oneshot::channel();
             Ok(RunUntilSignaledProduction {
@@ -1817,7 +1841,7 @@ mod tests {
             })
         }
 
-        fn shared(re: &RunUntilSignaledProduction) -> Arc<RunUntilSignaled> {
+        fn shared(re: &mut RunUntilSignaledProduction) -> Arc<RunUntilSignaled> {
             Arc::clone(&re.shared)
         }
 
@@ -1893,6 +1917,7 @@ mod tests {
             term_signals: ShutdownSignalParticipantCreator,
             up: Sentinel,
             _: sealed::DependencyTest,
+            _: usize,
         ) -> Result<Self::Production, Box<dyn Error>> {
             Ok((
                 Arc::new(CleanShutdown::default()),
@@ -1901,7 +1926,7 @@ mod tests {
             ))
         }
 
-        fn shared(re: &Self::Production) -> Arc<CleanShutdown> {
+        fn shared(re: &mut Self::Production) -> Arc<CleanShutdown> {
             Arc::clone(&re.0)
         }
 
@@ -2016,6 +2041,7 @@ mod tests {
             stoppers: ShutdownSignalParticipantCreator,
             sentinel: Sentinel,
             _: sealed::DependencyTest,
+            _: usize,
         ) -> Result<InertResourceProduction, Box<dyn Error>> {
             Ok(InertResourceProduction {
                 shared: Arc::new(Self),
@@ -2024,7 +2050,7 @@ mod tests {
             })
         }
 
-        fn shared(re: &InertResourceProduction) -> Arc<Self> {
+        fn shared(re: &mut InertResourceProduction) -> Arc<Self> {
             Arc::clone(&re.shared)
         }
 
@@ -2113,6 +2139,7 @@ mod tests {
             stoppers: ShutdownSignalParticipantCreator,
             up: Sentinel,
             _: sealed::DependencyTest,
+            _: usize,
         ) -> Result<Self::Production, Box<dyn Error>> {
             let deps = RequiresDynDependencies::produce(cx)?;
             Ok((
@@ -2122,7 +2149,7 @@ mod tests {
             ))
         }
 
-        fn shared(p: &Self::Production) -> Arc<Self> {
+        fn shared(p: &mut Self::Production) -> Arc<Self> {
             Arc::clone(&p.0)
         }
 
@@ -2178,6 +2205,7 @@ mod tests {
             stoppers: ShutdownSignalParticipantCreator,
             up: Sentinel,
             _: sealed::DependencyTest,
+            _: usize,
         ) -> Result<Self::Production, Box<dyn Error>> {
             let deps = RequiresDynMayFailDependencies::produce(cx)?;
             Ok((
@@ -2187,7 +2215,7 @@ mod tests {
             ))
         }
 
-        fn shared(p: &Self::Production) -> Arc<Self> {
+        fn shared(p: &mut Self::Production) -> Arc<Self> {
             Arc::clone(&p.0)
         }
 
@@ -2246,6 +2274,7 @@ mod tests {
             stoppers: ShutdownSignalParticipantCreator,
             up: Sentinel,
             dt: sealed::DependencyTest,
+            _: usize,
         ) -> Result<Self::Production, Box<dyn Error>> {
             let _ = CleanShutdownTop::produce(cx)?;
             let shared = Arc::new(ProvidesDyn);
@@ -2265,7 +2294,7 @@ mod tests {
             Ok((shared, stoppers.into_inner().unwrap(), up))
         }
 
-        fn shared(p: &Self::Production) -> Arc<Self> {
+        fn shared(p: &mut Self::Production) -> Arc<Self> {
             Arc::clone(&p.0)
         }
 
@@ -2317,6 +2346,7 @@ mod tests {
             _: ShutdownSignalParticipantCreator,
             up: Sentinel,
             dt: sealed::DependencyTest,
+            _: usize,
         ) -> Result<Self::Production, Box<dyn Error>> {
             let shared = Arc::new(AlsoProvidesDyn);
             if let Some(i) = cx.get_trait_i::<dyn TestTrait>(dt) {
@@ -2327,7 +2357,7 @@ mod tests {
             Ok((shared, up))
         }
 
-        fn shared(p: &Self::Production) -> Arc<Self> {
+        fn shared(p: &mut Self::Production) -> Arc<Self> {
             Arc::clone(&p.0)
         }
 
@@ -2376,11 +2406,12 @@ mod tests {
             _: ShutdownSignalParticipantCreator,
             _: Sentinel,
             _: sealed::DependencyTest,
+            _: usize,
         ) -> Result<Self::Production, Box<dyn Error>> {
             Err("ProvidesDynButFails".into())
         }
 
-        fn shared(_: &()) -> Arc<Self> {
+        fn shared(_: &mut ()) -> Arc<Self> {
             unreachable!();
         }
 
@@ -2523,11 +2554,12 @@ mod tests {
             _: ShutdownSignalParticipantCreator,
             _: Sentinel,
             _: sealed::DependencyTest,
+            _: usize,
         ) -> Result<(), Box<dyn Error>> {
             unreachable!();
         }
 
-        fn shared(_: &()) -> Arc<Self> {
+        fn shared(_: &mut ()) -> Arc<Self> {
             unreachable!();
         }
 
@@ -2574,11 +2606,12 @@ mod tests {
             _: ShutdownSignalParticipantCreator,
             _: Sentinel,
             _: sealed::DependencyTest,
+            _: usize,
         ) -> Result<(), Box<dyn Error>> {
             unreachable!();
         }
 
-        fn shared(_: &()) -> Arc<Self> {
+        fn shared(_: &mut ()) -> Arc<Self> {
             unreachable!();
         }
 

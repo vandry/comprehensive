@@ -218,7 +218,7 @@ impl AssemblyRuntime<'_> {
 #[doc(hidden)]
 pub struct TraitInstallerProduce<'a, 'b, 'c, R> {
     cx: &'a mut ProduceContext<'c>,
-    shared: &'b Arc<R>,
+    shared: &'b mut LimitedClone<R>,
     dependency_test: DependencyTest,
 }
 
@@ -238,9 +238,8 @@ impl<R> TraitInstaller<'_, '_, '_, R> {
             Self::Register(cx) => cx.register_as_trait::<T>(),
             Self::Produce(installer) => {
                 if let Some(trait_i) = installer.cx.get_trait_i::<T>(installer.dependency_test) {
-                    installer
-                        .cx
-                        .provide_as_trait(trait_i, factory(installer.shared));
+                    let shared = installer.shared.take_share();
+                    installer.cx.provide_as_trait(trait_i, factory(&shared));
                 }
             }
         }
@@ -582,9 +581,39 @@ where
     }
 }
 
+struct LimitedClone<T> {
+    inner: Option<Arc<T>>,
+    shares: usize,
+}
+
+impl<T> LimitedClone<T> {
+    fn new(inner: Arc<T>, shares: usize) -> Self {
+        if shares == 0 {
+            Self {
+                inner: None,
+                shares: 0,
+            }
+        } else {
+            Self {
+                inner: Some(inner),
+                shares,
+            }
+        }
+    }
+
+    fn take_share(&mut self) -> Arc<T> {
+        self.shares = self.shares.saturating_sub(1);
+        if self.shares == 0 {
+            self.inner.take().unwrap()
+        } else {
+            self.inner.clone().unwrap()
+        }
+    }
+}
+
 mod private {
     pub struct ResourceProduction<T> {
-        pub(super) shared: std::sync::Arc<T>,
+        pub(super) shared: super::LimitedClone<T>,
         pub(super) task: Option<Box<dyn super::Task>>,
         pub(super) stopper: super::ShutdownSignalParticipant,
         pub(super) keepalive: super::Sentinel,
@@ -615,6 +644,7 @@ impl<T: Resource> ResourceBase<{ crate::ResourceVariety::V1 as usize }> for T {
         mut stoppers: ShutdownSignalParticipantCreator,
         keepalive: Sentinel,
         dependency_test: DependencyTest,
+        ref_count: usize,
     ) -> Result<Self::Production, Box<dyn Error>> {
         let deps = T::Dependencies::produce(cx)?;
         let args = T::Args::from_arg_matches(arg_matches)?;
@@ -622,10 +652,11 @@ impl<T: Resource> ResourceBase<{ crate::ResourceVariety::V1 as usize }> for T {
             stoppers: Some(&mut stoppers),
             task: None,
         };
-        let shared = T::new(deps, args, &mut api).map_err(Into::into)?;
+        let mut shared =
+            LimitedClone::new(T::new(deps, args, &mut api).map_err(Into::into)?, ref_count);
         let mut installer = TraitInstaller::Produce(TraitInstallerProduce {
             cx,
-            shared: &shared,
+            shared: &mut shared,
             dependency_test,
         });
         T::provide_as_trait(&mut installer);
@@ -638,8 +669,8 @@ impl<T: Resource> ResourceBase<{ crate::ResourceVariety::V1 as usize }> for T {
         })
     }
 
-    fn shared(p: &Self::Production) -> Arc<T> {
-        Arc::clone(&p.shared)
+    fn shared(p: &mut Self::Production) -> Arc<T> {
+        p.shared.take_share()
     }
 
     fn task(
@@ -683,7 +714,7 @@ mod tests {
     use atomic_take::AtomicTake;
     use futures::TryFutureExt;
     use std::pin::pin;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use try_lock::TryLock;
 
     const EMPTY: &[std::ffi::OsString] = &[];
@@ -1128,5 +1159,56 @@ mod tests {
             &*log.0.lock().unwrap(),
             &[Action::MainTaskStart, Action::MainTaskEnd, Action::LogQuit,]
         );
+    }
+
+    struct CloneCounter(Arc<AtomicUsize>);
+
+    impl Clone for CloneCounter {
+        fn clone(&self) -> Self {
+            self.0.fetch_add(1, Ordering::Release);
+            Self(Arc::clone(&self.0))
+        }
+    }
+
+    #[resource]
+    impl Resource for CloneCounter {
+        fn new(
+            _: (),
+            _: NoArgs,
+            _: &mut AssemblyRuntime<'_>,
+        ) -> Result<Arc<Self>, std::convert::Infallible> {
+            Ok(Arc::new(Self(Arc::new(AtomicUsize::default()))))
+        }
+    }
+
+    struct WantsCloneCounter(usize);
+
+    #[resource]
+    impl Resource for WantsCloneCounter {
+        fn new(
+            (cc,): (Arc<CloneCounter>,),
+            _: NoArgs,
+            _: &mut AssemblyRuntime<'_>,
+        ) -> Result<Arc<Self>, std::convert::Infallible> {
+            // A Resource that expects to be the only consumer of another
+            // Resource should be able to take over the only reference to
+            // the Arc.
+            let owned: CloneCounter = Arc::unwrap_or_clone(cc);
+            Ok(Arc::new(Self(
+                Arc::into_inner(owned.0)
+                    .expect("no other refs")
+                    .into_inner(),
+            )))
+        }
+    }
+
+    #[test]
+    fn not_cloned_more_than_necessary() {
+        let clone_count = Assembly::<(Arc<WantsCloneCounter>,)>::new_from_argv(EMPTY)
+            .unwrap()
+            .top
+            .0
+            .0;
+        assert_eq!(clone_count, 0);
     }
 }

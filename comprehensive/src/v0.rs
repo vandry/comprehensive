@@ -231,6 +231,7 @@ impl<T: Resource> ResourceBase<{ crate::ResourceVariety::V0 as usize }> for T {
         stoppers: ShutdownSignalParticipantCreator,
         task_running: Sentinel,
         _: crate::assembly::sealed::DependencyTest,
+        _: usize,
     ) -> Result<Self::Production, Box<dyn Error>> {
         let deps = T::Dependencies::produce(cx)?;
         let args = T::Args::from_arg_matches(arg_matches)?;
@@ -238,7 +239,7 @@ impl<T: Resource> ResourceBase<{ crate::ResourceVariety::V0 as usize }> for T {
         Ok((shared, stoppers.into_inner().unwrap(), task_running))
     }
 
-    fn shared(re: &Self::Production) -> Arc<T> {
+    fn shared(re: &mut Self::Production) -> Arc<T> {
         Arc::clone(&re.0)
     }
 

@@ -70,6 +70,10 @@ impl DepMatrix {
         *refcount == 1
     }
 
+    pub(crate) fn refcount(&mut self, row: usize) -> usize {
+        *self.0.slice[row].refcount.get_mut()
+    }
+
     pub(crate) fn is_row_live(&self, row: usize) -> bool {
         self.0.slice[row].is_present()
     }

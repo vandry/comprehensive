@@ -62,8 +62,15 @@ impl Resource for HelloService {
 impl pb::comprehensive::test_server::Test for HelloService {
     async fn greet(
         &self,
-        _: tonic::Request<()>,
+        req: tonic::Request<()>,
     ) -> Result<tonic::Response<pb::comprehensive::GreetResponse>, tonic::Status> {
+        if req
+            .extensions()
+            .get::<tonic::transport::server::TcpConnectInfo>()
+            .is_none()
+        {
+            return Err(tonic::Status::data_loss("No remote_addr"));
+        }
         Ok(tonic::Response::new(pb::comprehensive::GreetResponse {
             message: Some(String::from("hello")),
         }))

@@ -180,6 +180,31 @@ async fn grpc_own_service() {
     .await
 }
 
+#[cfg(feature = "tls")]
+#[tokio::test]
+async fn grpcs_own_service() {
+    let port = testutil::pick_unused_port();
+    let argv = test_args(None, Some(port));
+    let assembly = comprehensive::Assembly::<OwnServer>::new_from_argv(argv).unwrap();
+    let _ = assembly.top.0;
+    let _ = assembly.top.1;
+    let addr = ([0, 0, 0, 0, 0, 0, 0, 1], port).into();
+
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let j = tokio::spawn(async move {
+        let _ = assembly
+            .run_with_termination_signal(futures::stream::once(rx.map(|_| ())))
+            .await;
+    });
+    testutil::wait_until_serving(&addr).await;
+
+    let channel = test_grpcs_channel(addr.port()).await;
+    check_greeter(channel).await;
+
+    let _ = tx.send(());
+    let _ = j.await;
+}
+
 pub struct NoDescriptorService;
 
 #[resource]

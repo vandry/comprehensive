@@ -37,22 +37,22 @@
 //!
 //! See also the crate-level documentation.
 
-use atomic_take::AtomicTake;
+use bytes::Bytes;
 use comprehensive::health::HealthReporter;
 use comprehensive::v1::{AssemblyRuntime, Resource, resource};
-use comprehensive::{NoArgs, ResourceDependencies};
+use comprehensive::{AnyResource, NoArgs, ResourceDependencies};
 use prost::Message;
 use prost_types::FileDescriptorSet;
 use std::collections::HashSet;
 use std::convert::Infallible;
+use std::marker::PhantomData;
 use std::net::IpAddr;
 use std::sync::Arc;
-use std::task::{Context, Poll};
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::body::Body;
 use tonic::server::NamedService;
 use tonic::service::Routes;
-use tower_layer::{Layer, Stack};
+use tower_layer::Layer;
 use tower_service::Service;
 use tracing::Instrument as _;
 use tracing::{error, info};
@@ -166,47 +166,6 @@ impl GrpcServiceAdder {
     }
 }
 
-#[derive(Clone)]
-struct SpannedService<S>(S, tracing::Span);
-
-impl<R, S: Service<R>> Service<R> for SpannedService<S> {
-    type Response = S::Response;
-    type Error = S::Error;
-    type Future = tracing::instrument::Instrumented<S::Future>;
-
-    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        let _g = self.1.enter();
-        self.0.poll_ready(cx)
-    }
-
-    fn call(&mut self, r: R) -> Self::Future {
-        {
-            let _g = self.1.enter();
-            self.0.call(r)
-        }
-        .instrument(self.1.clone())
-    }
-}
-
-#[derive(Clone)]
-struct PropagateTracingSpanLayer;
-
-impl<S> Layer<S> for PropagateTracingSpanLayer {
-    type Service = SpannedService<S>;
-
-    fn layer(&self, inner: S) -> SpannedService<S> {
-        SpannedService(inner, tracing::Span::current())
-    }
-}
-
-type BaseLayer = Stack<MetricsLayer, Stack<PropagateTracingSpanLayer, tower_layer::Identity>>;
-
-fn new_base_layer() -> tonic::transport::Server<BaseLayer> {
-    tonic::transport::Server::builder()
-        .layer(PropagateTracingSpanLayer)
-        .layer(MetricsLayer)
-}
-
 mod routes {
     use super::*;
 
@@ -216,12 +175,9 @@ mod routes {
         health: Arc<HealthReporter>,
     }
 
-    /// EXPERIMENTAL: Subject to change or removal in minor versions.
-    ///
     /// Common resource for collecting all gRPC services into a [`Routes`]
-    /// object for serving. This is exposed in order to make it possible
-    /// to supply a custom gRPC server without having to rewrite this part
-    /// of the logic, but the API for doing that is not firmly decided.
+    /// object for serving.
+    #[derive(Clone)]
     pub struct GrpcServingRoutes(Routes);
 
     #[resource]
@@ -244,21 +200,202 @@ mod routes {
         }
     }
 
-    impl GrpcServingRoutes {
-        /// EXPERIMENTAL: Subject to change or removal in minor versions.
-        ///
-        /// Get a [`Routes`] object for gRPC serving.
-        /// This is exposed in order to make it possible
-        /// to supply a custom gRPC server without having to rewrite this part
-        /// of the logic, but the API for doing that is not firmly decided.
-        pub fn routes(&self) -> Routes {
-            self.0.clone()
+    impl From<GrpcServingRoutes> for Routes {
+        fn from(r: GrpcServingRoutes) -> Self {
+            r.0
         }
     }
 }
 
-#[cfg(feature = "experimental")]
-pub use routes::GrpcServingRoutes;
+/// The default and recommended middleware layer for [`GrpcServer`].
+///
+/// This [`Resource`] is designed to be supplied to [`GrpcServer`] as a type
+/// parameter:
+///
+/// ```
+/// use comprehensive_grpc::server::{DefaultServingStack, GrpcServer};
+///
+/// type ServerWithDefaultMiddleware = GrpcServer<DefaultServingStack>;
+/// ```
+///
+/// Alternate middleware can augment the default stack:
+///
+/// ```
+/// # type NewLayer = ();
+/// use comprehensive::v1::{AssemblyRuntime, Resource, resource};
+/// use comprehensive_grpc::server::DefaultServingStack;
+/// use std::sync::Arc;
+/// use tower_layer::Layer;
+///
+/// type CombinedLayer = (DefaultServingStack, NewLayer);
+///
+/// struct ServingStackWithExtraLayer(CombinedLayer);
+///
+/// #[resource]
+/// impl Resource for ServingStackWithExtraLayer {
+///     fn new(
+///         (standard,): (Arc<DefaultServingStack>,),
+///         _: comprehensive::NoArgs,
+///         _: &mut AssemblyRuntime<'_>,
+///     ) -> Result<Arc<Self>, std::convert::Infallible> {
+///         let l = (Arc::unwrap_or_clone(standard), NewLayer::default());
+///         Ok(Arc::new(Self(l)))
+///     }
+/// }
+///
+/// impl<S> Layer<S> for ServingStackWithExtraLayer {
+///     type Service = <CombinedLayer as Layer<S>>::Service;
+///
+///     fn layer(&self, inner: S) -> Self::Service {
+///         self.0.layer(inner)
+///     }
+/// }
+/// ```
+#[derive(Clone)]
+pub struct DefaultServingStack {
+    metrics_layer: MetricsLayer,
+}
+
+#[resource]
+impl Resource for DefaultServingStack {
+    fn new(
+        _: comprehensive::NoDependencies,
+        _: comprehensive::NoArgs,
+        _: &mut AssemblyRuntime<'_>,
+    ) -> Result<Arc<Self>, std::convert::Infallible> {
+        Ok(Arc::new(Self {
+            metrics_layer: MetricsLayer,
+        }))
+    }
+}
+
+impl<S> Layer<S> for DefaultServingStack {
+    type Service = <MetricsLayer as Layer<S>>::Service;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        self.metrics_layer.layer(inner)
+    }
+}
+
+mod service {
+    use super::*;
+    use std::task::{Context, Poll};
+
+    #[derive(Clone)]
+    pub struct SpannedService<S>(S, tracing::Span);
+
+    impl<R, S: Service<R>> Service<R> for SpannedService<S> {
+        type Response = S::Response;
+        type Error = S::Error;
+        type Future = tracing::instrument::Instrumented<S::Future>;
+
+        fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            let _g = self.1.enter();
+            self.0.poll_ready(cx)
+        }
+
+        fn call(&mut self, r: R) -> Self::Future {
+            {
+                let _g = self.1.enter();
+                self.0.call(r)
+            }
+            .instrument(self.1.clone())
+        }
+    }
+
+    #[derive(Clone)]
+    pub struct PropagateTracingSpanLayer;
+
+    impl<S> Layer<S> for PropagateTracingSpanLayer {
+        type Service = SpannedService<S>;
+
+        fn layer(&self, inner: S) -> SpannedService<S> {
+            SpannedService(inner, tracing::Span::current())
+        }
+    }
+
+    /// This [`Resource`] supplies a tower [`Service`] that serves all of
+    /// the gRPC services registered in this assembly. It is not usually
+    /// requested directly but through [`GrpcServer`] which will listen
+    /// on a TCP port (or two) and serve it over HTTP2. [`GrpcCommonService`]
+    /// can be used instead to serve over some kind of different transport.
+    #[derive(Clone)]
+    pub struct GrpcCommonService<L = DefaultServingStack> {
+        stack: Arc<L>,
+        routes: Routes,
+    }
+
+    #[resource]
+    impl<L> Resource for GrpcCommonService<L>
+    where
+        L: AnyResource + Send + Sync + 'static,
+    {
+        fn new(
+            (routes, stack): (Arc<routes::GrpcServingRoutes>, Arc<L>),
+            _: comprehensive::NoArgs,
+            _: &mut comprehensive::v1::AssemblyRuntime<'_>,
+        ) -> Result<Arc<Self>, std::convert::Infallible> {
+            Ok(Arc::new(Self {
+                stack,
+                routes: Arc::unwrap_or_clone(routes).into(),
+            }))
+        }
+    }
+
+    impl<L, B> GrpcCommonService<L>
+    where
+        L: Layer<Routes>,
+        <L as Layer<Routes>>::Service:
+            Service<http::Request<Body>, Response = http::Response<B>> + Clone,
+        <<L as Layer<Routes>>::Service as Service<http::Request<Body>>>::Error:
+            Into<Box<dyn std::error::Error + Send + Sync>> + Send,
+        <<L as Layer<Routes>>::Service as Service<http::Request<Body>>>::Future: Send,
+    {
+        /// Generate a tower [`Service`] for gRPC serving. The service will
+        /// contain all of the configured middleware and all of the
+        /// registered gRPC services.
+        ///
+        /// ```
+        /// use comprehensive::v1::{AssemblyRuntime, Resource, resource};
+        /// use comprehensive_grpc::server::GrpcCommonService;
+        /// use futures::future::TryFutureExt;
+        /// use std::sync::Arc;
+        ///
+        /// struct Demo;
+        ///
+        /// #[resource]
+        /// impl Resource for Demo {
+        ///     fn new(
+        ///         (service,): (Arc<GrpcCommonService>,),
+        ///         _: comprehensive::NoArgs,
+        ///         api: &mut AssemblyRuntime<'_>,
+        ///     ) -> Result<Arc<Self>, std::convert::Infallible> {
+        ///         let server = tonic::transport::Server::builder()
+        ///             .serve_with_shutdown(
+        ///                 "[::1]:1234".parse().unwrap(),
+        ///                 Arc::unwrap_or_clone(service).into_service(),
+        ///                 api.self_stop(),
+        ///             );
+        ///         api.set_task(server.err_into());
+        ///         Ok(Arc::new(Self))
+        ///     }
+        /// }
+        /// ```
+        // https://github.com/rust-lang/rust/pull/122055
+        pub fn into_service(
+            self,
+        ) -> impl Service<
+            http::Request<Body>,
+            Response = http::Response<B>,
+            Future: Send,
+            Error: Into<Box<dyn std::error::Error + Send + Sync>> + Send,
+        > + Clone {
+            PropagateTracingSpanLayer.layer(self.stack.layer(self.routes.prepare()))
+        }
+    }
+}
+
+pub use service::GrpcCommonService;
 
 mod insecure_server {
     use super::*;
@@ -280,85 +417,48 @@ mod insecure_server {
         grpc_bind_addr: IpAddr,
     }
 
-    /// EXPERIMENTAL: Subject to change or removal in minor versions.
-    ///
-    /// Helper resource for binding a plaintext gRPC listening socket.
-    /// This is exposed in order to make it possible
-    /// to supply a custom gRPC server without having to rewrite this part
-    /// of the logic, but the API for doing that is not firmly decided.
-    pub struct InsecureGrpcListener(AtomicTake<TcpListenerStream>);
+    pub struct InsecureGrpcServer<L>(PhantomData<L>);
 
     #[resource]
-    impl Resource for InsecureGrpcListener {
-        const NAME: &str = "Plaintext gRPC listener";
-
-        fn new(
-            _: comprehensive::NoDependencies,
-            args: InsecureGrpcListenerArgs,
-            _: &mut AssemblyRuntime<'_>,
-        ) -> Result<Arc<Self>, crate::ComprehensiveGrpcError> {
-            Ok(Arc::new(Self(
-                args.grpc_port
-                    .map(|port| {
-                        let addr: std::net::SocketAddr = (args.grpc_bind_addr, port).into();
-                        let listener = std::net::TcpListener::bind(addr)?;
-                        listener.set_nonblocking(true)?;
-                        let incoming =
-                            TcpListenerStream::new(tokio::net::TcpListener::from_std(listener)?);
-                        info!("Insecure gRPC server listening on {}", addr);
-                        Ok::<_, crate::ComprehensiveGrpcError>(AtomicTake::new(incoming))
-                    })
-                    .transpose()?
-                    .unwrap_or(AtomicTake::empty()),
-            )))
-        }
-    }
-
-    impl InsecureGrpcListener {
-        /// EXPERIMENTAL: Subject to change or removal in minor versions.
-        ///
-        /// Get the plaintext gRPC listening socket. Can only be called once.
-        /// This is exposed in order to make it possible
-        /// to supply a custom gRPC server without having to rewrite this part
-        /// of the logic, but the API for doing that is not firmly decided.
-        pub fn take(&self) -> Option<TcpListenerStream> {
-            self.0.take()
-        }
-    }
-
-    #[derive(ResourceDependencies)]
-    pub(super) struct InsecureGrpcServerDependencies {
-        listener: Arc<InsecureGrpcListener>,
-        routes: Arc<routes::GrpcServingRoutes>,
-    }
-
-    pub(super) struct InsecureGrpcServer;
-
-    #[resource]
-    impl Resource for InsecureGrpcServer {
+    impl<L, B> Resource for InsecureGrpcServer<L>
+    where
+        L: AnyResource + Layer<Routes> + Clone + Send + Sync + 'static,
+        L::Service: Service<http::Request<Body>, Response = http::Response<B>> + Clone + Send,
+        <L::Service as Service<http::Request<Body>>>::Future: Send,
+        <L::Service as Service<http::Request<Body>>>::Error:
+            Into<Box<dyn std::error::Error + Send + Sync>> + Send,
+        B: http_body::Body<Data = Bytes> + Send + 'static,
+        B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    {
         const NAME: &str = "Plaintext gRPC server";
 
         fn new(
-            d: InsecureGrpcServerDependencies,
-            _: comprehensive::NoArgs,
+            (common_service,): (Arc<GrpcCommonService<L>>,),
+            args: InsecureGrpcListenerArgs,
             api: &mut AssemblyRuntime<'_>,
         ) -> Result<Arc<Self>, crate::ComprehensiveGrpcError> {
-            if let Some(listener) = d.listener.take() {
-                let server = new_base_layer()
-                    .add_routes(d.routes.routes())
-                    .serve_with_incoming_shutdown(listener, api.self_stop());
+            if let Some(port) = args.grpc_port {
+                let addr: std::net::SocketAddr = (args.grpc_bind_addr, port).into();
+                let listener = std::net::TcpListener::bind(addr)?;
+                listener.set_nonblocking(true)?;
+                let incoming = TcpListenerStream::new(tokio::net::TcpListener::from_std(listener)?);
+                info!("Insecure gRPC server listening on {}", addr);
+                let service = Arc::unwrap_or_clone(common_service).into_service();
+
+                let server = tonic::transport::Server::builder().serve_with_incoming_shutdown(
+                    service,
+                    incoming,
+                    api.self_stop(),
+                );
                 api.set_task(async move {
                     tokio::spawn(server.in_current_span()).await??;
                     Ok(())
                 });
             }
-            Ok(Arc::new(Self))
+            Ok(Arc::new(Self(PhantomData)))
         }
     }
 }
-
-#[cfg(feature = "experimental")]
-pub use insecure_server::InsecureGrpcListener;
 
 #[cfg(feature = "tls")]
 mod secure_server {
@@ -381,95 +481,49 @@ mod secure_server {
         grpcs_bind_addr: IpAddr,
     }
 
-    #[derive(ResourceDependencies)]
-    pub struct SecureGrpcListenerDependencies {
-        tls: Option<Arc<comprehensive_tls::TlsConfig>>,
-    }
-
-    /// EXPERIMENTAL: Subject to change or removal in minor versions.
-    ///
-    /// Helper resource for binding a secure gRPC listening socket.
-    /// This is exposed in order to make it possible
-    /// to supply a custom gRPC server without having to rewrite this part
-    /// of the logic, but the API for doing that is not firmly decided.
-    pub struct SecureGrpcListener(
-        AtomicTake<crate::incoming::Acceptor<TcpListenerStream, tokio::net::TcpStream>>,
-    );
+    pub struct SecureGrpcServer<L>(PhantomData<L>);
 
     #[resource]
-    impl Resource for SecureGrpcListener {
-        const NAME: &str = "Secure gRPC listener";
-
-        fn new(
-            d: SecureGrpcListenerDependencies,
-            args: SecureGrpcListenerArgs,
-            _: &mut AssemblyRuntime<'_>,
-        ) -> Result<Arc<Self>, crate::ComprehensiveGrpcError> {
-            Ok(Arc::new(Self(
-                args.grpcs_port
-                    .map(|port| {
-                        let Some(tlsc) = d.tls else {
-                            return Err(crate::ComprehensiveGrpcError::NoTlsProvider);
-                        };
-                        let addr = (args.grpcs_bind_addr, port).into();
-                        let incoming = crate::incoming::tls_over_tcp(addr, tlsc)?;
-                        info!("Secure gRPC server listening on {}", addr);
-                        Ok(AtomicTake::new(incoming))
-                    })
-                    .transpose()?
-                    .unwrap_or(AtomicTake::empty()),
-            )))
-        }
-    }
-
-    impl SecureGrpcListener {
-        /// EXPERIMENTAL: Subject to change or removal in minor versions.
-        ///
-        /// Get the secure gRPC listening socket. Can only be called once.
-        /// This is exposed in order to make it possible
-        /// to supply a custom gRPC server without having to rewrite this part
-        /// of the logic, but the API for doing that is not firmly decided.
-        pub fn take(
-            &self,
-        ) -> Option<crate::incoming::Acceptor<TcpListenerStream, tokio::net::TcpStream>> {
-            self.0.take()
-        }
-    }
-
-    #[derive(ResourceDependencies)]
-    pub(super) struct SecureGrpcServerDependencies {
-        listener: Arc<SecureGrpcListener>,
-        routes: Arc<routes::GrpcServingRoutes>,
-    }
-
-    pub(super) struct SecureGrpcServer;
-
-    #[resource]
-    impl Resource for SecureGrpcServer {
+    impl<L, B> Resource for SecureGrpcServer<L>
+    where
+        L: AnyResource + Layer<Routes> + Clone + Send + Sync + 'static,
+        L::Service: Service<http::Request<Body>, Response = http::Response<B>> + Clone + Send,
+        <L::Service as Service<http::Request<Body>>>::Future: Send,
+        <L::Service as Service<http::Request<Body>>>::Error:
+            Into<Box<dyn std::error::Error + Send + Sync>> + Send,
+        B: http_body::Body<Data = Bytes> + Send + 'static,
+        B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    {
         const NAME: &str = "Secure gRPC server";
 
         fn new(
-            d: SecureGrpcServerDependencies,
-            _: comprehensive::NoArgs,
+            (common_service, tls): (
+                Arc<GrpcCommonService<L>>,
+                Option<Arc<comprehensive_tls::TlsConfig>>,
+            ),
+            args: SecureGrpcListenerArgs,
             api: &mut AssemblyRuntime<'_>,
         ) -> Result<Arc<Self>, crate::ComprehensiveGrpcError> {
-            if let Some(listener) = d.listener.take() {
-                let server = new_base_layer()
+            if let Some(port) = args.grpcs_port {
+                let Some(tlsc) = tls else {
+                    return Err(crate::ComprehensiveGrpcError::NoTlsProvider);
+                };
+                let addr = (args.grpcs_bind_addr, port).into();
+                let incoming = crate::incoming::tls_over_tcp(addr, tlsc)?;
+                info!("Secure gRPC server listening on {}", addr);
+                let service = Arc::unwrap_or_clone(common_service).into_service();
+                let server = tonic::transport::Server::builder()
                     .layer(crate::incoming::AddUnderlyingConnectInfoLayer)
-                    .add_routes(d.routes.routes())
-                    .serve_with_incoming_shutdown(listener, api.self_stop());
+                    .serve_with_incoming_shutdown(service, incoming, api.self_stop());
                 api.set_task(async move {
                     tokio::spawn(server.in_current_span()).await??;
                     Ok(())
                 });
             }
-            Ok(Arc::new(Self))
+            Ok(Arc::new(Self(PhantomData)))
         }
     }
 }
-
-#[cfg(all(feature = "tls", feature = "experimental"))]
-pub use secure_server::SecureGrpcListener;
 
 #[derive(Default)]
 struct ReflectionInfo {
@@ -477,13 +531,14 @@ struct ReflectionInfo {
     registered_names: HashSet<String>,
 }
 
-#[doc(hidden)]
-#[derive(ResourceDependencies)]
-pub struct GrpcServerDependencies {
-    _grpc: Arc<insecure_server::InsecureGrpcServer>,
-    #[cfg(feature = "tls")]
-    _grpcs: Arc<secure_server::SecureGrpcServer>,
-}
+#[cfg(feature = "tls")]
+type GrpcServerDependencies<L> = (
+    Arc<insecure_server::InsecureGrpcServer<L>>,
+    Arc<secure_server::SecureGrpcServer<L>>,
+);
+
+#[cfg(not(feature = "tls"))]
+type GrpcServerDependencies<L> = (Arc<insecure_server::InsecureGrpcServer<L>>,);
 
 struct HealthRelay {
     health_subscriber: tokio::sync::watch::Receiver<bool>,
@@ -532,17 +587,179 @@ impl HealthRelay {
 ///   traffic.
 ///
 /// [`Assembly`]: comprehensive::Assembly
-pub struct GrpcServer;
+pub struct GrpcServer<L = DefaultServingStack> {
+    _stack: PhantomData<L>,
+}
 
 #[resource]
-impl Resource for GrpcServer {
+impl<L, B> Resource for GrpcServer<L>
+where
+    L: AnyResource + Layer<Routes> + Clone + Send + Sync + 'static,
+    L::Service: Service<http::Request<Body>, Response = http::Response<B>> + Clone + Send,
+    <L::Service as Service<http::Request<Body>>>::Future: Send,
+    <L::Service as Service<http::Request<Body>>>::Error:
+        Into<Box<dyn std::error::Error + Send + Sync>> + Send + Sync,
+    B: http_body::Body<Data = Bytes> + Send + 'static,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
     const NAME: &str = "gRPC server common";
 
     fn new(
-        _: GrpcServerDependencies,
+        _: GrpcServerDependencies<L>,
         _: NoArgs,
         _: &mut AssemblyRuntime<'_>,
     ) -> Result<Arc<Self>, std::convert::Infallible> {
-        Ok(Arc::new(Self))
+        Ok(Arc::new(Self {
+            _stack: PhantomData,
+        }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use comprehensive::Assembly;
+    use futures::future::Either;
+    use futures::pin_mut;
+    use pin_project_lite::pin_project;
+    use std::pin::Pin;
+    use std::task::{Context, Poll, ready};
+    use tonic_health::pb::{
+        HealthCheckRequest, HealthCheckResponse, health_check_response, health_client,
+    };
+
+    const EMPTY: &[std::ffi::OsString] = &[];
+
+    async fn test_health<A, R, E1, E2>(assembly: A, rpc: R)
+    where
+        A: Future<Output = Result<(), E1>>,
+        E1: std::fmt::Debug,
+        R: Future<Output = Result<tonic::Response<HealthCheckResponse>, E2>>,
+        E2: std::fmt::Debug,
+    {
+        pin_mut!(assembly);
+        pin_mut!(rpc);
+        let rpc_result = match futures::future::select(assembly, rpc).await {
+            Either::Left((Ok(()), rpc)) => rpc.await,
+            Either::Left((Err(e), _)) => {
+                panic!("Assembly unexpectedly quit: {e:?}");
+            }
+            Either::Right((rpc, _)) => rpc,
+        };
+        assert_eq!(
+            rpc_result.expect("rpc").into_inner().status,
+            health_check_response::ServingStatus::Serving as i32
+        );
+    }
+
+    #[tokio::test]
+    async fn default_stack() {
+        let assembly = Assembly::<(Arc<GrpcCommonService>,)>::new_from_argv(EMPTY).unwrap();
+        let service = (*assembly.top.0).clone().into_service();
+        let mut client = health_client::HealthClient::new(service);
+        test_health(
+            assembly.run_with_termination_signal(futures::stream::pending()),
+            client.check(HealthCheckRequest::default()),
+        )
+        .await;
+    }
+
+    #[derive(Clone)]
+    struct BodyChanger;
+
+    #[resource]
+    impl Resource for BodyChanger {
+        fn new(
+            _: comprehensive::NoDependencies,
+            _: comprehensive::NoArgs,
+            _: &mut AssemblyRuntime<'_>,
+        ) -> Result<Arc<Self>, std::convert::Infallible> {
+            Ok(Arc::new(Self))
+        }
+    }
+
+    pin_project! {
+        struct OtherBody<B> {
+            #[pin] inner: B,
+        }
+    }
+
+    impl<B: http_body::Body> http_body::Body for OtherBody<B> {
+        type Data = B::Data;
+        type Error = B::Error;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+            self.project().inner.poll_frame(cx)
+        }
+    }
+
+    pin_project! {
+        struct BodyChangingServiceFuture<F> {
+            #[pin] inner: F,
+        }
+    }
+
+    impl<F, B, E> Future for BodyChangingServiceFuture<F>
+    where
+        F: Future<Output = Result<http::Response<B>, E>>,
+    {
+        type Output = Result<http::Response<OtherBody<B>>, E>;
+
+        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            Poll::Ready(match ready!(self.project().inner.poll(cx)) {
+                Ok(r) => {
+                    let (parts, body) = r.into_parts();
+                    Ok(http::Response::from_parts(parts, OtherBody { inner: body }))
+                }
+                Err(e) => Err(e),
+            })
+        }
+    }
+
+    #[derive(Clone)]
+    struct BodyChangingService<S>(S);
+
+    impl<R, S, B> Service<R> for BodyChangingService<S>
+    where
+        S: Service<R, Response = http::Response<B>>,
+    {
+        type Response = http::Response<OtherBody<B>>;
+        type Error = S::Error;
+        type Future = BodyChangingServiceFuture<S::Future>;
+
+        fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            self.0.poll_ready(cx)
+        }
+
+        fn call(&mut self, r: R) -> Self::Future {
+            BodyChangingServiceFuture {
+                inner: self.0.call(r),
+            }
+        }
+    }
+
+    impl<S> Layer<S> for BodyChanger {
+        type Service = BodyChangingService<S>;
+
+        fn layer(&self, inner: S) -> Self::Service {
+            BodyChangingService(inner)
+        }
+    }
+
+    #[tokio::test]
+    async fn body_changing_stack() {
+        let assembly =
+            Assembly::<(Arc<GrpcCommonService<BodyChanger>>,)>::new_from_argv(EMPTY).unwrap();
+        let service = (*assembly.top.0).clone().into_service();
+        let mut client = health_client::HealthClient::new(service);
+        test_health(
+            assembly.run_with_termination_signal(futures::stream::pending()),
+            client.check(HealthCheckRequest::default()),
+        )
+        .await;
     }
 }

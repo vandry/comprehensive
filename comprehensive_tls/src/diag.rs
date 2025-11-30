@@ -8,7 +8,7 @@
 use async_stream::stream;
 use comprehensive::ResourceDependencies;
 use comprehensive::v1::{AssemblyRuntime, Resource, resource};
-use comprehensive_traits::http_diag::{HttpDiagHandler, HttpDiagHandlerInstaller};
+use comprehensive_traits::http_diag::{Body, HttpDiagHandler, HttpDiagHandlerInstaller};
 use futures::Stream;
 use std::convert::Infallible;
 use std::pin::Pin;
@@ -42,7 +42,7 @@ enum DiagServiceFuture {
 }
 
 impl Future for DiagServiceFuture {
-    type Output = Result<http::Response<axum_core::body::Body>, Infallible>;
+    type Output = Result<http::Response<Body>, Infallible>;
 
     fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Self::Output> {
         Poll::Ready(Ok(
@@ -57,7 +57,7 @@ impl Future for DiagServiceFuture {
                     .unwrap(),
                 Self::Normal(tlsc) => http::Response::builder()
                     .header("Content-Type", "text/html")
-                    .body(axum_core::body::Body::from_stream(respond(tlsc)))
+                    .body(Body::from_stream(respond(tlsc)))
                     .unwrap(),
             },
         ))
@@ -68,7 +68,7 @@ impl Future for DiagServiceFuture {
 struct DiagService(Option<Arc<TlsConfig>>);
 
 impl<B> Service<http::Request<B>> for DiagService {
-    type Response = http::Response<axum_core::body::Body>;
+    type Response = http::Response<Body>;
     type Error = Infallible;
     type Future = DiagServiceFuture;
 

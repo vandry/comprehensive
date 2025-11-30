@@ -11,7 +11,7 @@
 #![warn(missing_docs)]
 
 use comprehensive::v1::{AssemblyRuntime, Resource, resource};
-use comprehensive_traits::http_diag::{HttpDiagHandler, HttpDiagHandlerInstaller};
+use comprehensive_traits::http_diag::{Body, HttpDiagHandler, HttpDiagHandlerInstaller};
 use pin_project_lite::pin_project;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -71,9 +71,9 @@ pin_project! {
 impl<F, B, E> Future for MapResponseBodyFuture<F>
 where
     F: Future<Output = Result<http::Response<B>, E>>,
-    B: Into<axum_core::body::Body>,
+    B: Into<Body>,
 {
-    type Output = Result<http::Response<axum_core::body::Body>, E>;
+    type Output = Result<http::Response<Body>, E>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         match self.project().inner.poll(cx) {
@@ -93,9 +93,9 @@ struct MapResponseBody<T>(T);
 impl<T, R, B> Service<R> for MapResponseBody<T>
 where
     T: Service<R, Response = http::Response<B>>,
-    B: Into<axum_core::body::Body>,
+    B: Into<Body>,
 {
-    type Response = http::Response<axum_core::body::Body>;
+    type Response = http::Response<Body>;
     type Error = <T as Service<R>>::Error;
     type Future = MapResponseBodyFuture<<T as Service<R>>::Future>;
 

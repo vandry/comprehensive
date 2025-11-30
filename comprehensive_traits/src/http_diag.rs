@@ -9,7 +9,7 @@
 //! [`comprehensive_http::diag::HttpServer`]: https://docs.rs/comprehensive_http/latest/comprehensive_http/diag/type.HttpServer.html
 //! [`Assembly`]: https://docs.rs/comprehensive/latest/comprehensive/assembly/struct.Assembly.html
 
-use axum_core::body::Body;
+pub use axum_core::body::Body;
 use std::sync::Arc;
 
 /// The type or [`tower`] [`Service`] that handlers should provide.

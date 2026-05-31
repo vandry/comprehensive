@@ -19,8 +19,65 @@ use std::sync::Arc;
 /// need to convert services to this type.
 ///
 /// [`Service`]: https://docs.rs/tower-service/latest/tower_service/trait.Service.html
+#[deprecated(since = "0.3.1", note = "Use `DiagService` instead.")]
 pub type Service = tower::util::BoxCloneSyncService<
     http::Request<Body>,
+    http::Response<Body>,
+    std::convert::Infallible,
+>;
+
+macro_rules! diag_request {
+    ($($(#[$c:meta])* fn $name:ident($($m:ident)?; $($p:ident: $t:ty),*)$( -> $rt:ty)?;)*) => {
+        /// This provides extra features available on diagnostic HTTP requests.
+        pub trait DiagRequestExtra {
+            $($(#[$c])* fn $name<'a>(&self, _: &'a $($m)? http::Request<Body>, $($p:$t),*)$( -> $rt)?;)*
+        }
+
+        impl DiagRequest {
+            $($(#[$c])* pub fn $name<'a>(&'a $($m)? self, $($p:$t),*)$( -> $rt)? {
+                self.vtable.$name(&$($m)? self.inner, $($p),*)
+            })*
+        }
+    }
+}
+
+diag_request! {
+    /// Fetch the original URI of the HTTP request.
+    ///
+    /// Diag handlers are usually nested beneath the root, but the original path
+    /// is often needed for example for correct HTML hyperlink resolution.
+    fn get_original_uri(;) -> Option<&'a http::Uri>;
+}
+
+/// An [`http::Request`] wrapped with extra functionality available through the
+/// [`DiagRequestExtra`] trait. Only [`comprehensive_http::diag::HttpServer` needs to
+/// create these.
+pub struct DiagRequest {
+    inner: http::Request<Body>,
+    vtable: &'static dyn DiagRequestExtra,
+}
+
+impl DiagRequest {
+    #[doc(hidden)]
+    pub fn new(inner: http::Request<Body>, vtable: &'static dyn DiagRequestExtra) -> Self {
+        Self { inner, vtable }
+    }
+
+    /// Unwrap this request to obtain the [`http::Request`] inside.
+    pub fn into_inner(self) -> http::Request<Body> {
+        self.inner
+    }
+}
+
+/// The type or [`tower`] [`Service`] that handlers should provide.
+///
+/// This unfortunately has to be a concrete type in order for
+/// [`HttpDiagHandlerInstaller`] to be dyn-compatible, so implementors will
+/// need to convert services to this type.
+///
+/// [`Service`]: https://docs.rs/tower-service/latest/tower_service/trait.Service.html
+pub type DiagService = tower::util::BoxCloneSyncService<
+    DiagRequest,
     http::Response<Body>,
     std::convert::Infallible,
 >;
@@ -31,7 +88,13 @@ pub type Service = tower::util::BoxCloneSyncService<
 pub trait HttpDiagHandlerInstaller {
     /// Request to install a handler at `path` in the diagnostics HTTP
     /// server which will invoke `service`.
+    #[deprecated(since = "0.3.1", note = "Use `nest_diag_service` instead.")]
+    #[allow(deprecated)]
     fn nest_service(&mut self, path: &str, service: Service);
+
+    /// Request to install a handler at `path` in the diagnostics HTTP
+    /// server which will invoke `service`.
+    fn nest_diag_service(&mut self, path: &str, service: DiagService);
 }
 
 /// Trait for resources to offer handlers that expose diagnostic information

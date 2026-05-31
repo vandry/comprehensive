@@ -12,9 +12,10 @@ use axum::response::IntoResponse;
 use comprehensive::ResourceDependencies;
 use comprehensive::health::HealthReporter;
 use comprehensive::v1::{AssemblyRuntime, Resource, resource};
-use comprehensive_traits::http_diag::{HttpDiagHandler, HttpDiagHandlerInstaller};
+use comprehensive_traits::http_diag::{Body, HttpDiagHandler, HttpDiagHandlerInstaller};
 use prometheus::Encoder;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use crate::server::HttpServingInstance;
 
@@ -67,9 +68,43 @@ pub struct DiagInstance(#[router] Router);
 
 struct Installer(Option<Router<Arc<HealthReporter>>>);
 
+struct DiagOps;
+
+impl comprehensive_traits::http_diag::DiagRequestExtra for DiagOps {
+    fn get_original_uri<'a>(&self, req: &'a http::Request<Body>) -> Option<&'a http::Uri> {
+        req.extensions().get::<axum::extract::OriginalUri>().map(|v| &**v)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct AdaptDiagService<T>(T);
+
+impl<T> tower_service::Service<http::Request<Body>> for AdaptDiagService<T>
+where
+    T: tower_service::Service<comprehensive_traits::http_diag::DiagRequest>,
+{
+    type Response = T::Response;
+    type Error = T::Error;
+    type Future = T::Future;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), T::Error>> {
+        self.0.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: http::Request<Body>) -> Self::Future {
+        self.0.call(comprehensive_traits::http_diag::DiagRequest::new(req, &DiagOps))
+    }
+}
+
 impl HttpDiagHandlerInstaller for Installer {
+    #[allow(deprecated)]
     fn nest_service(&mut self, path: &str, service: comprehensive_traits::http_diag::Service) {
         let app = self.0.take().unwrap().nest_service(path, service);
+        self.0 = Some(app);
+    }
+
+    fn nest_diag_service(&mut self, path: &str, service: comprehensive_traits::http_diag::DiagService) {
+        let app = self.0.take().unwrap().nest_service(path, AdaptDiagService(service));
         self.0 = Some(app);
     }
 }

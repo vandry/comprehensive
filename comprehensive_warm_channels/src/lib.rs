@@ -11,7 +11,7 @@
 #![warn(missing_docs)]
 
 use comprehensive::v1::{AssemblyRuntime, Resource, resource};
-use comprehensive_traits::http_diag::{Body, HttpDiagHandler, HttpDiagHandlerInstaller};
+use comprehensive_traits::http_diag::{Body, DiagRequest, HttpDiagHandler, HttpDiagHandlerInstaller};
 use pin_project_lite::pin_project;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -88,24 +88,29 @@ where
 }
 
 #[derive(Clone)]
-struct MapResponseBody<T>(T);
+struct WarmChannelsDiagService<T>(T);
 
-impl<T, R, B> Service<R> for MapResponseBody<T>
+impl<T, B> Service<DiagRequest> for WarmChannelsDiagService<T>
 where
-    T: Service<R, Response = http::Response<B>>,
+    T: Service<http::Request<Body>, Response = http::Response<B>>,
     B: Into<Body>,
 {
     type Response = http::Response<Body>;
-    type Error = <T as Service<R>>::Error;
-    type Future = MapResponseBodyFuture<<T as Service<R>>::Future>;
+    type Error = <T as Service<http::Request<Body>>>::Error;
+    type Future = MapResponseBodyFuture<<T as Service<http::Request<Body>>>::Future>;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         Service::poll_ready(&mut self.0, cx)
     }
 
-    fn call(&mut self, request: R) -> Self::Future {
+    fn call(&mut self, request: DiagRequest) -> Self::Future {
+        let original_uri = request.get_original_uri().cloned();
+        let mut req = request.into_inner();
+        if let Some(uri) = original_uri {
+            req.extensions_mut().insert(warm_channels::OriginalUri(uri));
+        }
         MapResponseBodyFuture {
-            inner: Service::call(&mut self.0, request),
+            inner: Service::call(&mut self.0, req),
         }
     }
 }
@@ -113,9 +118,9 @@ where
 impl HttpDiagHandler for WarmChannelsDiag {
     fn install_handlers(self: Arc<Self>, installer: &mut dyn HttpDiagHandlerInstaller) {
         if !self.0.warm_channels_diag_path.is_empty() {
-            installer.nest_service(
+            installer.nest_diag_service(
                 &self.0.warm_channels_diag_path,
-                BoxCloneSyncService::new(MapResponseBody(ChannelDiagService::default())),
+                BoxCloneSyncService::new(WarmChannelsDiagService(ChannelDiagService::default())),
             );
         }
     }
